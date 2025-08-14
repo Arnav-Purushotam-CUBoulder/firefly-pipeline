@@ -36,7 +36,7 @@ from stage10_overlay_gt_vs_model import overlay_gt_vs_model  # includes per-thre
 # ──────────────────────────────────────────────────────────────
 # Root & I/O locations
 # ──────────────────────────────────────────────────────────────
-ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/orc pipeline frontalis only inference data')
+ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/orc pipeline frontalis only inference data 2')
 
 # Input videos (under your root)
 DIR_ORIG_VIDEOS = ROOT / 'original videos'         # put original .mp4/.avi here
@@ -329,6 +329,9 @@ def main():
                 backbone=STAGE9_BACKBONE,
                 imagenet_normalize=STAGE9_IMAGENET_NORM,
                 print_load_status=STAGE9_PRINT_LOAD_STATUS,
+                # NEW: forward GT filters from orchestrator constants
+                gt_area_threshold_px=AREA_THRESHOLD_PX,
+                gt_bright_max_threshold=BRIGHT_MAX_THRESHOLD,
             )
             ran_stage9 = True
 

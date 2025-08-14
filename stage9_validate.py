@@ -152,6 +152,85 @@ def _read_predictions(pred_csv: Path, only_firefly_rows: bool, max_frames: Optio
             preds_by_t[t].append({'x':x,'y':y,'b':b,'f':ffl,'conf':conf})
     return preds_by_t
 
+# ────────────────────── GT filtering (NEW) ──────────────────────
+
+def _write_norm_gt_from_map(out_path: Path, gt_by_t: Dict[int, List[Tuple[int,int]]]):
+    with out_path.open('w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=['x','y','t'])
+        w.writeheader()
+        for t in sorted(gt_by_t.keys()):
+            for (x,y) in gt_by_t[t]:
+                w.writerow({'x': int(x), 'y': int(y), 't': int(t)})
+
+def _filter_gt_by_brightness_and_area(
+    video_path: Path,
+    gt_by_t: Dict[int, List[Tuple[int,int]]],
+    *,
+    crop_w: int,
+    crop_h: int,
+    bright_max_threshold: int,
+    area_threshold_px: int,
+    max_frames: Optional[int],
+) -> Tuple[Dict[int, List[Tuple[int,int]]], int, int]:
+    """
+    Keep only GT points whose crop (centered at x,y; size crop_w×crop_h):
+      • has brightest pixel >= bright_max_threshold, and
+      • has a connected bright component (>= threshold) with area >= area_threshold_px.
+    Returns (filtered_map, kept_count, total_count).
+    """
+    total = sum(len(v) for v in gt_by_t.values())
+    if total == 0:
+        return gt_by_t, 0, 0
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"[stage9] Could not open video for GT filtering: {video_path}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    limit = total_frames
+    if max_frames is not None:
+        limit = min(limit, max_frames)
+
+    filtered: Dict[int, List[Tuple[int,int]]] = defaultdict(list)
+    kept = 0
+
+    fr = 0
+    while True:
+        if fr >= limit:
+            break
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        points = gt_by_t.get(fr, [])
+        if points:
+            for (x, y) in points:
+                crop = _center_crop_clamped(frame, float(x), float(y), crop_w, crop_h)
+                if crop.size == 0:
+                    continue
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+                # Brightest-pixel check
+                max_val = int(gray.max()) if gray.size else 0
+                if max_val < int(bright_max_threshold):
+                    continue
+
+                # Area check via connected components over >= bright_max_threshold
+                _, bin_img = cv2.threshold(gray, int(bright_max_threshold) - 1, 255, cv2.THRESH_BINARY)
+                num, labels, stats, centroids = cv2.connectedComponentsWithStats(bin_img, connectivity=8)
+                area = 0
+                if num > 1:
+                    area = int(stats[1:, cv2.CC_STAT_AREA].max()) if stats.shape[0] > 1 else 0
+
+                if area >= int(area_threshold_px):
+                    filtered[fr].append((int(x), int(y)))
+                    kept += 1
+
+        _progress(fr+1, limit, 'stage9-gt-filter'); fr += 1
+
+    cap.release()
+    return filtered, kept, total
+
 # ────────────────────── evaluation ──────────────────────
 
 def _evaluate_frames(gt_by_t, preds_by_t, thr_px: float):
@@ -415,6 +494,9 @@ def stage9_validate_against_gt(
     backbone: str = 'resnet18',
     imagenet_normalize: bool = False,
     print_load_status: bool = True,
+    # NEW: GT filtering thresholds (defaults match orchestrator)
+    gt_area_threshold_px: int = 4,
+    gt_bright_max_threshold: int = 50,
 ):
     """
     Validate predictions against ground truth across a sweep of distance thresholds.
@@ -429,9 +511,20 @@ def stage9_validate_against_gt(
 
     # Normalize GT (subtract offset) and write a normalized copy
     gt_by_t, norm_gt_csv = _read_and_normalize_gt(gt_csv_path, gt_t_offset, out_dir, max_frames)
-    print(f"[stage9] Normalized GT saved to: {norm_gt_csv}")
 
-    # Also copy normalized GT to the pipeline's CSV directory (same folder as predictions CSV)
+    # Filter normalized GT by brightness and area BEFORE copying/using it
+    gt_by_t_filt, kept, total = _filter_gt_by_brightness_and_area(
+        orig_video_path, gt_by_t,
+        crop_w=crop_w,
+        crop_h=crop_h,
+        bright_max_threshold=int(gt_bright_max_threshold),
+        area_threshold_px=int(gt_area_threshold_px),
+        max_frames=max_frames
+    )
+    _write_norm_gt_from_map(norm_gt_csv, gt_by_t_filt)
+    print(f"[stage9] Normalized + filtered GT saved to: {norm_gt_csv}  (kept {kept}/{total})")
+
+    # Also copy normalized (filtered) GT to the pipeline's CSV directory
     try:
         csv_dir = pred_csv_path.parent
         if csv_dir and csv_dir.exists():
@@ -462,12 +555,12 @@ def stage9_validate_against_gt(
 
     # Sweep thresholds
     for thr in dist_thresholds:
-        fps_by_t, tps_by_t, fns_by_t, (TP, FP, FN, mean_err) = _evaluate_frames(gt_by_t, preds_by_t, thr)
+        fps_by_t, tps_by_t, fns_by_t, (TP, FP, FN, mean_err) = _evaluate_frames(gt_by_t_filt, preds_by_t, thr)
 
         if show_per_frame:
-            frames = sorted(set(gt_by_t.keys()) | set(preds_by_t.keys()))
+            frames = sorted(set(gt_by_t_filt.keys()) | set(preds_by_t.keys()))
             for t in frames:
-                gs = len(gt_by_t.get(t, []))
+                gs = len(gt_by_t_filt.get(t, []))
                 ps = len(preds_by_t.get(t, []))
                 ts = len(tps_by_t.get(t, []))
                 fs = len(fps_by_t.get(t, []))
