@@ -30,13 +30,18 @@ from stage5_render import render_from_csv
 from stage6_10px_renderer import render_fixed_10px_from_csv
 from stage7_merge import prune_overlaps_keep_heaviest_unionfind
 from stage8_gaussian_centroid import recenter_gaussian_centroid
+from stage8_5_blob_area_filter import stage8_5_prune_by_blob_area
 from stage9_validate import stage9_validate_against_gt
 from stage10_overlay_gt_vs_model import overlay_gt_vs_model  # includes per-threshold TP/FP/FN videos
+from stage11_fn_analysis import stage11_fn_nearest_tp_analysis
+from stage12_fp_analysis import stage12_fp_nearest_tp_analysis
+from stage8_6_neighbor_hunt import stage8_6_neighbor_hunt
+
 
 # ──────────────────────────────────────────────────────────────
 # Root & I/O locations
 # ──────────────────────────────────────────────────────────────
-ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/orc pipeline frontalis only inference data 2')
+ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/orc pipeline frontalis only inference data')
 
 # Input videos (under your root)
 DIR_ORIG_VIDEOS = ROOT / 'original videos'         # put original .mp4/.avi here
@@ -66,7 +71,7 @@ for d in [DIR_CSV, DIR_OUT_BGS, DIR_OUT_ORIG, DIR_OUT_ORIG_10, DIR_STAGE8_CROPS,
 # ──────────────────────────────────────────────────────────────
 # Global knobs / flags
 # ──────────────────────────────────────────────────────────────
-MAX_FRAMES = 500              # e.g., 5000 to truncate
+MAX_FRAMES = None              # e.g., 5000 to truncate
 BBOX_THICKNESS = 1
 DRAW_BACKGROUND_BOXES = True   # stage 5/6
 
@@ -79,8 +84,17 @@ RUN_STAGE5 = True
 RUN_STAGE6 = True
 RUN_STAGE7 = True
 RUN_STAGE8 = True
+RUN_STAGE8_5 = True
+RUN_STAGE8_6 = True
+
+
+# THESE ARE THE VALIDATION STAGES, WILL ONLY RUN IF YOU HAVE GROUND TRUTH
 RUN_STAGE9 = True
 RUN_STAGE10 = True   # will only execute if RUN_STAGE9 is also True
+RUN_STAGE11 = True
+RUN_STAGE12 = True
+
+
 
 # ──────────────────────────────────────────────────────────────
 # Stage-specific parameters
@@ -130,6 +144,28 @@ STAGE8_PATCH_H             = 10
 STAGE8_GAUSSIAN_SIGMA      = 0.0   # 0.0 => intensity centroid; >0 => Gaussian-weighted
 STAGE8_VERBOSE             = True
 
+# Stage 8.5,9 — area calculation brightness floor for the largest CC (strict '>').
+MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION = 20
+
+
+# Stage 8.6 — neighbour hunt + CNN scoring + Gaussian recenter + saves
+STAGE8_6_NEIGHBOUR_RADIUS_PX   = 20      # search radius around center
+STAGE8_6_BLACKOUT_W            = 10
+STAGE8_6_BLACKOUT_H            = 10
+STAGE8_6_MIN_BRIGHTNESS        = 50      # grayscale max prefilter
+STAGE8_6_MIN_SEPARATION_PX     = 8       # de-dup in-frame
+STAGE8_6_GAUSSIAN_SIGMA        = 1.0     # σ for centroid weighting; 0 => intensity-only
+STAGE8_6_SAVE_DEBUG            = True    # crops + annotated frames
+
+# Reuse global model + threshold (keeps parity with Stage 4)
+STAGE8_6_MODEL_PATH            = CNN_MODEL_PATH
+STAGE8_6_BACKBONE              = CNN_BACKBONE
+STAGE8_6_IMAGENET_NORM         = IMAGENET_NORMALIZE
+STAGE8_6_CONF_THRESH           = FIREFLY_CONF_THRESH
+STAGE8_6_FAIL_IF_WEIGHTS_MISS  = FAIL_IF_WEIGHTS_MISSING
+
+
+
 # Stage 9 — validation vs ground truth
 GT_CSV_PATH                = ROOT / 'ground truth' / 'gt.csv'  # GT (x,y,t), t is raw & will be normalized
 GT_T_OFFSET                = 9000
@@ -143,6 +179,13 @@ STAGE9_MODEL_PATH          = CNN_MODEL_PATH
 STAGE9_BACKBONE            = CNN_BACKBONE
 STAGE9_IMAGENET_NORM       = IMAGENET_NORMALIZE
 STAGE9_PRINT_LOAD_STATUS   = PRINT_LOAD_STATUS
+
+# Stage 9 — GT dedup distance (in pixels) for merging duplicate GT points (Stage-7 style)
+STAGE9_GT_DEDUPE_DIST_PX = 4.0
+
+
+
+
 
 # Stage 10 — overlay
 STAGE10_GT_BOX_W           = STAGE9_CROP_W   # keep consistent with Stage 9 crop size
@@ -307,6 +350,47 @@ def main():
                 verbose=STAGE8_VERBOSE,
                 crop_dir=DIR_STAGE8_CROPS / base,   # optional per-video dump
             )
+        
+        # Stage 8.5 — prune firefly detections by blob area (> brightness floor), keep files in sync
+        if RUN_STAGE8_5:
+            stage8_5_prune_by_blob_area(
+                orig_video_path=orig_path,
+                csv_path=csv_path,
+                area_threshold_px=AREA_THRESHOLD_PX,  # same scalar you use elsewhere
+                min_pixel_brightness_to_be_considered_in_area_calculation=MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION,
+                max_frames=MAX_FRAMES,
+                verbose=True,
+            )
+        
+
+        if RUN_STAGE8_6:
+             _added = stage8_6_neighbor_hunt(
+                orig_video_path=orig_path,
+                csv_path=csv_path,
+                neighbour_radius_px=STAGE8_6_NEIGHBOUR_RADIUS_PX,
+                blackout_w=STAGE8_6_BLACKOUT_W,
+                blackout_h=STAGE8_6_BLACKOUT_H,
+                min_brightness_for_neighbour=STAGE8_6_MIN_BRIGHTNESS,
+                min_separation_px=STAGE8_6_MIN_SEPARATION_PX,
+                # model + preprocessing parity
+                model_path=STAGE8_6_MODEL_PATH,
+                backbone=STAGE8_6_BACKBONE,
+                imagenet_normalize=STAGE8_6_IMAGENET_NORM,
+                firefly_conf_thresh=STAGE8_6_CONF_THRESH,
+                fail_if_weights_missing=STAGE8_6_FAIL_IF_WEIGHTS_MISS,
+                # gaussian recenter + debug saves
+                gaussian_sigma=STAGE8_6_GAUSSIAN_SIGMA,
+                save_debug_artifacts=STAGE8_6_SAVE_DEBUG,
+                # misc
+                max_frames=MAX_FRAMES,
+                verbose=True,
+            )
+
+
+
+
+
+
 
         # Stage 9 — validate vs ground truth (writes normalized GT to stage9 dir and copies to CSV dir; saves TP/FP/FN crops)
         ran_stage9 = False
@@ -332,8 +416,39 @@ def main():
                 # NEW: forward GT filters from orchestrator constants
                 gt_area_threshold_px=AREA_THRESHOLD_PX,
                 gt_bright_max_threshold=BRIGHT_MAX_THRESHOLD,
+                # NEW: brightness floor for area calculation (largest CC uses '>' this value)
+                min_pixel_brightness_to_be_considered_in_area_calculation=MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION,
+                gt_dedupe_dist_threshold_px=STAGE9_GT_DEDUPE_DIST_PX,  # NEW
             )
             ran_stage9 = True
+        
+        # Stage 11 — FN analysis (per-threshold nearest-TP distances → CSV + full-frame images)
+        if RUN_STAGE11 and ran_stage9:
+            stage11_fn_nearest_tp_analysis(
+                stage9_video_dir=DIR_STAGE9_OUT / base,
+                orig_video_path=orig_path,          # NEW: needed to grab full frames
+                box_w=STAGE10_GT_BOX_W,             # optional (keeps visuals consistent)
+                box_h=STAGE10_GT_BOX_H,             # optional
+                color=(0, 255, 255),                # optional: yellow boxes for FN & nearest TP
+                thickness=BBOX_THICKNESS,           # optional
+                verbose=True,
+        )
+            
+            
+        # Stage 12 — FP analysis (per-threshold nearest-TP distances → CSV + full-frame images)
+        if RUN_STAGE12 and ran_stage9:
+            stage12_fp_nearest_tp_analysis(
+                stage9_video_dir=DIR_STAGE9_OUT / base,
+                orig_video_path=orig_path,
+                box_w=STAGE10_GT_BOX_W,   # keep consistent visuals
+                box_h=STAGE10_GT_BOX_H,
+                color=(255, 0, 255),      # magenta for FP↔TP pairs (same color for both boxes)
+                thickness=BBOX_THICKNESS,
+                verbose=True,
+        )
+
+
+
 
         # Stage 10 — overlay GT (GREEN), model (RED), overlap (YELLOW) on one video
         #            and render per-threshold TP/FP/FN videos (TP=YELLOW, FP=RED, FN=GREEN)

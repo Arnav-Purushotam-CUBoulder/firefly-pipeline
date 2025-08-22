@@ -83,6 +83,9 @@ def _center_crop_clamped(img: np.ndarray, cx: float, cy: float, w: int, h: int) 
 def sub_abs(n: int) -> str:
     return (f"minus{abs(n)}" if n < 0 else f"plus{abs(n)}")
 
+# For appending brightness/area to crop filenames; set at runtime from args.
+_NAMING_BIN_THR = 50
+
 # ────────────────────── GT & predictions I/O ──────────────────────
 
 def _read_and_normalize_gt(gt_csv: Path, gt_t_offset: int, out_dir: Path, max_frames: Optional[int]):
@@ -171,6 +174,7 @@ def _filter_gt_by_brightness_and_area(
     bright_max_threshold: int,
     area_threshold_px: int,
     max_frames: Optional[int],
+    area_min_pixel_brightness: int,       # NEW: for area calculation threshold (strict “>”)
 ) -> Tuple[Dict[int, List[Tuple[int,int]]], int, int]:
     """
     Keep only GT points whose crop (centered at x,y; size crop_w×crop_h):
@@ -216,7 +220,7 @@ def _filter_gt_by_brightness_and_area(
                     continue
 
                 # Area check via connected components over >= bright_max_threshold
-                _, bin_img = cv2.threshold(gray, int(bright_max_threshold) - 1, 255, cv2.THRESH_BINARY)
+                _, bin_img = cv2.threshold(gray, int(area_min_pixel_brightness), 255, cv2.THRESH_BINARY)
                 num, labels, stats, centroids = cv2.connectedComponentsWithStats(bin_img, connectivity=8)
                 area = 0
                 if num > 1:
@@ -230,6 +234,143 @@ def _filter_gt_by_brightness_and_area(
 
     cap.release()
     return filtered, kept, total
+
+
+
+
+def _dedupe_gt_via_distance_and_weight(
+    video_path: Path,
+    gt_by_t: Dict[int, List[Tuple[int,int]]],
+    *,
+    crop_w: int,
+    crop_h: int,
+    dist_threshold_px: float,
+    max_frames: Optional[int],
+) -> Tuple[Dict[int, List[Tuple[int,int]]], int]:
+    """
+    Deduplicate GT within each frame by grouping points whose centroid distance
+    is <= dist_threshold_px, keeping the single point with the largest RGB-sum
+    weight (sum of all BGR values) measured in a crop_w×crop_h crop centered at (x,y).
+
+    Returns: (deduped_map, num_removed)
+    """
+    if not gt_by_t:
+        return gt_by_t, 0
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"[stage9] Could not open video for GT dedupe: {video_path}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    limit = total_frames if max_frames is None else min(total_frames, max_frames)
+
+    def crop_weight(frame: np.ndarray, x: int, y: int) -> float:
+        crop = _center_crop_clamped(frame, float(x), float(y), crop_w, crop_h)
+        if crop.size == 0:
+            return 0.0
+        return float(crop.sum())  # BGR-sum
+
+    def _dist2(a: Tuple[int,int], b: Tuple[int,int]) -> float:
+        dx = float(a[0]) - float(b[0])
+        dy = float(a[1]) - float(b[1])
+        return dx*dx + dy*dy
+
+    thr2 = float(dist_threshold_px) * float(dist_threshold_px)
+    deduped: Dict[int, List[Tuple[int,int]]] = defaultdict(list)
+    removed = 0
+
+    fr = 0
+    while True:
+        if fr >= limit:
+            break
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        pts = gt_by_t.get(fr, [])
+        n = len(pts)
+        if n <= 1:
+            if n == 1:
+                x, y = pts[0]
+                deduped[fr].append((int(x), int(y)))
+            fr += 1
+            continue
+
+        # Compute weights per point
+        weights = [crop_weight(frame, int(p[0]), int(p[1])) for p in pts]
+
+        # Union-Find to group close points
+        parent = list(range(n))
+        rank = [0]*n
+        def find(a: int) -> int:
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra == rb:
+                return
+            if rank[ra] < rank[rb]:
+                parent[ra] = rb
+            elif rank[ra] > rank[rb]:
+                parent[rb] = ra
+            else:
+                parent[rb] = ra
+                rank[ra] += 1
+
+        for i in range(n):
+            ai = pts[i]
+            for j in range(i+1, n):
+                if _dist2(ai, pts[j]) <= thr2:
+                    union(i, j)
+
+        # Keep the heaviest in each component
+        comps: Dict[int, List[int]] = {}
+        for i in range(n):
+            r = find(i)
+            comps.setdefault(r, []).append(i)
+
+        kept = 0
+        for comp_idxs in comps.values():
+            best_idx = max(comp_idxs, key=lambda k: weights[k])
+            bx, by = pts[best_idx]
+            deduped[fr].append((int(bx), int(by)))
+            kept += 1
+
+        removed += (n - kept)
+        fr += 1
+
+    cap.release()
+    return deduped, removed
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # ────────────────────── evaluation ──────────────────────
 
@@ -440,7 +581,18 @@ def _write_crops_and_csvs_for_threshold(
             for p in fps_by_t.get(fr, []):
                 x = float(p['x']); y = float(p['y']); conf = float(p['conf'])
                 crop = _center_crop_clamped(frame, x, y, crop_w, crop_h)
-                fname = f"FP_t{fr:06d}_x{int(round(x))}_y{int(round(y))}_conf{conf:.4f}.png"
+
+                # brightness/area like the GT filter
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.size else None
+                max_val = int(gray.max()) if (gray is not None and gray.size) else 0
+                if gray is not None and gray.size:
+                    _, bin_img = cv2.threshold(gray, int(_NAMING_BIN_THR) - 1, 255, cv2.THRESH_BINARY)
+                    num, labels, stats, centroids = cv2.connectedComponentsWithStats(bin_img, connectivity=8)
+                    area = int(stats[1:, cv2.CC_STAT_AREA].max()) if (num > 1 and stats.shape[0] > 1) else 0
+                else:
+                    area = 0
+
+                fname = f"FP_t{fr:06d}_x{int(round(x))}_y{int(round(y))}_conf{conf:.4f}_max{max_val}_area{area}.png"
                 outp = crops_dir_fp / fname
                 cv2.imwrite(str(outp), crop)
                 w_fp.writerow([int(round(x)), int(round(y)), fr, str(outp), f"{conf:.6f}"])
@@ -449,7 +601,18 @@ def _write_crops_and_csvs_for_threshold(
             for p in tps_by_t.get(fr, []):
                 x = float(p['x']); y = float(p['y']); conf = float(p['conf'])
                 crop = _center_crop_clamped(frame, x, y, crop_w, crop_h)
-                fname = f"TP_t{fr:06d}_x{int(round(x))}_y{int(round(y))}_conf{conf:.4f}.png"
+
+                # brightness/area like the GT filter
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.size else None
+                max_val = int(gray.max()) if (gray is not None and gray.size) else 0
+                if gray is not None and gray.size:
+                    _, bin_img = cv2.threshold(gray, int(_NAMING_BIN_THR) - 1, 255, cv2.THRESH_BINARY)
+                    num, labels, stats, centroids = cv2.connectedComponentsWithStats(bin_img, connectivity=8)
+                    area = int(stats[1:, cv2.CC_STAT_AREA].max()) if (num > 1 and stats.shape[0] > 1) else 0
+                else:
+                    area = 0
+
+                fname = f"TP_t{fr:06d}_x{int(round(x))}_y{int(round(y))}_conf{conf:.4f}_max{max_val}_area{area}.png"
                 outp = crops_dir_tp / fname
                 cv2.imwrite(str(outp), crop)
                 w_tp.writerow([int(round(x)), int(round(y)), fr, str(outp), f"{conf:.6f}"])
@@ -463,9 +626,20 @@ def _write_crops_and_csvs_for_threshold(
                     except Exception:
                         conf = float('nan')
                 crop = _center_crop_clamped(frame, gx, gy, crop_w, crop_h)
+
+                # brightness/area like the GT filter
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.size else None
+                max_val = int(gray.max()) if (gray is not None and gray.size) else 0
+                if gray is not None and gray.size:
+                    _, bin_img = cv2.threshold(gray, int(_NAMING_BIN_THR) - 1, 255, cv2.THRESH_BINARY)
+                    num, labels, stats, centroids = cv2.connectedComponentsWithStats(bin_img, connectivity=8)
+                    area = int(stats[1:, cv2.CC_STAT_AREA].max()) if (num > 1 and stats.shape[0] > 1) else 0
+                else:
+                    area = 0
+
                 # use 0.0 in filename if NaN (to avoid "confnan")
                 conf_for_name = 0.0 if conf != conf else conf
-                fname = f"FN_t{fr:06d}_x{gx}_y{gy}_conf{conf_for_name:.4f}.png"
+                fname = f"FN_t{fr:06d}_x{gx}_y{gy}_conf{conf_for_name:.4f}_max{max_val}_area{area}.png"
                 outp = crops_dir_fn / fname
                 cv2.imwrite(str(outp), crop)
                 w_fn.writerow([gx, gy, fr, str(outp), ("" if conf!=conf else f"{conf:.6f}")])
@@ -497,6 +671,9 @@ def stage9_validate_against_gt(
     # NEW: GT filtering thresholds (defaults match orchestrator)
     gt_area_threshold_px: int = 4,
     gt_bright_max_threshold: int = 50,
+    min_pixel_brightness_to_be_considered_in_area_calculation: int = 50,  # NEW
+    gt_dedupe_dist_threshold_px: float = 2.0,  # NEW
+
 ):
     """
     Validate predictions against ground truth across a sweep of distance thresholds.
@@ -509,6 +686,10 @@ def stage9_validate_against_gt(
     """
     _ensure_dir(out_dir)
 
+    # Set the naming threshold used to compute _max and _area in crop filenames
+    global _NAMING_BIN_THR
+    _NAMING_BIN_THR = int(min_pixel_brightness_to_be_considered_in_area_calculation)
+
     # Normalize GT (subtract offset) and write a normalized copy
     gt_by_t, norm_gt_csv = _read_and_normalize_gt(gt_csv_path, gt_t_offset, out_dir, max_frames)
 
@@ -519,10 +700,25 @@ def stage9_validate_against_gt(
         crop_h=crop_h,
         bright_max_threshold=int(gt_bright_max_threshold),
         area_threshold_px=int(gt_area_threshold_px),
-        max_frames=max_frames
+        max_frames=max_frames,
+        area_min_pixel_brightness=int(min_pixel_brightness_to_be_considered_in_area_calculation),  # NEW
     )
-    _write_norm_gt_from_map(norm_gt_csv, gt_by_t_filt)
-    print(f"[stage9] Normalized + filtered GT saved to: {norm_gt_csv}  (kept {kept}/{total})")
+
+    # 2) NEW: dedupe GT by distance (Stage-7 style; keep heaviest crop)
+    gt_by_t_dedup, removed_dups = _dedupe_gt_via_distance_and_weight(
+        orig_video_path,
+        gt_by_t_filt,
+        crop_w=crop_w,
+        crop_h=crop_h,
+        dist_threshold_px=float(gt_dedupe_dist_threshold_px),
+        max_frames=max_frames,
+    )
+
+    # Write the final (filtered + deduped) normalized GT
+    _write_norm_gt_from_map(norm_gt_csv, gt_by_t_dedup)
+    final_kept = sum(len(v) for v in gt_by_t_dedup.values())
+    print(f"[stage9] Normalized + filtered + deduped GT saved to: {norm_gt_csv}  "
+      f"(kept {kept}/{total} after filter; removed duplicates: {removed_dups}; final: {final_kept})")
 
     # Also copy normalized (filtered) GT to the pipeline's CSV directory
     try:
@@ -555,12 +751,12 @@ def stage9_validate_against_gt(
 
     # Sweep thresholds
     for thr in dist_thresholds:
-        fps_by_t, tps_by_t, fns_by_t, (TP, FP, FN, mean_err) = _evaluate_frames(gt_by_t_filt, preds_by_t, thr)
+        fps_by_t, tps_by_t, fns_by_t, (TP, FP, FN, mean_err) = _evaluate_frames(gt_by_t_dedup, preds_by_t, thr)
 
         if show_per_frame:
-            frames = sorted(set(gt_by_t_filt.keys()) | set(preds_by_t.keys()))
+            frames = sorted(set(gt_by_t_dedup.keys()) | set(preds_by_t.keys()))
             for t in frames:
-                gs = len(gt_by_t_filt.get(t, []))
+                gs = len(gt_by_t_dedup.get(t, []))
                 ps = len(preds_by_t.get(t, []))
                 ts = len(tps_by_t.get(t, []))
                 fs = len(fps_by_t.get(t, []))
