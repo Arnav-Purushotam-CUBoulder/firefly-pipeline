@@ -35,7 +35,9 @@ from stage9_validate import stage9_validate_against_gt
 from stage10_overlay_gt_vs_model import overlay_gt_vs_model  # includes per-threshold TP/FP/FN videos
 from stage11_fn_analysis import stage11_fn_nearest_tp_analysis
 from stage12_fp_analysis import stage12_fp_nearest_tp_analysis
-from stage8_6_neighbor_hunt import stage8_6_neighbor_hunt
+from stage8_6_neighbor_hunt import stage8_6_run
+
+
 
 
 # ──────────────────────────────────────────────────────────────
@@ -71,7 +73,7 @@ for d in [DIR_CSV, DIR_OUT_BGS, DIR_OUT_ORIG, DIR_OUT_ORIG_10, DIR_STAGE8_CROPS,
 # ──────────────────────────────────────────────────────────────
 # Global knobs / flags
 # ──────────────────────────────────────────────────────────────
-MAX_FRAMES = None              # e.g., 5000 to truncate
+MAX_FRAMES = 1000              # e.g., 5000 to truncate
 BBOX_THICKNESS = 1
 DRAW_BACKGROUND_BOXES = True   # stage 5/6
 
@@ -122,7 +124,7 @@ AREA_THRESHOLD_PX = 4
 
 # Stage 4 — CNN classify/filter
 USE_CNN_FILTER             = True
-CNN_MODEL_PATH             = Path('latest frontalis code (contains post processing features from resnet forresti)/resnet frontalis models/colored_ResNet_18_Frontalis_best_model.pt')  # ← SET THIS to your .pt file
+CNN_MODEL_PATH             = Path('/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/background subtraction detection method/actual background subtraction code/latest frontalis code (contains post processing features from resnet forresti)/resnet frontalis models/colored_ResNet_18_Frontalis_best_model.pt')  # ← SET THIS to your .pt file
 CNN_BACKBONE               = 'resnet18'
 CNN_CLASS_TO_KEEP          = 1               # firefly class idx
 CNN_PATCH_W                = 10
@@ -148,21 +150,9 @@ STAGE8_VERBOSE             = True
 MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION = 20
 
 
-# Stage 8.6 — neighbour hunt + CNN scoring + Gaussian recenter + saves
-STAGE8_6_NEIGHBOUR_RADIUS_PX   = 20      # search radius around center
-STAGE8_6_BLACKOUT_W            = 10
-STAGE8_6_BLACKOUT_H            = 10
-STAGE8_6_MIN_BRIGHTNESS        = 50      # grayscale max prefilter
-STAGE8_6_MIN_SEPARATION_PX     = 8       # de-dup in-frame
-STAGE8_6_GAUSSIAN_SIGMA        = 1.0     # σ for centroid weighting; 0 => intensity-only
-STAGE8_6_SAVE_DEBUG            = True    # crops + annotated frames
+STAGE8_6_RUNS = 1          # try 2–3 to dig deeper
+STAGE8_6_DEDUPE_PX = 4.0   # (optional) merge safety, defaults to 2.0 if omitted
 
-# Reuse global model + threshold (keeps parity with Stage 4)
-STAGE8_6_MODEL_PATH            = CNN_MODEL_PATH
-STAGE8_6_BACKBONE              = CNN_BACKBONE
-STAGE8_6_IMAGENET_NORM         = IMAGENET_NORMALIZE
-STAGE8_6_CONF_THRESH           = FIREFLY_CONF_THRESH
-STAGE8_6_FAIL_IF_WEIGHTS_MISS  = FAIL_IF_WEIGHTS_MISSING
 
 
 
@@ -364,31 +354,11 @@ def main():
         
 
         if RUN_STAGE8_6:
-             _added = stage8_6_neighbor_hunt(
+            _added = stage8_6_run(
                 orig_video_path=orig_path,
-                csv_path=csv_path,
-                neighbour_radius_px=STAGE8_6_NEIGHBOUR_RADIUS_PX,
-                blackout_w=STAGE8_6_BLACKOUT_W,
-                blackout_h=STAGE8_6_BLACKOUT_H,
-                min_brightness_for_neighbour=STAGE8_6_MIN_BRIGHTNESS,
-                min_separation_px=STAGE8_6_MIN_SEPARATION_PX,
-                # model + preprocessing parity
-                model_path=STAGE8_6_MODEL_PATH,
-                backbone=STAGE8_6_BACKBONE,
-                imagenet_normalize=STAGE8_6_IMAGENET_NORM,
-                firefly_conf_thresh=STAGE8_6_CONF_THRESH,
-                fail_if_weights_missing=STAGE8_6_FAIL_IF_WEIGHTS_MISS,
-                # gaussian recenter + debug saves
-                gaussian_sigma=STAGE8_6_GAUSSIAN_SIGMA,
-                save_debug_artifacts=STAGE8_6_SAVE_DEBUG,
-                # misc
-                max_frames=MAX_FRAMES,
-                verbose=True,
+                main_csv_path=csv_path,
+                num_runs=STAGE8_6_RUNS,
             )
-
-
-
-
 
 
 
