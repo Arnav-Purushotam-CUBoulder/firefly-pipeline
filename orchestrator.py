@@ -36,6 +36,7 @@ from stage10_overlay_gt_vs_model import overlay_gt_vs_model  # includes per-thre
 from stage11_fn_analysis import stage11_fn_nearest_tp_analysis
 from stage12_fp_analysis import stage12_fp_nearest_tp_analysis
 from stage8_6_neighbor_hunt import stage8_6_run
+from stage8_7_large_flash_bfs import stage8_7_expand_large_fireflies
 
 
 
@@ -73,7 +74,7 @@ for d in [DIR_CSV, DIR_OUT_BGS, DIR_OUT_ORIG, DIR_OUT_ORIG_10, DIR_STAGE8_CROPS,
 # ──────────────────────────────────────────────────────────────
 # Global knobs / flags
 # ──────────────────────────────────────────────────────────────
-MAX_FRAMES = 1000              # e.g., 5000 to truncate
+MAX_FRAMES = 300              # e.g., 5000 to truncate
 BBOX_THICKNESS = 1
 DRAW_BACKGROUND_BOXES = True   # stage 5/6
 
@@ -152,6 +153,24 @@ MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION = 20
 
 STAGE8_6_RUNS = 1          # try 2–3 to dig deeper
 STAGE8_6_DEDUPE_PX = 4.0   # (optional) merge safety, defaults to 2.0 if omitted
+
+
+
+
+
+
+# Stage 8.7 — large-flash fixer (BFS)
+RUN_STAGE8_7                              = True
+STAGE8_7_INTENSITY_THR                    = 140     # BFS_NEIGHBOR_PIXEL_INTENSITY_THRESHOLD
+STAGE8_7_DEDUPE_PX                        = 10.0    # union-find distance among new squares
+STAGE8_7_MIN_SQUARE_AREA_PX               = 75    # >100 to exceed 10x10
+STAGE8_7_GAUSSIAN_SIGMA                   = STAGE8_GAUSSIAN_SIGMA  # reuse if you want
+
+
+
+
+
+
 
 
 
@@ -358,6 +377,19 @@ def main():
                 orig_video_path=orig_path,
                 main_csv_path=csv_path,
                 num_runs=STAGE8_6_RUNS,
+            )
+
+         # ── NEW: Stage 8.7 — grow large flashes & replace 10x10 shards
+        if RUN_STAGE8_7:
+            stage8_7_expand_large_fireflies(
+                orig_video_path=orig_path,
+                main_csv_path=csv_path,
+                neighbor_intensity_threshold=STAGE8_7_INTENSITY_THR,
+                dedupe_dist_px=STAGE8_7_DEDUPE_PX,
+                min_square_area_px=STAGE8_7_MIN_SQUARE_AREA_PX,
+                gaussian_sigma=STAGE8_7_GAUSSIAN_SIGMA,
+                max_frames=MAX_FRAMES,
+                verbose=True,
             )
 
 
