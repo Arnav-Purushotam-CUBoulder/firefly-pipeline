@@ -44,7 +44,7 @@ from stage8_7_large_flash_bfs import stage8_7_expand_large_fireflies
 # ──────────────────────────────────────────────────────────────
 # Root & I/O locations
 # ──────────────────────────────────────────────────────────────
-ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/orc pipeline frontalis only inference data')
+ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/orc pipeline forresti only inference data')
 
 # Input videos (under your root)
 DIR_ORIG_VIDEOS = ROOT / 'original videos'         # put original .mp4/.avi here
@@ -74,7 +74,7 @@ for d in [DIR_CSV, DIR_OUT_BGS, DIR_OUT_ORIG, DIR_OUT_ORIG_10, DIR_STAGE8_CROPS,
 # ──────────────────────────────────────────────────────────────
 # Global knobs / flags
 # ──────────────────────────────────────────────────────────────
-MAX_FRAMES = 300              # e.g., 5000 to truncate
+MAX_FRAMES = None              # e.g., 5000 to truncate
 BBOX_THICKNESS = 1
 DRAW_BACKGROUND_BOXES = True   # stage 5/6
 
@@ -121,11 +121,11 @@ DOG_SIGMA2          = 1.6
 BRIGHT_MAX_THRESHOLD = 50
 
 # Stage 3 — area filter
-AREA_THRESHOLD_PX = 4
+AREA_THRESHOLD_PX = 6
 
 # Stage 4 — CNN classify/filter
 USE_CNN_FILTER             = True
-CNN_MODEL_PATH             = Path('/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/background subtraction detection method/actual background subtraction code/latest frontalis code (contains post processing features from resnet forresti)/resnet frontalis models/colored_ResNet_18_Frontalis_best_model.pt')  # ← SET THIS to your .pt file
+CNN_MODEL_PATH             = Path('/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/background subtraction detection method/actual background subtraction code/frontalis, tremulans and forresti global models/resnet18_Forresti_best_model.pt')  # ← SET THIS to your .pt file
 CNN_BACKBONE               = 'resnet18'
 CNN_CLASS_TO_KEEP          = 1               # firefly class idx
 CNN_PATCH_W                = 10
@@ -161,7 +161,7 @@ STAGE8_6_DEDUPE_PX = 4.0   # (optional) merge safety, defaults to 2.0 if omitted
 
 # Stage 8.7 — large-flash fixer (BFS)
 RUN_STAGE8_7                              = True
-STAGE8_7_INTENSITY_THR                    = 140     # BFS_NEIGHBOR_PIXEL_INTENSITY_THRESHOLD
+STAGE8_7_INTENSITY_THR                    = 70     # BFS_NEIGHBOR_PIXEL_INTENSITY_THRESHOLD
 STAGE8_7_DEDUPE_PX                        = 10.0    # union-find distance among new squares
 STAGE8_7_MIN_SQUARE_AREA_PX               = 75    # >100 to exceed 10x10
 STAGE8_7_GAUSSIAN_SIGMA                   = STAGE8_GAUSSIAN_SIGMA  # reuse if you want
@@ -177,7 +177,7 @@ STAGE8_7_GAUSSIAN_SIGMA                   = STAGE8_GAUSSIAN_SIGMA  # reuse if yo
 
 # Stage 9 — validation vs ground truth
 GT_CSV_PATH                = ROOT / 'ground truth' / 'gt.csv'  # GT (x,y,t), t is raw & will be normalized
-GT_T_OFFSET                = 9000
+GT_T_OFFSET                = 4000
 DIST_THRESHOLDS_PX         = [1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0]                   # sweep
 STAGE9_CROP_W              = 10
 STAGE9_CROP_H              = 10
