@@ -37,6 +37,7 @@ from stage11_fn_analysis import stage11_fn_nearest_tp_analysis
 from stage12_fp_analysis import stage12_fp_nearest_tp_analysis
 from stage8_6_neighbor_hunt import stage8_6_run
 from stage8_7_large_flash_bfs import stage8_7_expand_large_fireflies
+from stage8_9_gt_gaussian_centroid import stage8_9_recenter_gt_gaussian_centroid
 
 
 
@@ -44,7 +45,7 @@ from stage8_7_large_flash_bfs import stage8_7_expand_large_fireflies
 # ──────────────────────────────────────────────────────────────
 # Root & I/O locations
 # ──────────────────────────────────────────────────────────────
-ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/orc pipeline forresti only inference data')
+ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/orc pipeline frontalis only inference data')
 
 # Input videos (under your root)
 DIR_ORIG_VIDEOS = ROOT / 'original videos'         # put original .mp4/.avi here
@@ -89,6 +90,9 @@ RUN_STAGE7 = True
 RUN_STAGE8 = True
 RUN_STAGE8_5 = True
 RUN_STAGE8_6 = True
+RUN_STAGE8_9 = True
+# After your existing toggles (RUN_STAGE8_5, RUN_STAGE8_6, RUN_STAGE8_7, …)
+RUN_STAGE8_5_AFTER_8_7 = True
 
 
 # THESE ARE THE VALIDATION STAGES, WILL ONLY RUN IF YOU HAVE GROUND TRUTH
@@ -125,7 +129,7 @@ AREA_THRESHOLD_PX = 6
 
 # Stage 4 — CNN classify/filter
 USE_CNN_FILTER             = True
-CNN_MODEL_PATH             = Path('/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/background subtraction detection method/actual background subtraction code/frontalis, tremulans and forresti global models/resnet18_Forresti_best_model.pt')  # ← SET THIS to your .pt file
+CNN_MODEL_PATH             = Path('/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/background subtraction detection method/actual background subtraction code/frontalis, tremulans and forresti global models/colored_ResNet_18_Frontalis_best_model.pt')  # ← SET THIS to your .pt file
 CNN_BACKBONE               = 'resnet18'
 CNN_CLASS_TO_KEEP          = 1               # firefly class idx
 CNN_PATCH_W                = 10
@@ -173,11 +177,22 @@ STAGE8_7_GAUSSIAN_SIGMA                   = STAGE8_GAUSSIAN_SIGMA  # reuse if yo
 
 
 
+# Stage 8.9 — recenter GT via Gaussian centroid (pre-Stage 9)
+STAGE8_9_CROP_W        = 10              # use 10×10 to match Stage 9
+STAGE8_9_CROP_H        = 10
+STAGE8_9_GAUSSIAN_SIGMA = STAGE8_GAUSSIAN_SIGMA  # reuse Stage-8 sigma; set >0 for Gaussian
+DIR_STAGE8_9_OUT       = ROOT / 'stage8.9 gt centroid crops'
+
+
+
+
+
+
 
 
 # Stage 9 — validation vs ground truth
 GT_CSV_PATH                = ROOT / 'ground truth' / 'gt.csv'  # GT (x,y,t), t is raw & will be normalized
-GT_T_OFFSET                = 4000
+GT_T_OFFSET                = 9000
 DIST_THRESHOLDS_PX         = [1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0]                   # sweep
 STAGE9_CROP_W              = 10
 STAGE9_CROP_H              = 10
@@ -391,6 +406,43 @@ def main():
                 max_frames=MAX_FRAMES,
                 verbose=True,
             )
+
+        # Re-run 8.5 AFTER 8.7 so replacements/center shifts are re-checked
+        if RUN_STAGE8_5_AFTER_8_7:
+            stage8_5_prune_by_blob_area(
+                orig_video_path=orig_path,
+                csv_path=csv_path,
+                area_threshold_px=AREA_THRESHOLD_PX,
+                min_pixel_brightness_to_be_considered_in_area_calculation=
+                MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION,
+                max_frames=MAX_FRAMES,
+                verbose=True,
+        )
+
+
+
+
+
+        # Stage 8.9 — GT recenter (produces x,y,t + debug crops), runs once per video
+        if RUN_STAGE8_9:
+            out89 = DIR_STAGE8_9_OUT / base
+            stage8_9_recenter_gt_gaussian_centroid(
+            orig_video_path=orig_path,
+            gt_csv_path=GT_CSV_PATH,                 # overwritten in place to x,y,t
+            crop_w=STAGE8_9_CROP_W,
+            crop_h=STAGE8_9_CROP_H,
+            gaussian_sigma=STAGE8_9_GAUSSIAN_SIGMA,
+            gt_t_offset=GT_T_OFFSET,
+            max_frames=MAX_FRAMES,
+            out_crop_dir=out89,
+            verbose=True,
+        )
+
+
+
+
+
+
 
 
 
