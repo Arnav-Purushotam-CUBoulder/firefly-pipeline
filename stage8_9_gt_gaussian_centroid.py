@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+"""
+Stage 8.9 — Recenter GT via Gaussian centroid and write x,y,t (t = RAW frame)
+──────────────────────────────────────────────────────────────────────────────
+
+Reads a GT CSV with columns x,y,w,h,frame (x,y are centers), computes a
+Gaussian-weighted centroid in a crop_w×crop_h window for the corresponding
+video frame, and OVERWRITES gt_csv_path with x,y,t where **t is the RAW frame
+number from the filename (offset NOT subtracted)**.
+
+Saves crops (if out_crop_dir):
+  • A *clean* GT crop (no overlay) with a “__clean” suffix.
+  • A debug crop with the centroid pixel colored red (BGR=(0,0,255)).
+
+Returns: (num_processed_points, num_saved_files)
+"""
+
 import csv
 import re
 import sys
@@ -111,8 +127,10 @@ def stage8_9_recenter_gt_gaussian_centroid(
     video frame, and OVERWRITES gt_csv_path with x,y,t where **t is the RAW
     frame number from the filename (offset NOT subtracted)**.
 
-    Saves debug crops (if out_crop_dir) with the centroid pixel colored red.
-    Returns: (num_processed, num_saved_crops)
+    Also saves:
+      • Clean GT crop (no overlay) with a “__clean” suffix,
+      • Debug crop with the centroid pixel colored red.
+    Returns: (num_processed_points, num_saved_files)
     """
     rows = _read_gt_xywh_frame(gt_csv_path)
     if not rows:
@@ -189,13 +207,30 @@ def stage8_9_recenter_gt_gaussian_centroid(
                     processed += 1
 
                     if out_crop_dir is not None:
-                        dbg = crop.copy()
+                        # 1) Save a clean GT crop (no red overlay)
+                        clean = crop.copy()
+
+                        # 2) Create the debug crop (with red dot at centroid)
+                        dbg = clean.copy()
                         px = int(round(ccx)); py = int(round(ccy))
                         if 0 <= py < dbg.shape[0] and 0 <= px < dbg.shape[1]:
                             dbg[py, px] = (0, 0, 255)  # BGR red
-                        out_name = f"tRaw{int(e['raw_idx']):06d}_norm{fr:06d}__orig({int(round(cx0))},{int(round(cy0))})__cent({x_int},{y_int}).png"
-                        cv2.imwrite(str(out_crop_dir / out_name), dbg)
-                        saved += 1
+
+                        base_name = (
+                            f"tRaw{int(e['raw_idx']):06d}_norm{fr:06d}"
+                            f"__orig({int(round(cx0))},{int(round(cy0))})"
+                            f"__cent({x_int},{y_int})"
+                        )
+
+                        # Clean crop filename
+                        clean_name = f"{base_name}__clean.png"
+                        cv2.imwrite(str(out_crop_dir / clean_name), clean)
+
+                        # Debug crop filename (keeps original naming)
+                        dbg_name = f"{base_name}.png"
+                        cv2.imwrite(str(out_crop_dir / dbg_name), dbg)
+
+                        saved += 2
                 except Exception:
                     continue
 
@@ -207,7 +242,7 @@ def stage8_9_recenter_gt_gaussian_centroid(
     if verbose:
         print(f"[stage8.9] Processed {processed} GT points; wrote x,y,t (t=RAW frame) to {gt_csv_path}")
         if out_crop_dir is not None:
-            print(f"[stage8.9] Saved {saved} debug crops to {out_crop_dir}")
+            print(f"[stage8.9] Saved {saved} crops (clean+debug) to {out_crop_dir}")
 
     return processed, saved
 
@@ -222,7 +257,7 @@ if __name__ == "__main__":
     ap.add_argument("--crop_h", type=int, default=10)
     ap.add_argument("--gt_offset", type=int, default=9000, help="Offset used ONLY to index into the video; not applied to CSV output.")
     ap.add_argument("--max_frames", type=int, default=None)
-    ap.add_argument("--out_crops", type=str, default=None, help="Folder to save debug crops (optional).")
+    ap.add_argument("--out_crops", type=str, default=None, help="Folder to save debug + clean crops (optional).")
     args = ap.parse_args()
 
     v = Path(args.video)
