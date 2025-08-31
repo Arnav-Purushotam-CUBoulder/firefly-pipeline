@@ -24,6 +24,7 @@ from typing import Dict, List, Tuple, Optional
 
 import cv2
 import numpy as np
+from audit_trail import AuditTrail
 
 # ──────────────────────────────────────────────────────────────
 _BAR = 50
@@ -120,6 +121,7 @@ def stage8_9_recenter_gt_gaussian_centroid(
     max_frames: Optional[int] = None,
     out_crop_dir: Optional[Path] = None,
     verbose: bool = True,
+    audit: Optional[AuditTrail] = None,
 ) -> Tuple[int,int]:
     """
     Reads GT CSV with columns x,y,w,h,frame (x,y are centers), computes a
@@ -176,6 +178,7 @@ def stage8_9_recenter_gt_gaussian_centroid(
     out_rows: List[Tuple[int,int,int]] = []
     saved = 0
     processed = 0
+    audit_shifts: List[dict] = []
 
     fr = 0  # normalized (0-based) frame index for the video
     while True:
@@ -205,6 +208,14 @@ def stage8_9_recenter_gt_gaussian_centroid(
                     # IMPORTANT: write RAW frame index (offset NOT subtracted)
                     out_rows.append((x_int, y_int, int(e['raw_idx'])))
                     processed += 1
+
+                    # audit: log old → new shift at RAW frame index
+                    if audit is not None:
+                        audit_shifts.append({
+                            'frame': int(e['raw_idx']),
+                            'old_x': int(round(cx0)), 'old_y': int(round(cy0)),
+                            'new_x': x_int, 'new_y': y_int,
+                        })
 
                     if out_crop_dir is not None:
                         # 1) Save a clean GT crop (no red overlay)
@@ -239,6 +250,12 @@ def stage8_9_recenter_gt_gaussian_centroid(
     cap.release()
 
     _atomic_write_xy_t(gt_csv_path, out_rows)
+
+    # flush audit shifts (single batch write)
+    if audit is not None and audit_shifts:
+        audit.log_kept('08_9_gt_centroid', audit_shifts,
+                       extra_cols=['old_x','old_y','new_x','new_y'])
+
     if verbose:
         print(f"[stage8.9] Processed {processed} GT points; wrote x,y,t (t=RAW frame) to {gt_csv_path}")
         if out_crop_dir is not None:

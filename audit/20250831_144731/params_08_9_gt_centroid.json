@@ -1,0 +1,6 @@
+{
+  "crop_h": 10,
+  "crop_w": 10,
+  "gt_t_offset": 9000,
+  "sigma": 0.0
+}

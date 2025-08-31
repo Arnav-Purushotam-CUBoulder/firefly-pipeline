@@ -10,6 +10,7 @@ import torch.nn as nn
 import torchvision.transforms as T
 from torchvision import models
 from PIL import Image
+from audit_trail import AuditTrail
 
 BAR_LEN = 50
 def progress(i, total, tag=''):
@@ -74,6 +75,7 @@ def classify_and_filter_csv(
     print_load_status: bool = True,
     fail_if_weights_missing: bool = True,
     debug_save_patches_dir: Optional[Path] = None,
+    audit: Optional[AuditTrail] = None,
 ):
     """Classify detections and overwrite csv_path with added:
        background_logit, firefly_logit, firefly_confidence, and class.
@@ -200,8 +202,20 @@ def classify_and_filter_csv(
 
     cap.release()
 
+    # audit: log all scores before any drop
+    if audit is not None and labeled_rows:
+        audit.log_kept('04_cnn', labeled_rows,
+                       extra_cols=['class','background_logit','firefly_logit','firefly_confidence'],
+                       filename_suffix='scores')
+
     if drop_background_rows:
+        before_drop = list(labeled_rows)
         labeled_rows = [r for r in labeled_rows if r.get('class') == 'firefly']
+        if audit is not None:
+            removed = [r for r in before_drop if r.get('class') != 'firefly']
+            if removed:
+                audit.log_removed('04_cnn', 'classified_background', removed,
+                                  extra_cols=['class','background_logit','firefly_logit','firefly_confidence'])
 
     # Preserve original order, append extras at end
     orig_fields = list(rows[0].keys())

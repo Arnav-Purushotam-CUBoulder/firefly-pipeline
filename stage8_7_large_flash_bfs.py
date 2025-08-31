@@ -26,6 +26,7 @@ from typing import Dict, List, Tuple, Optional, Sequence
 
 import cv2
 import numpy as np
+from audit_trail import AuditTrail
 
 # ──────────────────────────────────────────────────────────────
 # Tiny progress bar (same style as your other stages)
@@ -184,6 +185,7 @@ def stage8_7_expand_large_fireflies(
     gaussian_sigma: float = 0.0,               # reuse orchestrator’s Stage-8 sigma
     max_frames: Optional[int] = None,
     verbose: bool = True,
+    audit: AuditTrail | None = None,
 ) -> Dict[str, int]:
     """
     Returns metrics dict:
@@ -247,6 +249,10 @@ def stage8_7_expand_large_fireflies(
     # We'll rewrite the WHOLE CSV at the end; for now, accumulate per frame.
     new_all_rows: List[dict] = []
 
+    # audit collectors
+    pairs_log: List[dict] = []
+    dim_seeds_log: List[dict] = []
+
     fr = 0
     while True:
         if fr >= limit:
@@ -286,6 +292,14 @@ def stage8_7_expand_large_fireflies(
                 continue
             if int(gray[sy, sx]) < int(neighbor_intensity_threshold):
                 metrics['skipped_dim_seed'] += 1
+                if audit is not None:
+                    dim_seeds_log.append({
+                        'video': str(orig_video_path),
+                        'frame': fr,
+                        'x': sx, 'y': sy,
+                        'seed_intensity': int(gray[sy, sx]),
+                        'min_thr': int(neighbor_intensity_threshold),
+                    })
                 continue
 
             mask_roi, (minx, miny, maxx, maxy) = _bfs_region(gray, sx, sy, int(neighbor_intensity_threshold))
@@ -381,7 +395,7 @@ def stage8_7_expand_large_fireflies(
             metrics['dedup_groups'] += len(groups)
 
             # For each group: if any candidate exists, keep the heaviest candidate; remove all others (orig+cand).
-            for gidxs in groups.values():
+            for root, gidxs in groups.items():
                 cand_nodes = [k for k in gidxs if nodes[k]['kind'] == 'cand']
                 orig_nodes = [k for k in gidxs if nodes[k]['kind'] == 'orig']
 
@@ -423,7 +437,8 @@ def stage8_7_expand_large_fireflies(
                     'new_cx': best['new_cx'], 'new_cy': best['new_cy'],
                     'side': best['side'], 'weight': best['weight'],
                     'src_idx': best['src_idx'], 'src_row': best['src_row'],
-                    'group_src_rows': group_src_rows
+                    'group_src_rows': group_src_rows,
+                    'group_id': int(root),
                 })
 
         metrics['old_rows_removed'] += len(to_remove)
@@ -526,6 +541,29 @@ def stage8_7_expand_large_fireflies(
             ctx_path = out_folder / ("CONTEXT_100.png" if ctx_s == 100 else f"CONTEXT_{ctx_s}.png")
             cv2.imwrite(str(ctx_path), context)
 
+            # audit pair logs for each contributing original → kept replacement
+            if audit is not None:
+                for orow in g['group_src_rows']:
+                    try:
+                        ow = int(round(float(orow.get('w', 10)))); oh = int(round(float(orow.get('h', 10))))
+                        if has_xy_sem and str(orow.get('xy_semantics','')).lower() == 'center':
+                            ocx = float(orow['x']); ocy = float(orow['y'])
+                        else:
+                            ocx = float(orow['x']) + ow/2.0; ocy = float(orow['y']) + oh/2.0
+                    except Exception:
+                        continue
+                    pairs_log.append({
+                        'frame': fr,
+                        'group_id': int(g.get('group_id', -1)),
+                        'new_x': int(round(ncx)), 'new_y': int(round(ncy)),
+                        'new_side': int(ns), 'new_weight': float(g.get('weight', -1.0)),
+                        'old_x': int(round(ocx)), 'old_y': int(round(ocy)),
+                        'old_w': int(ow), 'old_h': int(oh),
+                        'reason': 'large_flash_replace',
+                        'intensity_thr': int(neighbor_intensity_threshold),
+                        'gaussian_sigma': float(gaussian_sigma),
+                    })
+
         metrics['replaced']          += len(kept_cands)
         metrics['new_rows_inserted'] += len(kept_cands)
 
@@ -574,6 +612,14 @@ def stage8_7_expand_large_fireflies(
                     w.writerow({k: r.get(k, "") for k in ff_fieldnames})
                 except Exception:
                     continue
+
+    # audit sidecars
+    if audit is not None:
+        if pairs_log:
+            audit.log_pairs('08_7_large_flash_bfs', pairs_log, filename='replacements.csv')
+        if dim_seeds_log:
+            audit.log_removed('08_7_large_flash_bfs', 'dim_seed', dim_seeds_log,
+                              extra_cols=['seed_intensity','min_thr'])
 
     # Summary
     print("\nStage 8.7 summary")

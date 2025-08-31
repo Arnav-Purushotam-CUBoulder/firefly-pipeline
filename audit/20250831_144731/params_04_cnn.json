@@ -1,0 +1,4 @@
+{
+  "backbone": "resnet18",
+  "model": "/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/background subtraction detection method/actual background subtraction code/frontalis, tremulans and forresti global models/colored_ResNet_18_Frontalis_best_model.pt"
+}

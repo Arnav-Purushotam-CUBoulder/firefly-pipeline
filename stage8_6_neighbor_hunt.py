@@ -20,6 +20,7 @@ from typing import Dict, List, Sequence, Tuple
 
 import cv2
 import numpy as np
+from audit_trail import AuditTrail
 
 # ──────────────────────────────────────────────────────────────
 # Import the stage functions (same names you use in orchestrator)
@@ -206,7 +207,7 @@ def _dedupe_merge(base_rows: List[dict], add_rows: List[dict], dist_px: float) -
 # ──────────────────────────────────────────────────────────────
 # Public API
 # ──────────────────────────────────────────────────────────────
-def stage8_6_run(*, orig_video_path: Path, main_csv_path: Path, num_runs: int | None = None) -> int:
+def stage8_6_run(*, orig_video_path: Path, main_csv_path: Path, num_runs: int | None = None, audit: AuditTrail | None = None) -> int:
     """
     Execute Stage 8.6 end-to-end using orchestrator params. Returns total rows added to MAIN CSV.
     """
@@ -339,6 +340,8 @@ def stage8_6_run(*, orig_video_path: Path, main_csv_path: Path, num_runs: int | 
             csv_path=sub_csv,
             max_frames=MAX_FRAMES,
             bright_max_threshold=BRIGHT_MAX_THRESHOLD,
+            audit=audit,
+            audit_video_path=blacked_video,
         )
 
         # Stage 3
@@ -346,6 +349,7 @@ def stage8_6_run(*, orig_video_path: Path, main_csv_path: Path, num_runs: int | 
             csv_path=sub_csv,
             area_threshold_px=AREA_THRESHOLD_PX,
             snapshot_csv_path=sub_area_snap,
+            audit=audit,
         )
 
         # Stage 4 (only if enabled in orchestrator)
@@ -366,6 +370,7 @@ def stage8_6_run(*, orig_video_path: Path, main_csv_path: Path, num_runs: int | 
                 print_load_status=PRINT_LOAD_STATUS,
                 fail_if_weights_missing=FAIL_IF_WEIGHTS_MISSING,
                 debug_save_patches_dir=DEBUG_SAVE_PATCHES_DIR,
+                audit=audit,
             )
 
         # Stage 7
@@ -375,6 +380,7 @@ def stage8_6_run(*, orig_video_path: Path, main_csv_path: Path, num_runs: int | 
             dist_threshold_px=STAGE7_DIST_THRESHOLD_PX,
             max_frames=MAX_FRAMES,
             verbose=STAGE7_VERBOSE,
+            audit=audit,
         )
 
         # Stage 8
@@ -387,6 +393,7 @@ def stage8_6_run(*, orig_video_path: Path, main_csv_path: Path, num_runs: int | 
             max_frames=MAX_FRAMES,
             verbose=STAGE8_VERBOSE,
             crop_dir=sub_s8_crops,
+            audit=audit,
         )
 
         # Stage 8.5
@@ -397,6 +404,7 @@ def stage8_6_run(*, orig_video_path: Path, main_csv_path: Path, num_runs: int | 
             min_pixel_brightness_to_be_considered_in_area_calculation=MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION,
             max_frames=MAX_FRAMES,
             verbose=True,
+            audit=audit,
         )
 
         # 3) Merge run results into MAIN CSV (+ logits)
@@ -417,6 +425,14 @@ def stage8_6_run(*, orig_video_path: Path, main_csv_path: Path, num_runs: int | 
                 continue
 
         kept, _dropped = _dedupe_merge(base_rows, add_rows, MERGE_DEDUPE_PX)
+
+        # audit: what we tried to add vs what dedupe rejected
+        if audit is not None:
+            if kept:
+                audit.log_kept('08_6_neighbor_hunt', [dict(r, video=str(orig_video_path)) for r in kept])
+            if _dropped:
+                audit.log_removed('08_6_neighbor_hunt', 'dedupe', [dict(r, video=str(orig_video_path)) for r in _dropped])
+
         if not kept:
             print(f"[stage8.6] RUN {run_idx}: nothing to add after dedupe.")
             continue
