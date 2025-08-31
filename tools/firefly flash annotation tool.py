@@ -32,9 +32,9 @@ def _basename(p: str | Path) -> str:
 
 # ───────── global paths ─────────
 DEFAULT_IMAGE_FOLDER = (
-    '/Users/arnavps/Desktop/New DL project data to transfer to external disk/to annotate frames/frontalis')
+    '/Users/arnavps/Desktop/New DL project data to transfer to external disk/to annotate frames/forresti')
 DEFAULT_CSV_FILE = (
-'/Users/arnavps/Desktop/New DL project data to transfer to external disk/to annotate frames/RemovedOverlap_frontalis_annotations.csv')
+'/Users/arnavps/Desktop/New DL project data to transfer to external disk/to annotate frames/forresti ground truth_4k_to_4_5k.csv')
 
 BOX_SIZE      = 10                    # also used as hover patch size
 SEARCH_RADIUS = 30

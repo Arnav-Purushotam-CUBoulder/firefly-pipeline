@@ -45,7 +45,7 @@ from stage8_9_gt_gaussian_centroid import stage8_9_recenter_gt_gaussian_centroid
 # ──────────────────────────────────────────────────────────────
 # Root & I/O locations
 # ──────────────────────────────────────────────────────────────
-ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/orc pipeline frontalis only inference data')
+ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/orc pipeline forresti only inference data')
 
 # Input videos (under your root)
 DIR_ORIG_VIDEOS = ROOT / 'original videos'         # put original .mp4/.avi here
@@ -129,7 +129,7 @@ AREA_THRESHOLD_PX = 6
 
 # Stage 4 — CNN classify/filter
 USE_CNN_FILTER             = True
-CNN_MODEL_PATH             = Path('/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/background subtraction detection method/actual background subtraction code/frontalis, tremulans and forresti global models/colored_ResNet_18_Frontalis_best_model.pt')  # ← SET THIS to your .pt file
+CNN_MODEL_PATH             = Path('/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/background subtraction detection method/actual background subtraction code/frontalis, tremulans and forresti global models/resnet18_Forresti_best_model.pt')  # ← SET THIS to your .pt file
 CNN_BACKBONE               = 'resnet18'
 CNN_CLASS_TO_KEEP          = 1               # firefly class idx
 CNN_PATCH_W                = 10
@@ -192,7 +192,7 @@ DIR_STAGE8_9_OUT       = ROOT / 'stage8.9 gt centroid crops'
 
 # Stage 9 — validation vs ground truth
 GT_CSV_PATH                = ROOT / 'ground truth' / 'gt.csv'  # GT (x,y,t), t is raw & will be normalized
-GT_T_OFFSET                = 9000
+GT_T_OFFSET                = 4000
 DIST_THRESHOLDS_PX         = [1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0]                   # sweep
 STAGE9_CROP_W              = 10
 STAGE9_CROP_H              = 10
