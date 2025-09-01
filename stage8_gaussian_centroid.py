@@ -8,6 +8,7 @@ from typing import Optional, List, Dict, Tuple
 
 import cv2
 import numpy as np
+from audit_trail import AuditTrail
 
 # ──────────────────────────────────────────────────────────────
 # Tiny progress bar
@@ -106,6 +107,7 @@ def recenter_gaussian_centroid(
     # backward-compat aliases
     patch_w: Optional[int] = None,
     patch_h: Optional[int] = None,
+    audit: AuditTrail | None = None,
 ):
     """
     Reads csv_path (expects at least frame,x,y,w,h [,+class,+logits]),
@@ -160,6 +162,7 @@ def recenter_gaussian_centroid(
 
     out_rows: List[dict] = []
     firefly_rows: List[Tuple[float,float,int,float,float]] = []
+    logs_shifts: List[dict] = []
 
     fr = 0  # ZERO-BASED
     while True:
@@ -206,6 +209,20 @@ def recenter_gaussian_centroid(
                 bg = _parse_float_safe(out.get('background_logit', 0.0), 0.0)
                 ff = _parse_float_safe(out.get('firefly_logit', 0.0), 0.0)
                 firefly_rows.append((float(new_cx), float(new_cy), fr, bg, ff))
+
+            # audit: record shift old→new centers
+            if audit is not None:
+                # If row already had center semantics, treat x,y as center; else top-left + w/2,h/2
+                if str(r.get('xy_semantics','')).lower() == 'center':
+                    old_cx, old_cy = float(r['x']), float(r['y'])
+                else:
+                    old_cx, old_cy = float(x) + w/2.0, float(y) + h/2.0
+                logs_shifts.append({
+                    'video': str(orig_video_path),
+                    'frame': int(r['frame']),
+                    'old_x': int(round(old_cx)), 'old_y': int(round(old_cy)),
+                    'new_x': int(round(new_cx)), 'new_y': int(round(new_cy)),
+                })
 
         _progress(fr+1, total_frames, 'stage8'); fr += 1
 
@@ -308,3 +325,7 @@ def recenter_gaussian_centroid(
     if verbose:
         print(f"Stage-8: wrote firefly logits CSV to {fireflies_csv}")
         print("Done.")
+
+    # audit sidecar (centroid shifts)
+    if audit is not None and logs_shifts:
+        audit.log_kept('08_gauss', logs_shifts, extra_cols=['old_x','old_y','new_x','new_y'])

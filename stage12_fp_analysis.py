@@ -66,22 +66,32 @@ def _analyze_threshold_dir_and_render(
     For a single thr_* folder, compute nearest-TP distance for every FP in fps.csv,
     write thr_dir/'fp_nearest_tp.csv', and render a full-frame image per FP with
     both the FP and its nearest TP highlighted in the same color.
+    Also writes an additional full-frame per-FP image that overlays:
+      - All GT (TP+FN) in GREEN
+      - The FP in RED
+      - Overlap pixels (between outlines) in YELLOW
     Returns: (num_fps, num_without_tp_in_frame)
     """
     fps_csv = thr_dir / 'fps.csv'
     tps_csv = thr_dir / 'tps.csv'
+    fns_csv = thr_dir / 'fns.csv'  # for GT overlay images (GT = TP + FN)
     out_csv = thr_dir / 'fp_nearest_tp.csv'
     out_img_dir = thr_dir / 'fp_pair_frames'
     out_img_dir.mkdir(parents=True, exist_ok=True)
 
+    # NEW: extra folder for FP vs all GT overlays
+    out_img_dir_fp_vs_gt = thr_dir / 'fp_vs_gt_frames'
+    out_img_dir_fp_vs_gt.mkdir(parents=True, exist_ok=True)
+
     fps_by_t = _read_points_by_frame(fps_csv)
     tps_by_t = _read_points_by_frame(tps_csv)
+    fns_by_t = _read_points_by_frame(fns_csv)  # may be empty if file missing
 
     frames = sorted(set(fps_by_t.keys()))
     total_fps = sum(len(v) for v in fps_by_t.values())
     no_tp_cnt = 0
 
-    # Precompute nearest TP for each FP
+    # Precompute nearest TP for each FP (kept as-is for CSV compatibility)
     per_t_pairs: Dict[int, List[Dict]] = {}
     for t in frames:
         fps = fps_by_t.get(t, [])
@@ -136,7 +146,7 @@ def _analyze_threshold_dir_and_render(
                     if rec['tp_x'] is not None and rec['tp_y'] is not None:
                         _draw_centered_box(img, rec['tp_x'], rec['tp_y'], box_w, box_h, color, thickness)
 
-                    # Save image
+                    # Save image (original behavior)
                     fpx = int(round(rec['fp_x'])); fpy = int(round(rec['fp_y']))
                     if rec['tp_x'] is None:
                         img_name = f"t{fr:06d}_fpx{fpx}_fpy{fpy}_tpNA_dNA.png"
@@ -149,7 +159,56 @@ def _analyze_threshold_dir_and_render(
                     cv2.imwrite(str(out_path), img)
                     rec['image_path'] = str(out_path)
 
-                    # Write CSV row
+                    # NEW: FP vs ALL GT overlay frame (GREEN=GT, RED=FP, YELLOW=overlap)
+                    # Build layers for outline overlap coloration
+                    green_layer = np.zeros_like(frame)
+                    red_layer   = np.zeros_like(frame)
+                    # All GT points (TP + FN) for this frame
+                    gt_pts = (tps_by_t.get(fr, []) or []) + (fns_by_t.get(fr, []) or [])
+                    # Draw GT in green
+                    for (gx, gy) in gt_pts:
+                        _draw_centered_box(green_layer, gx, gy, box_w, box_h, (0,255,0), thickness)
+                    # Draw FP in red
+                    _draw_centered_box(red_layer, rec['fp_x'], rec['fp_y'], box_w, box_h, (0,0,255), thickness)
+
+                    # Compose: yellow wherever both outlines present, else keep their color
+                    composed = frame.copy()
+                    red_mask   = np.any(red_layer > 0, axis=2)
+                    green_mask = np.any(green_layer > 0, axis=2)
+                    overlap    = red_mask & green_mask
+                    only_red   = red_mask & ~overlap
+                    only_green = green_mask & ~overlap
+                    composed[only_red]   = (0,0,255)
+                    composed[only_green] = (0,255,0)
+                    composed[overlap]    = (0,255,255)
+
+                    # Compute nearest GT (from ALL GT)
+                    if gt_pts:
+                        min_d_gt = None
+                        min_gt   = None
+                        for (gx, gy) in gt_pts:
+                            d = _euclid((rec['fp_x'], rec['fp_y']), (gx, gy))
+                            if (min_d_gt is None) or (d < min_d_gt):
+                                min_d_gt = d
+                                min_gt   = (gx, gy)
+                        ngtx, ngty = int(round(min_gt[0])), int(round(min_gt[1]))
+                        dstr_gt = f"{min_d_gt:.6f}"
+                        legend = "LEGEND_FP=RED_GT=GREEN_OVERLAP=YELLOW"
+                        img_name_gt = (
+                            f"t{fr:06d}_{legend}_"
+                            f"FP({fpx},{fpy})_nearestGT({ngtx},{ngty})_d{dstr_gt}.png"
+                        )
+                    else:
+                        legend = "LEGEND_FP=RED_GT=GREEN_OVERLAP=YELLOW"
+                        img_name_gt = (
+                            f"t{fr:06d}_{legend}_"
+                            f"FP({fpx},{fpy})_nearestGT(NA,NA)_dNA.png"
+                        )
+
+                    out_path_gt = out_img_dir_fp_vs_gt / img_name_gt
+                    cv2.imwrite(str(out_path_gt), composed)
+
+                    # Write CSV row (unchanged)
                     wri.writerow([
                         rec['t'],
                         f"{rec['fp_x']:.3f}", f"{rec['fp_y']:.3f}",
@@ -169,7 +228,7 @@ def _analyze_threshold_dir_and_render(
     cap.release()
     if verbose:
         print(f"[stage12] {thr_dir.name}: analyzed {total_fps} FPs  (no-TP frames: {no_tp_cnt})  "
-              f"→ {out_csv.name} and {out_img_dir.name}/")
+              f"→ {out_csv.name} and {out_img_dir.name}/, plus {out_img_dir_fp_vs_gt.name}/ (FP vs GT overlays)")
 
     return total_fps, no_tp_cnt
 
@@ -189,6 +248,9 @@ def stage12_fp_nearest_tp_analysis(
       - Load fps.csv and tps.csv
       - Create fp_nearest_tp.csv with nearest-TP distances for every FP
       - Save full-frame images per FP in thr_*/fp_pair_frames/, drawing FP and nearest TP.
+      - Also save full-frame images per FP in thr_*/fp_vs_gt_frames/ with GT (TP+FN) in green
+        and the FP in red; overlap pixels are colored yellow. Filenames include a legend,
+        FP coords, nearest GT (from TP+FN), and their distance.
 
     Parameters
     ----------
@@ -197,9 +259,9 @@ def stage12_fp_nearest_tp_analysis(
     orig_video_path : Path
         Path to the original video to grab frames from.
     box_w, box_h : int
-        Size (in pixels) of the boxes to draw, centered at the FP/TP coordinates.
+        Size (in pixels) of the boxes to draw, centered at the FP/TP/GT coordinates.
     color : (B, G, R)
-        Color used for both FP and nearest TP boxes (same color).
+        Color used for both FN and nearest TP boxes (same color).
     thickness : int
         Rectangle border thickness.
     """

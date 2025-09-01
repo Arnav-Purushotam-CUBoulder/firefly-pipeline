@@ -7,6 +7,7 @@ import numpy as np
 import sys
 import math
 from typing import List, Dict
+from audit_trail import AuditTrail
 
 # ─── tiny progress bar ─────────────────────────────────────────
 BAR_LEN = 50
@@ -47,6 +48,7 @@ def prune_overlaps_keep_heaviest_unionfind(
     dist_threshold_px: float = 10.0,   # NEW: max centroid distance to group boxes
     max_frames=None,
     verbose: bool = True,
+    audit: AuditTrail | None = None,
 ):
     """
     For each frame:
@@ -78,6 +80,7 @@ def prune_overlaps_keep_heaviest_unionfind(
 
     global_before = len(rows)
     out_rows: List[dict] = []
+    merge_pairs = []
 
     fr = 0
     while True:
@@ -130,17 +133,39 @@ def prune_overlaps_keep_heaviest_unionfind(
         # For each group choose max-weight index
         for root, idxs in groups.items():
             max_w = -1.0; max_idx = idxs[0]
+            weights = {}
             for i in idxs:
                 x,y,w,h = boxes[i]
                 wt = _rgb_weight(frame, x, y, w, h)
+                weights[i] = wt
                 if wt > max_w:
                     max_w = wt; max_idx = i
             kept = dict(dets[max_idx])  # preserve all columns
             out_rows.append(kept)
+            if audit is not None:
+                for j in idxs:
+                    if j == max_idx:
+                        continue
+                    L = dets[j]
+                    merge_pairs.append({
+                        'frame': int(kept['frame']),
+                        'group_id': int(root),
+                        'keep_x': int(kept['x']), 'keep_y': int(kept['y']),
+                        'keep_w': int(kept['w']), 'keep_h': int(kept['h']),
+                        'keep_weight': float(weights.get(max_idx, -1.0)),
+                        'drop_x': int(L['x']), 'drop_y': int(L['y']),
+                        'drop_w': int(L['w']), 'drop_h': int(L['h']),
+                        'drop_weight': float(weights.get(j, -1.0)),
+                        'reason': 'merge_keep_heaviest',
+                        'dist_thr_px': float(dist_threshold_px),
+                    })
 
         _progress(fr, max_frames or total_frames, 'stage7'); fr += 1
 
     cap.release()
+
+    if audit is not None and merge_pairs:
+        audit.log_pairs('07_merge', merge_pairs, filename='groups_and_winners.csv')
 
     global_after = len(out_rows)
     # Determine fieldnames: keep originals; ensure base columns at front

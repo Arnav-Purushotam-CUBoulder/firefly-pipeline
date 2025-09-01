@@ -7,6 +7,7 @@ from typing import Optional, List, Dict, Tuple
 
 import cv2
 import numpy as np
+from audit_trail import AuditTrail
 
 # ──────────────────────────────────────────────────────────────
 # Tiny progress bar (matches style used elsewhere)
@@ -88,6 +89,7 @@ def stage8_5_prune_by_blob_area(
     min_pixel_brightness_to_be_considered_in_area_calculation: int,
     max_frames: Optional[int] = None,
     verbose: bool = True,
+    audit: AuditTrail | None = None,
 ) -> Tuple[int, int, int]:
     """
     After Stage 8:
@@ -131,6 +133,9 @@ def stage8_5_prune_by_blob_area(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
     limit = min(max_frames, total_frames) if max_frames is not None else total_frames
 
+    logs_removed: List[dict] = []
+    logs_kept: List[dict] = []
+
     fr = 0
     while True:
         if limit is not None and fr >= limit:
@@ -152,6 +157,29 @@ def stage8_5_prune_by_blob_area(
                     area = _largest_cc_area_pixels_over(gray, min_pixel_brightness_to_be_considered_in_area_calculation)
                     if area < int(area_threshold_px):
                         keep_mask[idx] = False
+                        if audit is not None:
+                            logs_removed.append({
+                                'video': str(orig_video_path),
+                                'frame': int(r['frame']),
+                                'x': int(round(float(r['x']))),
+                                'y': int(round(float(r['y']))),
+                                'w': int(round(float(r.get('w', 10)))),
+                                'h': int(round(float(r.get('h', 10)))),
+                                'blob_area': int(area),
+                                'blob_area_thr': int(area_threshold_px),
+                                'bright_floor': int(min_pixel_brightness_to_be_considered_in_area_calculation),
+                            })
+                    else:
+                        if audit is not None:
+                            logs_kept.append({
+                                'video': str(orig_video_path),
+                                'frame': int(r['frame']),
+                                'x': int(round(float(r['x']))),
+                                'y': int(round(float(r['y']))),
+                                'w': int(round(float(r.get('w', 10)))),
+                                'h': int(round(float(r.get('h', 10)))),
+                                'blob_area': int(area),
+                            })
                 except Exception:
                     # If anything fails, keep the row (non-destructive)
                     continue
@@ -220,5 +248,13 @@ def stage8_5_prune_by_blob_area(
     else:
         if verbose:
             print(f"[stage8.5] Fireflies logits CSV not found at {ff_csv}; skipped mirroring.")
+
+    # audit sidecars
+    if audit is not None:
+        if logs_removed:
+            audit.log_removed('08_5_blob_area', 'blob_area_gate_removed', logs_removed,
+                              extra_cols=['blob_area','blob_area_thr','bright_floor'])
+        if logs_kept:
+            audit.log_kept('08_5_blob_area', logs_kept, extra_cols=['blob_area'])
 
     return (deleted_main_fireflies, kept_main_fireflies, deleted_from_ff_csv)

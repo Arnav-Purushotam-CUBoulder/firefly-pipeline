@@ -20,8 +20,8 @@ def _progress(i: int, total: int, tag: str = ''):
 # ──────────────────────────────────────────────────────────────
 def _read_points_by_frame(csv_path: Path) -> Dict[int, List[Tuple[float, float]]]:
     """
-    Read a tps.csv/fns.csv into: t -> list[(x,y)].
-    Expected headers: ['x','y','t','filepath','confidence']
+    Read a tps.csv/fns.csv/fps.csv into: t -> list[(x,y)].
+    Expected headers: ['x','y','t', ...]
     """
     by_t: Dict[int, List[Tuple[float, float]]] = {}
     if not csv_path.exists():
@@ -66,22 +66,39 @@ def _analyze_threshold_dir_and_render(
     For a single thr_* folder, compute nearest-TP distance for every FN in fns.csv,
     write thr_dir/'fn_nearest_tp.csv', and render a full-frame image per FN with
     both the FN and its nearest TP highlighted in the same color.
-    Returns: (num_fns, num_without_tp_in_frame)
+
+    NEW: also render FN vs MODEL overlay frames:
+      - All model predictions (TP + FP) in RED
+      - The FN (missed GT) in GREEN
+      - Overlap pixels (between outlines) in YELLOW
+      Saved under thr_dir/'fn_vs_pred_frames/' with a legend and nearest-PRED info.
     """
     fns_csv = thr_dir / 'fns.csv'
     tps_csv = thr_dir / 'tps.csv'
+    fps_csv = thr_dir / 'fps.csv'   # NEW: to collect all predictions for overlays
     out_csv = thr_dir / 'fn_nearest_tp.csv'
     out_img_dir = thr_dir / 'fn_pair_frames'
     out_img_dir.mkdir(parents=True, exist_ok=True)
 
+    # NEW: extra folder for FN vs MODEL (TP+FP) overlays
+    out_img_dir_fn_vs_pred = thr_dir / 'fn_vs_pred_frames'
+    out_img_dir_fn_vs_pred.mkdir(parents=True, exist_ok=True)
+
     fns_by_t = _read_points_by_frame(fns_csv)
     tps_by_t = _read_points_by_frame(tps_csv)
+    fps_by_t = _read_points_by_frame(fps_csv) if fps_csv.exists() else {}
+
+    # For overlays: predictions in a frame are TP (pred side) + FP
+    preds_by_t: Dict[int, List[Tuple[float, float]]] = {}
+    all_ts = set(tps_by_t.keys()) | set(fps_by_t.keys())
+    for t in all_ts:
+        preds_by_t[t] = (tps_by_t.get(t, []) or []) + (fps_by_t.get(t, []) or [])
 
     frames = sorted(set(fns_by_t.keys()))
     total_fns = sum(len(v) for v in fns_by_t.values())
     no_tp_cnt = 0
 
-    # Precompute nearest TP for each FN
+    # Precompute nearest TP for each FN (kept as-is for CSV compatibility)
     per_t_pairs: Dict[int, List[Dict]] = {}
     for t in frames:
         fns = fns_by_t.get(t, [])
@@ -110,7 +127,7 @@ def _analyze_threshold_dir_and_render(
                     'dist': float(min_d), 'image_path': ''
                 })
 
-    # Render full-frame image(s) for each FN
+    # Render full-frame images and write CSV
     cap = cv2.VideoCapture(str(orig_video_path))
     if not cap.isOpened():
         raise RuntimeError(f"[stage11] Could not open video: {orig_video_path}")
@@ -128,7 +145,6 @@ def _analyze_threshold_dir_and_render(
                 break
 
             if fr in per_t_pairs and per_t_pairs[fr]:
-                H, W = frame.shape[:2]
                 for rec in per_t_pairs[fr]:
                     img = frame.copy()
                     # Draw FN
@@ -137,8 +153,7 @@ def _analyze_threshold_dir_and_render(
                     if rec['tp_x'] is not None and rec['tp_y'] is not None:
                         _draw_centered_box(img, rec['tp_x'], rec['tp_y'], box_w, box_h, color, thickness)
 
-                    # Save image
-                    # Use rounded ints in filename; include distance if available
+                    # Save the "pair" image (original behavior)
                     fnx = int(round(rec['fn_x'])); fny = int(round(rec['fn_y']))
                     if rec['tp_x'] is None:
                         img_name = f"t{fr:06d}_fnx{fnx}_fny{fny}_tpNA_dNA.png"
@@ -151,7 +166,56 @@ def _analyze_threshold_dir_and_render(
                     cv2.imwrite(str(out_path), img)
                     rec['image_path'] = str(out_path)
 
-                    # Write CSV row
+                    # ── NEW: FN vs MODEL overlay (RED = model preds, GREEN = this FN, YELLOW = overlap)
+                    red_layer   = np.zeros_like(frame)
+                    green_layer = np.zeros_like(frame)
+
+                    # Draw all predictions (TP + FP) in RED
+                    pred_pts = preds_by_t.get(fr, [])
+                    for (px, py) in pred_pts:
+                        _draw_centered_box(red_layer, px, py, box_w, box_h, (0,0,255), thickness)
+
+                    # Draw this FN in GREEN
+                    _draw_centered_box(green_layer, rec['fn_x'], rec['fn_y'], box_w, box_h, (0,255,0), thickness)
+
+                    # Compose outlines → red/green/yellow
+                    composed = frame.copy()
+                    red_mask   = np.any(red_layer > 0, axis=2)
+                    green_mask = np.any(green_layer > 0, axis=2)
+                    overlap    = red_mask & green_mask
+                    only_red   = red_mask & ~overlap
+                    only_green = green_mask & ~overlap
+                    composed[only_red]   = (0,0,255)
+                    composed[only_green] = (0,255,0)
+                    composed[overlap]    = (0,255,255)
+
+                    # Nearest predicted point (from TP+FP set)
+                    if pred_pts:
+                        min_d_pred = None
+                        min_pred   = None
+                        for (px, py) in pred_pts:
+                            d = _euclid((rec['fn_x'], rec['fn_y']), (px, py))
+                            if (min_d_pred is None) or (d < min_d_pred):
+                                min_d_pred = d
+                                min_pred   = (px, py)
+                        npx, npy = int(round(min_pred[0])), int(round(min_pred[1]))
+                        dstr_pred = f"{min_d_pred:.6f}"
+                        legend = "LEGEND_PRED=RED_FN=GREEN_OVERLAP=YELLOW"
+                        img_name_pred = (
+                            f"t{fr:06d}_{legend}_"
+                            f"FN({fnx},{fny})_nearestPRED({npx},{npy})_d{dstr_pred}.png"
+                        )
+                    else:
+                        legend = "LEGEND_PRED=RED_FN=GREEN_OVERLAP=YELLOW"
+                        img_name_pred = (
+                            f"t{fr:06d}_{legend}_"
+                            f"FN({fnx},{fny})_nearestPRED(NA,NA)_dNA.png"
+                        )
+
+                    out_path_pred = out_img_dir_fn_vs_pred / img_name_pred
+                    cv2.imwrite(str(out_path_pred), composed)
+
+                    # Write CSV row (unchanged)
                     wri.writerow([
                         rec['t'],
                         f"{rec['fn_x']:.3f}", f"{rec['fn_y']:.3f}",
@@ -161,8 +225,8 @@ def _analyze_threshold_dir_and_render(
                         rec['image_path'],
                     ])
 
+                    _progress(done + 1, total_fns, f"stage11@{thr_dir.name}")
                     done += 1
-                    _progress(done, total_fns, f"stage11@{thr_dir.name}")
 
             fr += 1
             if fr >= total_frames:
@@ -171,7 +235,7 @@ def _analyze_threshold_dir_and_render(
     cap.release()
     if verbose:
         print(f"[stage11] {thr_dir.name}: analyzed {total_fns} FNs  (no-TP frames: {no_tp_cnt})  "
-              f"→ {out_csv.name} and {out_img_dir.name}/")
+              f"→ {out_csv.name} and {out_img_dir.name}/, plus {out_img_dir_fn_vs_pred.name}/ (FN vs PRED overlays)")
 
     return total_fns, no_tp_cnt
 
@@ -191,19 +255,8 @@ def stage11_fn_nearest_tp_analysis(
       - Load fns.csv and tps.csv
       - Create fn_nearest_tp.csv with nearest-TP distances for every FN
       - Save full-frame images per FN in thr_*/fn_pair_frames/, drawing FN and nearest TP.
-
-    Parameters
-    ----------
-    stage9_video_dir : Path
-        Folder with Stage-9 outputs for a single video (contains thr_* subdirs).
-    orig_video_path : Path
-        Path to the original video to grab frames from.
-    box_w, box_h : int
-        Size (in pixels) of the boxes to draw, centered at the FN/TP coordinates.
-    color : (B, G, R)
-        Color used for both FN and nearest TP boxes (same color).
-    thickness : int
-        Rectangle border thickness.
+      - NEW: Save full-frame images per FN in thr_*/fn_vs_pred_frames/ with
+             predictions (TP+FP) in red, FN in green, and yellow where outlines overlap.
     """
     if not stage9_video_dir.exists():
         if verbose:

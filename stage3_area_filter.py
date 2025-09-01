@@ -1,5 +1,6 @@
 import csv
 from pathlib import Path
+from audit_trail import AuditTrail
 
 def _write_csv(path: Path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -10,7 +11,7 @@ def _write_csv(path: Path, rows):
         for r in rows:
             wri.writerow(r)
 
-def filter_boxes_by_area(csv_path: Path, area_threshold_px: int, snapshot_csv_path: Path | None = None):
+def filter_boxes_by_area(csv_path: Path, area_threshold_px: int, snapshot_csv_path: Path | None = None, audit: AuditTrail | None = None):
     """
     Filters rows in-place by area (w*h >= area_threshold_px) and ALSO saves
     an identical 'snapshot' CSV that will NOT be modified by later stages.
@@ -30,14 +31,23 @@ def filter_boxes_by_area(csv_path: Path, area_threshold_px: int, snapshot_csv_pa
         return
 
     filtered = []
+    removed = []
     for r in rows:
         try:
             w = int(r['w']); h = int(r['h'])
-            if w * h >= area_threshold_px:
+            a = w * h
+            if a >= area_threshold_px:
                 filtered.append({
                     'frame': int(r['frame']),
                     'x': int(r['x']), 'y': int(r['y']),
                     'w': w, 'h': h
+                })
+            else:
+                removed.append({
+                    'frame': int(r['frame']),
+                    'x': int(r['x']), 'y': int(r['y']),
+                    'w': w, 'h': h,
+                    'area': a, 'area_thr': int(area_threshold_px)
                 })
         except Exception:
             continue
@@ -49,3 +59,7 @@ def filter_boxes_by_area(csv_path: Path, area_threshold_px: int, snapshot_csv_pa
     if snapshot_csv_path is None:
         snapshot_csv_path = csv_path.with_name(csv_path.stem + '_area_snapshot.csv')
     _write_csv(snapshot_csv_path, filtered)
+
+    # 3) audit sidecar with reasons for removals
+    if audit and removed:
+        audit.log_removed('03_area_filter', 'area_below_thr', removed, extra_cols=['area','area_thr'])

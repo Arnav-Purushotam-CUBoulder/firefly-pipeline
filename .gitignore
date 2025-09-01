@@ -1,0 +1,8 @@
+# model / checkpoint artifacts
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tflite
+*.pb
+*.weights

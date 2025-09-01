@@ -1,100 +1,103 @@
 #!/usr/bin/env python3
 """
-Stage 8.6 — neighbour hunting (post 8.5) with:
- • CNN scoring
- • Stage-8-style Gaussian recenter (local 10×10)
- • Full-frame debug overlays (white = search window, gray = blackout, red = final box+pixel)
- • Dedupe against ALL EXISTING **FIREFLY** rows in the frame (from the saved CSV)
+Stage 8.6 — Iterative blackout + full re-run (uses orchestrator's params directly)
 
-Behavior
---------
-For every firefly row in the main CSV:
-  1) Hunt a bright neighbour around its center (central 10×10 blacked out in the search patch).
-  2) Peak-brightness prefilter.
-  3) CNN on a 10×10 at the peak; keep only if firefly_conf ≥ threshold.
-  4) Recenter inside that 10×10 using Stage-8’s local Gaussian/intensity centroid.
-  5) **Dedupe**: if the refined center is within min_separation_px of *any existing firefly* in that frame
-     (from the CSV prior to 8.6), discard. Also dedupe against neighbours accepted earlier in this same frame.
-  6) Append accepted neighbours to the main CSV (w=h=10, class/logits/conf, xy_semantics='center').
-  7) Append to `<stem>_fireflies_logits.csv`.
-  8) Save crop (red pixel at centroid) + full frame (white search, gray blackout, red final box).
+Per RUN:
+  1) Read the current MAIN CSV (already post Stage 8/8.5).
+  2) Build a blacked video by painting 10×10 black squares at every firefly center (per frame).
+  3) Run Stage1→2→3→4→7→8→8.5 directly on that blacked video using the SAME params you set in the orchestrator.
+  4) Merge the run's final CSV into the MAIN CSV (+ append matching rows into main *_fireflies_logits.csv)
+     with a tiny proximity dedupe (default 2 px).
 
+All Stage 8.6 artifacts live under:
+  ROOT / "stage8.6" / <video_stem> / run_XX/
 """
 
-import csv, math, os
+from __future__ import annotations
+import csv
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import cv2
 import numpy as np
-import torch
-import torch.nn as nn
-import torchvision.transforms as T
-from torchvision import models
-from PIL import Image
+from audit_trail import AuditTrail
 
 # ──────────────────────────────────────────────────────────────
-# Progress bar
-_BAR = 50
-def _progress(i, total, tag=''):
-    total = max(1, int(total or 1))
-    i = min(i, total)
-    frac = 0 if total == 0 else min(1.0, max(0.0, i / total))
-    bar  = '=' * int(frac * _BAR) + ' ' * (_BAR - int(frac * _BAR))
-    try:
-        import sys
-        sys.stdout.write(f'\r{tag} [{bar}] {int(frac*100):3d}%')
-        sys.stdout.flush()
-        if i == total:
-            sys.stdout.write('\n')
-    except Exception:
-        pass
+# Import the stage functions (same names you use in orchestrator)
+# ──────────────────────────────────────────────────────────────
+from stage1_detect import detect_blobs_to_csv as STAGE1_DETECT
+from stage2_recenter import recenter_boxes_with_centroid as STAGE2_RECENTER
+from stage3_area_filter import filter_boxes_by_area as STAGE3_AREA_FILTER
+from stage4_cnn_filter import classify_and_filter_csv as STAGE4_CNN_FILTER
+from stage7_merge import prune_overlaps_keep_heaviest_unionfind as STAGE7_MERGE
+from stage8_gaussian_centroid import recenter_gaussian_centroid as STAGE8_GAUSSIAN_CENTROID
+from stage8_5_blob_area_filter import stage8_5_prune_by_blob_area as STAGE8_5_BLOB_FILTER
+
 
 # ──────────────────────────────────────────────────────────────
-# CSV utils
+# Pull ALL params/paths directly from the running orchestrator.
+# (Avoid circular imports by reading __main__ at call time.)
+# ──────────────────────────────────────────────────────────────
+def _orc():
+    """Return the running orchestrator module (loaded as __main__)."""
+    import __main__ as ORC  # orchestrator.py when executed is __main__
+    return ORC
+
+
+# ──────────────────────────────────────────────────────────────
+# CSV helpers
+# ──────────────────────────────────────────────────────────────
 def _read_csv_rows(p: Path) -> List[dict]:
     try:
-        with p.open('r', newline='') as f:
+        with p.open("r", newline="") as f:
             return list(csv.DictReader(f))
     except FileNotFoundError:
         return []
 
-def _write_csv_rows(p: Path, rows: List[dict], orig_cols: List[str]):
-    fieldnames = orig_cols[:]
-    for extra in ['class','background_logit','firefly_logit','firefly_confidence','xy_semantics']:
+def _write_csv_rows(p: Path, rows: List[dict], field_order: Sequence[str]):
+    fieldnames = list(field_order)
+    # Keep stage-added columns stable
+    for extra in ["class","background_logit","firefly_logit","firefly_confidence","xy_semantics"]:
         if extra not in fieldnames:
             fieldnames.append(extra)
-    with p.open('w', newline='') as f:
-        wri = csv.DictWriter(f, fieldnames=fieldnames)
-        wri.writeheader()
+    with p.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
         for r in rows:
-            wri.writerow({k: r.get(k, '') for k in fieldnames})
+            w.writerow({k: r.get(k, "") for k in fieldnames})
 
-# ──────────────────────────────────────────────────────────────
-# Geometry + math
-def _euclid2(a: Tuple[float,float], b: Tuple[float,float]) -> float:
-    dx = float(a[0]) - float(b[0]); dy = float(a[1]) - float(b[1])
-    return dx*dx + dy*dy
-
-def _frame_firefly_centers(rows: List[dict], frame_idx: int, has_class: bool) -> List[Tuple[float,float]]:
-    """Centers of EXISTING FIREFLY rows (or all rows if no 'class' column)."""
-    out = []
+def _frame_firefly_centers(rows: List[dict]) -> Dict[int, List[Tuple[float,float]]]:
+    out: Dict[int, List[Tuple[float,float]]] = {}
+    has_class = ("class" in rows[0].keys()) if rows else False
     for r in rows:
         try:
-            if int(r['frame']) != frame_idx: 
+            if has_class and r.get("class") != "firefly":
                 continue
-            if has_class and r.get('class') != 'firefly':
-                continue
-            w = int(round(float(r.get('w', 10))))
-            h = int(round(float(r.get('h', 10))))
-            if str(r.get('xy_semantics','')).lower() == 'center':
-                cx = float(r['x']); cy = float(r['y'])
+            f = int(r["frame"])
+            w = int(round(float(r.get("w", 10))))
+            h = int(round(float(r.get("h", 10))))
+            if str(r.get("xy_semantics","")).lower() == "center":
+                cx = float(r["x"]); cy = float(r["y"])
             else:
-                cx = float(r['x']) + w/2.0; cy = float(r['y']) + h/2.0
-            out.append((cx, cy))
+                cx = float(r["x"]) + w/2.0
+                cy = float(r["y"]) + h/2.0
+            out.setdefault(f, []).append((cx, cy))
         except Exception:
             continue
     return out
+
+
+# ──────────────────────────────────────────────────────────────
+# Video helpers
+# ──────────────────────────────────────────────────────────────
+def _open_writer_like(cap: cv2.VideoCapture, out_path: Path) -> cv2.VideoWriter:
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or float(fps) <= 1e-3:
+        fps = 30.0
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    return cv2.VideoWriter(str(out_path), fourcc, float(fps), (W, H))
 
 def _clamped_center_box(cx: float, cy: float, w: int, h: int, W: int, H: int) -> Tuple[int,int,int,int]:
     w = max(1, int(round(w))); h = max(1, int(round(h)))
@@ -102,378 +105,384 @@ def _clamped_center_box(cx: float, cy: float, w: int, h: int, W: int, H: int) ->
     x0 = max(0, min(x0, W - w)); y0 = max(0, min(y0, H - h))
     return x0, y0, x0 + w, y0 + h
 
-# ── Stage-8-style Gaussian centroid on LOCAL 10×10 crop ───────
-def _gaussian_kernel(w: int, h: int, sigma: float) -> np.ndarray:
-    if sigma <= 0:
-        k = np.ones((h, w), dtype=np.float32)
-        return k / float(h * w)
-    yc = (h - 1) / 2.0
-    xc = (w - 1) / 2.0
-    y  = np.arange(h, dtype=np.float32)[:, None]
-    x  = np.arange(w, dtype=np.float32)[None, :]
-    g  = np.exp(-((x - xc)**2 + (y - yc)**2) / (2.0 * sigma**2))
-    s  = g.sum()
-    if s > 0:
-        g /= s
-    return g.astype(np.float32)
-
-def _intensity_centroid_local(img_gray: np.ndarray, gaussian_sigma: float = 0.0) -> Tuple[float,float]:
-    """
-    Stage-8 equivalent: return centroid (cx, cy) IN LOCAL CROP COORDS.
-    """
-    img = img_gray.astype(np.float32)
-    if gaussian_sigma and gaussian_sigma > 0:
-        gh, gw = img.shape[:2]
-        G = _gaussian_kernel(gw, gh, gaussian_sigma)
-        img = img * G
-    total = float(img.sum())
-    if total <= 1e-6:
-        H, W = img.shape[:2]
-        return (W/2.0, H/2.0)
-    ys, xs = np.mgrid[0:img.shape[0], 0:img.shape[1]].astype(np.float32)
-    cx = float((xs * img).sum() / total)
-    cy = float((ys * img).sum() / total)
-    return cx, cy
-
-# ──────────────────────────────────────────────────────────────
-# Model helpers
-def _device():
-    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-def _build_backbone(backbone: str) -> nn.Module:
-    b = (backbone or 'resnet18').lower()
-    fns = {
-        'resnet18':  models.resnet18,
-        'resnet34':  models.resnet34,
-        'resnet50':  models.resnet50,
-        'resnet101': models.resnet101,
-        'resnet152': models.resnet152,
-    }
-    net = fns.get(b, models.resnet18)(weights=None)
-    in_f = net.fc.in_features
-    net.fc = nn.Linear(in_f, 2)
-    return net
-
-def _softmax_fire_prob(bg_logit: float, ff_logit: float) -> float:
-    m = max(bg_logit, ff_logit)
-    eb = math.exp(bg_logit - m); ef = math.exp(ff_logit - m)
-    denom = eb + ef
-    return ef / denom if denom > 0 else 0.5
-
-def _center_crop_bgr(frame_bgr: np.ndarray, cx: float, cy: float, w: int, h: int) -> Tuple[np.ndarray, Tuple[int,int,int,int]]:
-    H, W = frame_bgr.shape[:2]
-    x0, y0, x1, y1 = _clamped_center_box(cx, cy, w, h, W, H)
-    return frame_bgr[y0:y1, x0:x1].copy(), (x0, y0, x1, y1)
-
-def _bgr_to_pil(bgr: np.ndarray) -> Image.Image:
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(rgb)
-
-@torch.no_grad()
-def stage8_6_neighbor_hunt(
-    *,
-    orig_video_path: Path,
-    csv_path: Path,
-    neighbour_radius_px: int,
-    blackout_w: int = 10,
-    blackout_h: int = 10,
-    min_brightness_for_neighbour: int = 50,
-    min_separation_px: int = 2,
-    # model settings
-    model_path: Optional[Path] = None,
-    backbone: str = 'resnet18',
-    imagenet_normalize: bool = False,
-    firefly_conf_thresh: float = 0.5,
-    fail_if_weights_missing: bool = True,
-    # Gaussian centroid
-    gaussian_sigma: float = 1.0,
-    # debug saves
-    save_debug_artifacts: bool = True,
-    # misc
-    max_frames: Optional[int] = None,
-    verbose: bool = True,
-    **extra_kwargs,
-) -> int:
-    rows = _read_csv_rows(csv_path)
-    if not rows:
-        if verbose: print("[stage8.6] No rows; nothing to do.")
-        return 0
-
-    orig_cols = list(rows[0].keys())
-    has_class = ('class' in rows[0].keys())
-
-    # Build per-frame indexes
-    # • by_frame: indexes FIRELY source rows we iterate over (same as before)
-    # • centers_ff: EXISTING **firefly** centers (from the CSV prior to 8.6) we must dedupe against
-    by_frame: Dict[int, List[int]] = {}
-    centers_ff: Dict[int, List[Tuple[float,float]]] = {}  # prior fireflies in saved CSV
-    frames_seen = set()
-    for i, r in enumerate(rows):
-        try:
-            f = int(r['frame'])
-            frames_seen.add(f)
-            if max_frames is not None and f >= max_frames:
-                continue
-            if (not has_class) or (r.get('class') == 'firefly'):
-                by_frame.setdefault(f, []).append(i)
-        except Exception:
-            continue
-    for f in frames_seen:
-        centers_ff[f] = _frame_firefly_centers(rows, f, has_class)
-
-    # Video
+def _build_blacked_video(
+    *, orig_video_path: Path, centers_by_frame: Dict[int, List[Tuple[float,float]]],
+    out_video_path: Path, blackout_w: int = 10, blackout_h: int = 10, max_frames=None
+):
     cap = cv2.VideoCapture(str(orig_video_path))
     if not cap.isOpened():
         raise RuntimeError(f"[stage8.6] Could not open video: {orig_video_path}")
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-    limit = min(max_frames, total_frames) if max_frames is not None else total_frames
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    if max_frames is not None:
+        total = min(total, int(max_frames))
 
-    # Output dirs (next to CSV)
-    video_stem = Path(orig_video_path).stem
-    base_dir   = csv_path.parent
-    crops_dir  = base_dir / "stage8_6_neighbor_crops" / video_stem
-    frames_dir = base_dir / "stage8_6_neighbor_frames" / video_stem
-    if save_debug_artifacts:
-        os.makedirs(crops_dir, exist_ok=True)
-        os.makedirs(frames_dir, exist_ok=True)
-
-    # Model
-    dev = _device()
-    net = _build_backbone(backbone).to(dev).eval()
-
-    ok_weights = False
-    if model_path is not None and Path(model_path).exists():
-        try:
-            blob = torch.load(str(model_path), map_location=dev)
-            sd = None
-            if isinstance(blob, dict):
-                for k in ['state_dict','model_state_dict','net','model','weights']:
-                    if k in blob and isinstance(blob[k], dict):
-                        sd = blob[k]; break
-                if sd is None and all(isinstance(v, torch.Tensor) for v in blob.values()):
-                    sd = blob
-            elif isinstance(blob, nn.Module):
-                net.load_state_dict(blob.state_dict(), strict=False)
-                ok_weights = True
-            if sd is not None:
-                net.load_state_dict(sd, strict=False)
-                ok_weights = True
-        except Exception as e:
-            if verbose: print(f"[stage8.6] Warning: failed to load weights: {e}")
-            ok_weights = False
-    if not ok_weights:
-        msg = f"[stage8.6] Model weights missing at {model_path}."
-        if fail_if_weights_missing: raise RuntimeError(msg)
-        if verbose: print(msg + " Proceeding with random weights (NOT recommended).")
-
-    # Transforms
-    tfms = [T.ToTensor()]
-    if imagenet_normalize:
-        tfms.append(T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]))
-    transform = T.Compose(tfms)
-
-    # Idempotence caches:
-    #  • existing fireflies in saved CSV (centers_ff)
-    #  • neighbours we accept during this run (accepted_ff)
-    accepted_ff: Dict[int, List[Tuple[float,float]]] = {f: [] for f in frames_seen}
-
-    new_rows: List[dict] = []
-    new_ff_logits_rows: List[dict] = []
+    out = _open_writer_like(cap, out_video_path)
 
     fr = 0
+    BAR = 50
     while True:
-        if limit is not None and fr >= limit: break
-        ok, frame_bgr = cap.read()
-        if not ok: break
+        if max_frames is not None and fr >= max_frames:
+            break
+        ok, frame = cap.read()
+        if not ok:
+            break
+        for (cx, cy) in centers_by_frame.get(fr, []):
+            x0, y0, x1, y1 = _clamped_center_box(cx, cy, blackout_w, blackout_h, W, H)
+            frame[y0:y1, x0:x1] = 0  # fill black
+        out.write(frame)
 
-        idxs = by_frame.get(fr, [])
-        if not idxs:
-            _progress(fr+1, limit, 'stage8.6'); fr += 1
+        # progress
+        frac = 0 if total == 0 else min(1.0, max(0.0, (fr+1) / total))
+        bar  = '=' * int(frac * BAR) + ' ' * (BAR - int(frac * BAR))
+        try:
+            import sys
+            sys.stdout.write(f'\r[stage8.6] build blacked video [{bar}] {int(frac*100):3d}%')
+            sys.stdout.flush()
+        except Exception:
+            pass
+        fr += 1
+
+    cap.release(); out.release()
+    try:
+        import sys; sys.stdout.write('\n')
+    except Exception:
+        pass
+    print(f"[stage8.6] Blacked video → {out_video_path}")
+
+
+# ──────────────────────────────────────────────────────────────
+# Merge helpers
+# ──────────────────────────────────────────────────────────────
+def _euclid2(a: Tuple[float,float], b: Tuple[float,float]) -> float:
+    dx = float(a[0]) - float(b[0]); dy = float(a[1]) - float(b[1])
+    return dx*dx + dy*dy
+
+def _dedupe_merge(base_rows: List[dict], add_rows: List[dict], dist_px: float) -> Tuple[List[dict], List[dict]]:
+    if not add_rows:
+        return [], []
+    has_class = ("class" in base_rows[0].keys()) if base_rows else False
+    centers_by_frame: Dict[int, List[Tuple[float,float]]] = {}
+    for r in base_rows:
+        try:
+            if has_class and r.get("class") != "firefly":
+                continue
+            f = int(r["frame"])
+            w = int(round(float(r.get("w", 10)))); h = int(round(float(r.get("h", 10))))
+            if str(r.get("xy_semantics","")).lower() == "center":
+                cx = float(r["x"]); cy = float(r["y"])
+            else:
+                cx = float(r["x"]) + w/2.0; cy = float(r["y"]) + h/2.0
+            centers_by_frame.setdefault(f, []).append((cx, cy))
+        except Exception:
             continue
 
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    thr2 = float(dist_px * dist_px)
+    kept, dropped = [], []
+    acc_by_frame: Dict[int, List[Tuple[float,float]]] = {}
+    for r in add_rows:
+        try:
+            f = int(r["frame"])
+            w = int(round(float(r.get("w", 10)))); h = int(round(float(r.get("h", 10))))
+            if str(r.get("xy_semantics","")).lower() == "center":
+                cx = float(r["x"]); cy = float(r["y"])
+            else:
+                cx = float(r["x"]) + w/2.0; cy = float(r["y"]) + h/2.0
 
-        # Centers to dedupe against in this frame = prior fireflies + those we accepted earlier in this frame
-        def too_close_to_any(xy: Tuple[float,float]) -> bool:
-            px, py = xy
-            thr2 = float(min_separation_px**2)
-            # prior fireflies
-            for c in centers_ff.get(fr, []):
-                if _euclid2((px,py), c) <= thr2: 
-                    return True
-            # accepted in this run (same frame)
-            for c in accepted_ff.get(fr, []):
-                if _euclid2((px,py), c) <= thr2:
-                    return True
-            return False
+            # against base
+            if any(_euclid2((cx,cy), c) <= thr2 for c in centers_by_frame.get(f, [])):
+                dropped.append(r); continue
+            # among kept additions
+            if any(_euclid2((cx,cy), c) <= thr2 for c in acc_by_frame.get(f, [])):
+                dropped.append(r); continue
 
-        for i in idxs:
-            r = rows[i]
+            kept.append(r)
+            acc_by_frame.setdefault(f, []).append((cx,cy))
+        except Exception:
+            dropped.append(r)
+    return kept, dropped
+
+
+# ──────────────────────────────────────────────────────────────
+# Public API
+# ──────────────────────────────────────────────────────────────
+def stage8_6_run(*, orig_video_path: Path, main_csv_path: Path, num_runs: int | None = None, audit: AuditTrail | None = None) -> int:
+    """
+    Execute Stage 8.6 end-to-end using orchestrator params. Returns total rows added to MAIN CSV.
+    """
+    ORC = _orc()
+
+    # —— derive knobs from orchestrator (single source of truth)
+    ROOT                     = ORC.ROOT
+    MAX_FRAMES               = ORC.MAX_FRAMES
+    RUN_STAGE4               = ORC.RUN_STAGE4
+    USE_CNN_FILTER           = ORC.USE_CNN_FILTER
+
+    # Stage-1 params
+    SBD_MIN_AREA_PX          = ORC.SBD_MIN_AREA_PX
+    SBD_MAX_AREA_SCALE       = ORC.SBD_MAX_AREA_SCALE
+    SBD_MIN_DIST             = ORC.SBD_MIN_DIST
+    SBD_MIN_REPEAT           = ORC.SBD_MIN_REPEAT
+    USE_CLAHE                = ORC.USE_CLAHE
+    CLAHE_CLIP               = ORC.CLAHE_CLIP
+    CLAHE_TILE               = ORC.CLAHE_TILE
+    USE_TOPHAT               = ORC.USE_TOPHAT
+    TOPHAT_KSIZE             = ORC.TOPHAT_KSIZE
+    USE_DOG                  = ORC.USE_DOG
+    DOG_SIGMA1               = ORC.DOG_SIGMA1
+    DOG_SIGMA2               = ORC.DOG_SIGMA2
+
+    # Stage-2
+    BRIGHT_MAX_THRESHOLD     = ORC.BRIGHT_MAX_THRESHOLD
+
+    # Stage-3
+    AREA_THRESHOLD_PX        = ORC.AREA_THRESHOLD_PX
+
+    # Stage-4
+    CNN_MODEL_PATH           = ORC.CNN_MODEL_PATH
+    CNN_BACKBONE             = ORC.CNN_BACKBONE
+    CNN_CLASS_TO_KEEP        = ORC.CNN_CLASS_TO_KEEP
+    CNN_PATCH_W              = ORC.CNN_PATCH_W
+    CNN_PATCH_H              = ORC.CNN_PATCH_H
+    FIREFLY_CONF_THRESH      = ORC.FIREFLY_CONF_THRESH
+    DROP_BACKGROUND_ROWS     = ORC.DROP_BACKGROUND_ROWS
+    IMAGENET_NORMALIZE       = ORC.IMAGENET_NORMALIZE
+    PRINT_LOAD_STATUS        = ORC.PRINT_LOAD_STATUS
+    FAIL_IF_WEIGHTS_MISSING  = ORC.FAIL_IF_WEIGHTS_MISSING
+    DEBUG_SAVE_PATCHES_DIR   = ORC.DEBUG_SAVE_PATCHES_DIR
+
+    # Stage-7
+    STAGE7_DIST_THRESHOLD_PX = ORC.STAGE7_DIST_THRESHOLD_PX
+    STAGE7_VERBOSE           = ORC.STAGE7_VERBOSE
+
+    # Stage-8
+    STAGE8_PATCH_W           = ORC.STAGE8_PATCH_W
+    STAGE8_PATCH_H           = ORC.STAGE8_PATCH_H
+    STAGE8_GAUSSIAN_SIGMA    = ORC.STAGE8_GAUSSIAN_SIGMA
+    STAGE8_VERBOSE           = ORC.STAGE8_VERBOSE
+    DIR_STAGE8_CROPS         = ORC.DIR_STAGE8_CROPS
+
+    # Stage-8.5 / 9 shared
+    MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION = ORC.MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION
+
+    # Stage-8.6 knobs
+    STAGE8_6_RUNS            = getattr(ORC, "STAGE8_6_RUNS", 1)  # you add this in orchestrator
+    MERGE_DEDUPE_PX          = getattr(ORC, "STAGE8_6_DEDUPE_PX", 2.0)
+
+    runs = int(num_runs if num_runs is not None else STAGE8_6_RUNS)
+    if runs <= 0:
+        print("[stage8.6] Skipping (STAGE8_6_RUNS <= 0)")
+        return 0
+
+    # Load MAIN CSV
+    base_rows = _read_csv_rows(main_csv_path)
+    if not base_rows:
+        print("[stage8.6] Main CSV is empty—nothing to blackout.")
+        return 0
+    field_order = list(base_rows[0].keys())
+
+    video_stem = Path(orig_video_path).stem
+    stage86_root = ROOT / "stage8.6" / video_stem
+    stage86_root.mkdir(parents=True, exist_ok=True)
+
+    main_ff_logits_path = main_csv_path.with_name(main_csv_path.stem + "_fireflies_logits.csv")
+
+    total_added = 0
+    for run_idx in range(1, runs + 1):
+        print(f"[stage8.6] RUN {run_idx}/{runs}")
+
+        # Paths for this run
+        run_dir = stage86_root / f"run_{run_idx:02d}"
+        (run_dir / "csv files").mkdir(parents=True, exist_ok=True)
+        (run_dir / "stage8 crops").mkdir(parents=True, exist_ok=True)
+
+        run_tag        = f"{main_csv_path.stem}__s8_6run{run_idx}"
+        blacked_video  = run_dir / "blacked.mp4"
+        sub_csv        = run_dir / "csv files" / f"{run_tag}.csv"
+        sub_ff_logits  = run_dir / "csv files" / f"{run_tag}_fireflies_logits.csv"
+        sub_area_snap  = run_dir / "csv files" / f"{run_tag}_area_snapshot.csv"
+        sub_s8_crops   = run_dir / "stage8 crops"  # for Stage 8
+
+        # 1) Build blacked video from CURRENT base_rows
+        centers_by_frame = _frame_firefly_centers(base_rows)
+        _build_blacked_video(
+            orig_video_path=orig_video_path,
+            centers_by_frame=centers_by_frame,
+            out_video_path=blacked_video,
+            blackout_w=10, blackout_h=10,
+            max_frames=MAX_FRAMES,
+        )
+
+        # 2) Run standard pipeline on the blacked video (using orchestrator's params)
+        # Stage 1
+        STAGE1_DETECT(
+            orig_path=blacked_video,
+            csv_path=sub_csv,
+            max_frames=MAX_FRAMES,
+            sbd_min_area_px=SBD_MIN_AREA_PX,
+            sbd_max_area_scale=SBD_MAX_AREA_SCALE,
+            sbd_min_dist=SBD_MIN_DIST,
+            sbd_min_repeat=SBD_MIN_REPEAT,
+            use_clahe=USE_CLAHE,
+            clahe_clip=CLAHE_CLIP,
+            clahe_tile=CLAHE_TILE,
+            use_tophat=USE_TOPHAT,
+            tophat_ksize=TOPHAT_KSIZE,
+            use_dog=USE_DOG,
+            dog_sigma1=DOG_SIGMA1,
+            dog_sigma2=DOG_SIGMA2,
+        )
+
+        # Stage 2
+        STAGE2_RECENTER(
+            orig_path=blacked_video,
+            csv_path=sub_csv,
+            max_frames=MAX_FRAMES,
+            bright_max_threshold=BRIGHT_MAX_THRESHOLD,
+            audit=audit,
+            audit_video_path=blacked_video,
+        )
+
+        # Stage 3
+        STAGE3_AREA_FILTER(
+            csv_path=sub_csv,
+            area_threshold_px=AREA_THRESHOLD_PX,
+            snapshot_csv_path=sub_area_snap,
+            audit=audit,
+        )
+
+        # Stage 4 (only if enabled in orchestrator)
+        if RUN_STAGE4 and USE_CNN_FILTER:
+            STAGE4_CNN_FILTER(
+                orig_path=blacked_video,
+                csv_path=sub_csv,
+                max_frames=MAX_FRAMES,
+                use_cnn_filter=USE_CNN_FILTER,
+                model_path=CNN_MODEL_PATH,
+                backbone=CNN_BACKBONE,
+                class_to_keep=CNN_CLASS_TO_KEEP,
+                patch_w=CNN_PATCH_W,
+                patch_h=CNN_PATCH_H,
+                firefly_conf_thresh=FIREFLY_CONF_THRESH,
+                drop_background_rows=DROP_BACKGROUND_ROWS,
+                imagenet_normalize=IMAGENET_NORMALIZE,
+                print_load_status=PRINT_LOAD_STATUS,
+                fail_if_weights_missing=FAIL_IF_WEIGHTS_MISSING,
+                debug_save_patches_dir=DEBUG_SAVE_PATCHES_DIR,
+                audit=audit,
+            )
+
+        # Stage 7
+        STAGE7_MERGE(
+            orig_video_path=blacked_video,
+            csv_path=sub_csv,
+            dist_threshold_px=STAGE7_DIST_THRESHOLD_PX,
+            max_frames=MAX_FRAMES,
+            verbose=STAGE7_VERBOSE,
+            audit=audit,
+        )
+
+        # Stage 8
+        STAGE8_GAUSSIAN_CENTROID(
+            orig_video_path=blacked_video,
+            csv_path=sub_csv,
+            centroid_patch_w=STAGE8_PATCH_W,
+            centroid_patch_h=STAGE8_PATCH_H,
+            gaussian_sigma=STAGE8_GAUSSIAN_SIGMA,
+            max_frames=MAX_FRAMES,
+            verbose=STAGE8_VERBOSE,
+            crop_dir=sub_s8_crops,
+            audit=audit,
+        )
+
+        # Stage 8.5
+        STAGE8_5_BLOB_FILTER(
+            orig_video_path=blacked_video,
+            csv_path=sub_csv,
+            area_threshold_px=AREA_THRESHOLD_PX,
+            min_pixel_brightness_to_be_considered_in_area_calculation=MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION,
+            max_frames=MAX_FRAMES,
+            verbose=True,
+            audit=audit,
+        )
+
+        # 3) Merge run results into MAIN CSV (+ logits)
+        run_rows = _read_csv_rows(sub_csv)
+        if not run_rows:
+            print(f"[stage8.6] RUN {run_idx}: produced no rows.")
+            continue
+
+        # Collect fireflies (post Stage 8/8.5: center semantics, w=h=10)
+        add_rows = []
+        has_class = ("class" in run_rows[0].keys())
+        for r in run_rows:
             try:
-                w = int(round(float(r.get('w', 10))))
-                h = int(round(float(r.get('h', 10))))
-                if str(r.get('xy_semantics','')).lower() == 'center':
-                    cx = float(r['x']); cy = float(r['y'])
-                else:
-                    cx = float(r['x']) + w/2.0; cy = float(r['y']) + h/2.0
-
-                # Search window (includes blackout padding)
-                pad_x = neighbour_radius_px + blackout_w//2
-                pad_y = neighbour_radius_px + blackout_h//2
-                sx0 = max(0, int(round(cx - pad_x)))
-                sy0 = max(0, int(round(cy - pad_y)))
-                sx1 = min(W, int(round(cx + pad_x)))
-                sy1 = min(H, int(round(cy + pad_y)))
-                if sx1 <= sx0 or sy1 <= sy0: 
+                if has_class and r.get("class") != "firefly":
                     continue
-
-                patch = gray[sy0:sy1, sx0:sx1].copy()
-
-                # Black out central 10×10 inside the search patch
-                bx0 = int(round(cx - blackout_w/2.0)) - sx0
-                by0 = int(round(cy - blackout_h/2.0)) - sy0
-                bx1 = bx0 + blackout_w
-                by1 = by0 + blackout_h
-                bx0_c = max(0, min(bx0, patch.shape[1]))
-                by0_c = max(0, min(by0, patch.shape[0]))
-                bx1_c = max(0, min(bx1, patch.shape[1]))
-                by1_c = max(0, min(by1, patch.shape[0]))
-                if bx1_c > bx0_c and by1_c > by0_c:
-                    patch[by0_c:by1_c, bx0_c:bx1_c] = 0
-
-                # Peak search
-                _, max_val, _, max_loc = cv2.minMaxLoc(patch)
-                if max_val < float(min_brightness_for_neighbour):
-                    continue
-
-                # Candidate center (global)
-                nx = float(sx0 + max_loc[0])
-                ny = float(sy0 + max_loc[1])
-
-                # Early dedupe vs existing & already-accepted fireflies
-                if too_close_to_any((nx, ny)):
-                    continue
-
-                # CNN on 10×10 at (nx,ny)
-                crop10_bgr, (cx0, cy0, cx1, cy1) = _center_crop_bgr(frame_bgr, nx, ny, blackout_w, blackout_h)
-                x = transform(_bgr_to_pil(crop10_bgr)).unsqueeze(0).to(_device())
-                logits = net(x)[0]
-                bg_logit = float(logits[0].item())
-                ff_logit = float(logits[1].item())
-                ff_conf  = _softmax_fire_prob(bg_logit, ff_logit)
-                if ff_conf < float(firefly_conf_thresh):
-                    continue
-
-                # Recenter using Stage-8 local-crop Gaussian centroid
-                crop_gray = cv2.cvtColor(crop10_bgr, cv2.COLOR_BGR2GRAY)
-                ccx, ccy  = _intensity_centroid_local(crop_gray, gaussian_sigma)
-                gx        = float(cx0 + ccx)
-                gy        = float(cy0 + ccy)
-
-                # Final dedupe right before saving (AGAINST EXISTING CSV FIRELIES + accepted in-run)
-                if too_close_to_any((gx, gy)):
-                    continue
-
-                # Final crop at refined center
-                final_crop_bgr, (fx0, fy0, fx1, fy1) = _center_crop_bgr(frame_bgr, gx, gy, blackout_w, blackout_h)
-
-                # Mark centroid as saturated RED pixel
-                cx_local = int(round(gx - fx0))
-                cy_local = int(round(gy - fy0))
-                if 0 <= cy_local < final_crop_bgr.shape[0] and 0 <= cx_local < final_crop_bgr.shape[1]:
-                    final_crop_bgr[cy_local, cx_local] = (0, 0, 255)
-
-                # Save artifacts
-                if save_debug_artifacts:
-                    # 1) Crop
-                    crop_name  = f"f{fr:05d}_x{int(round(gx))}_y{int(round(gy))}_conf{ff_conf:.3f}.png"
-                    cv2.imwrite(str(crops_dir / crop_name),  final_crop_bgr)
-
-                    # 2) Full frame overlays
-                    frame_dbg = frame_bgr.copy()
-                    # Search window (white)
-                    cv2.rectangle(frame_dbg, (sx0, sy0), (sx1-1, sy1-1), (255,255,255), 1)
-                    # Blacked-out region at ORIGINAL seed center (gray fill)
-                    bx0_abs, by0_abs, bx1_abs, by1_abs = _clamped_center_box(cx, cy, blackout_w, blackout_h, W, H)
-                    cv2.rectangle(frame_dbg, (bx0_abs, by0_abs), (bx1_abs-1, by1_abs-1), (128,128,128), thickness=-1)
-                    # Final 10×10 neighbour bbox (red) + center pixel
-                    rx0, ry0, rx1, ry1 = _clamped_center_box(gx, gy, blackout_w, blackout_h, W, H)
-                    cv2.rectangle(frame_dbg, (rx0, ry0), (rx1-1, ry1-1), (0,0,255), 1)
-                    if 0 <= int(round(gy)) < H and 0 <= int(round(gx)) < W:
-                        frame_dbg[int(round(gy)), int(round(gx))] = (0,0,255)
-                    frame_name = f"f{fr:05d}_x{int(round(gx))}_y{int(round(gy))}_conf{ff_conf:.3f}.jpg"
-                    cv2.imwrite(str(frames_dir / frame_name), frame_dbg)
-
-                # Append to main CSV
-                new_r = {k: '' for k in orig_cols}
-                new_r['frame'] = str(fr)
-                new_r['x'] = f"{gx:.3f}"
-                new_r['y'] = f"{gy:.3f}"
-                new_r['w'] = str(int(blackout_w))
-                new_r['h'] = str(int(blackout_h))
-                if has_class:
-                    new_r['class'] = 'firefly'
-                new_r['background_logit']   = f"{bg_logit:.6f}"
-                new_r['firefly_logit']      = f"{ff_logit:.6f}"
-                new_r['firefly_confidence'] = f"{ff_conf:.6f}"
-                new_r['xy_semantics']       = 'center'
-                new_rows.append(new_r)
-
-                # Append to logits CSV
-                new_ff_logits_rows.append({
-                    'x': str(int(round(gx))),
-                    'y': str(int(round(gy))),
-                    't': str(int(fr)),
-                    'background_logit': f"{bg_logit:.6f}",
-                    'firefly_logit':    f"{ff_logit:.6f}",
-                })
-
-                # Register as accepted so subsequent neighbours in this frame dedupe against it
-                accepted_ff.setdefault(fr, []).append((gx, gy))
-
+                add_rows.append(r)
             except Exception:
                 continue
 
-        _progress(fr+1, limit, 'stage8.6'); fr += 1
+        kept, _dropped = _dedupe_merge(base_rows, add_rows, MERGE_DEDUPE_PX)
 
-    cap.release()
+        # audit: what we tried to add vs what dedupe rejected
+        if audit is not None:
+            if kept:
+                audit.log_kept('08_6_neighbor_hunt', [dict(r, video=str(orig_video_path)) for r in kept])
+            if _dropped:
+                audit.log_removed('08_6_neighbor_hunt', 'dedupe', [dict(r, video=str(orig_video_path)) for r in _dropped])
 
-    if not new_rows:
-        if verbose: print("[stage8.6] No neighbours accepted by CNN/dedupe; CSV unchanged.")
-        return 0
+        if not kept:
+            print(f"[stage8.6] RUN {run_idx}: nothing to add after dedupe.")
+            continue
 
-    # Rewrite main CSV
-    all_rows = rows + new_rows
-    _write_csv_rows(csv_path, all_rows, list(orig_cols))
+        # append to main CSV
+        base_rows = base_rows + kept
+        _write_csv_rows(main_csv_path, base_rows, field_order)
 
-    # Update <stem>_fireflies_logits.csv
-    ff_csv = csv_path.with_name(csv_path.stem + '_fireflies_logits.csv')
-    ff_cols = ['x','y','t','background_logit','firefly_logit']
-    existing = []
-    if ff_csv.exists():
-        try:
-            with ff_csv.open('r', newline='') as f:
+        # append to main fireflies_logits.csv (match by frame,int(x),int(y))
+        if sub_ff_logits.exists():
+            ff_cols = ["x","y","t","background_logit","firefly_logit"]
+            existing = []
+            if main_ff_logits_path.exists():
+                with main_ff_logits_path.open("r", newline="") as f:
+                    rd = csv.DictReader(f)
+                    if rd.fieldnames:
+                        ff_cols = rd.fieldnames
+                    existing = list(rd)
+
+            kept_keys = set()
+            for r in kept:
+                try:
+                    kept_keys.add((int(r["frame"]), int(round(float(r["x"]))), int(round(float(r["y"])))))
+                except Exception:
+                    continue
+
+            new_ff_rows = []
+            with sub_ff_logits.open("r", newline="") as f:
                 rd = csv.DictReader(f)
-                if rd.fieldnames: ff_cols = rd.fieldnames
-                existing = list(rd)
-        except Exception:
-            pass
+                for r in rd:
+                    try:
+                        k = (int(r["t"]), int(r["x"]), int(r["y"]))
+                        if k in kept_keys:
+                            new_ff_rows.append({k2: r.get(k2, "") for k2 in ff_cols})
+                    except Exception:
+                        continue
 
-    with ff_csv.open('w', newline='') as f:
-        wri = csv.DictWriter(f, fieldnames=ff_cols)
-        wri.writeheader()
-        for r in existing:
-            wri.writerow({k: r.get(k, '') for k in ff_cols})
-        for r in new_ff_logits_rows:
-            wri.writerow({k: r.get(k, '') for k in ff_cols})
+            with main_ff_logits_path.open("w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=ff_cols)
+                w.writeheader()
+                for r in existing:
+                    w.writerow({k: r.get(k, "") for k in ff_cols})
+                for r in new_ff_rows:
+                    w.writerow({k: r.get(k, "") for k in ff_cols})
 
-    if verbose:
-        print(f"[stage8.6] Added {len(new_rows)} neighbours ≥ conf {firefly_conf_thresh} (σ={gaussian_sigma}) → {csv_path.name}")
-        print(f"[stage8.6] Updated logits CSV with {len(new_ff_logits_rows)} rows → {ff_csv.name}")
-        if save_debug_artifacts:
-            print(f"[stage8.6] Crops → {crops_dir}")
-            print(f"[stage8.6] Frames → {frames_dir}")
+        print(f"[stage8.6] RUN {run_idx}: added {len(kept)} new rows → {main_csv_path.name}")
+        total_added += len(kept)
 
-    return len(new_rows)
+    print(f"[stage8.6] TOTAL new rows added across runs: {total_added}")
+    return total_added
+
+# Back-compat alias if old name is referenced anywhere
+stage8_6_iterative_blackout = stage8_6_run

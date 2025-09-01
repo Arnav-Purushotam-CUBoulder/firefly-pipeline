@@ -3,6 +3,7 @@ from collections import defaultdict
 from pathlib import Path
 import cv2
 import numpy as np
+from audit_trail import AuditTrail
 
 BAR_LEN = 50
 def progress(i, total, tag=''):
@@ -27,6 +28,8 @@ def recenter_boxes_with_centroid(
     max_frames=None,
     *,
     bright_max_threshold: int = 50,   # ← threshold now comes from orchestrator
+    audit: AuditTrail | None = None,
+    audit_video_path: Path | None = None,
 ):
     """
     For each CSV row (frame,x,y,w,h):
@@ -59,6 +62,8 @@ def recenter_boxes_with_centroid(
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     keep_mask = [True] * len(rows)
+    logs_removed = []
+    logs_kept = []
 
     fr = 0
     while True:
@@ -72,6 +77,7 @@ def recenter_boxes_with_centroid(
             gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
             for row_idx, x, y, w, h in by_frame[fr]:
+                r = rows[row_idx]
                 # clamp to frame
                 w = max(1, min(w, W)); h = max(1, min(h, H))
                 x = max(0, min(x, W - w)); y = max(0, min(y, H - h))
@@ -85,6 +91,15 @@ def recenter_boxes_with_centroid(
                 patch_max = int(cv2.cvtColor(color_patch, cv2.COLOR_BGR2GRAY).max())
                 if patch_max < int(bright_max_threshold):
                     keep_mask[row_idx] = False
+                    if audit is not None:
+                        logs_removed.append({
+                            'video': str(orig_path),
+                            'frame': int(r['frame']),
+                            'x': int(x), 'y': int(y),
+                            'w': int(w), 'h': int(h),
+                            'bright_max': int(patch_max),
+                            'bright_min_thr': int(bright_max_threshold),
+                        })
                     continue
 
                 # recenter using centroid on grayscale
@@ -101,6 +116,22 @@ def recenter_boxes_with_centroid(
                 new_y = int(round(cy_full - h/2))
                 new_x = max(0, min(new_x, W - w))
                 new_y = max(0, min(new_y, H - h))
+
+                if audit is not None:
+                    try:
+                        shift_dx = int(new_x - int(r['x']))
+                        shift_dy = int(new_y - int(r['y']))
+                    except Exception:
+                        shift_dx = int(new_x - x)
+                        shift_dy = int(new_y - y)
+                    logs_kept.append({
+                        'video': str(orig_path),
+                        'frame': int(r['frame']),
+                        'x': int(new_x), 'y': int(new_y),
+                        'w': int(w), 'h': int(h),
+                        'shift_dx': shift_dx, 'shift_dy': shift_dy,
+                        'bright_max': int(patch_max),
+                    })
 
                 rows[row_idx]['x'] = str(new_x)
                 rows[row_idx]['y'] = str(new_y)
@@ -122,3 +153,18 @@ def recenter_boxes_with_centroid(
                 'x': int(r['x']), 'y': int(r['y']),
                 'w': int(r['w']), 'h': int(r['h'])
             })
+
+    # audit sidecars
+    if audit is not None:
+        if logs_removed:
+            audit.log_removed('02_recenter', 'dim_seed', logs_removed, extra_cols=['bright_max','bright_min_thr'])
+            if audit_video_path is not None:
+                for rr in logs_removed[:2000]:
+                    audit.save_crop(
+                        audit_video_path,
+                        rr['frame'], rr['x'], rr['y'], rr['w'], rr['h'],
+                        '02_recenter/removed_dim',
+                        f"t{rr['frame']:06d}_x{rr['x']}_y{rr['y']}_b{rr['bright_max']}"
+                    )
+        if logs_kept:
+            audit.log_kept('02_recenter', logs_kept, extra_cols=['shift_dx','shift_dy','bright_max'])
