@@ -42,14 +42,14 @@ from stage8_7_large_flash_bfs import stage8_7_expand_large_fireflies
 from stage8_9_gt_gaussian_centroid import stage8_9_recenter_gt_gaussian_centroid
 from stage13_audit_analysis import stage13_audit_trail_analysis
 
-
+from stage8_sync import rebuild_fireflies_logits_from_main
 
 
 
 # ──────────────────────────────────────────────────────────────
 # Root & I/O locations
 # ──────────────────────────────────────────────────────────────
-ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/orc pipeline testing audit/frontalis')
+ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/fixing stage9 val/frontalis')
 
 
 # ──────────────────────────────────────────────────────────────
@@ -93,7 +93,7 @@ for d in [DIR_CSV, DIR_OUT_BGS, DIR_OUT_ORIG, DIR_OUT_ORIG_10,
 # ──────────────────────────────────────────────────────────────
 # Global knobs / flags
 # ──────────────────────────────────────────────────────────────
-MAX_FRAMES = 2000              # e.g., 5000 to truncate
+MAX_FRAMES = None              # e.g., 5000 to truncate
 BBOX_THICKNESS = 1
 DRAW_BACKGROUND_BOXES = True   # stage 5/6
 
@@ -395,6 +395,7 @@ def main():
             )
             AUDIT.record_params('07_merge', dist_threshold_px=STAGE7_DIST_THRESHOLD_PX)
             AUDIT.copy_snapshot('07_merge', csv_path)
+            rebuild_fireflies_logits_from_main(csv_path)
 
 
         # Stage 8 — Gaussian centroid recenter (rewrites CSV; x,y become centers; w,h fixed to patch; adds xy_semantics='center')
@@ -412,6 +413,7 @@ def main():
             )
             AUDIT.record_params('08_gauss', patch_w=STAGE8_PATCH_W, patch_h=STAGE8_PATCH_H, sigma=STAGE8_GAUSSIAN_SIGMA)
             AUDIT.copy_snapshot('08_gauss', csv_path)
+            rebuild_fireflies_logits_from_main(csv_path)
         
         # Stage 8.5 — prune firefly detections by blob area (> brightness floor), keep files in sync
         if RUN_STAGE8_5:
@@ -426,7 +428,7 @@ def main():
             )
             AUDIT.record_params('08_5_blob_area', area_threshold_px=AREA_THRESHOLD_PX)
             AUDIT.copy_snapshot('08_5_blob_area', csv_path)
-        
+            rebuild_fireflies_logits_from_main(csv_path)
 
         if RUN_STAGE8_6:
             _added = stage8_6_run(
@@ -436,6 +438,7 @@ def main():
             )
             AUDIT.record_params('08_6_neighbor_hunt', runs=STAGE8_6_RUNS)
             AUDIT.copy_snapshot('08_6_neighbor_hunt', csv_path)
+            rebuild_fireflies_logits_from_main(csv_path)
 
          # ── NEW: Stage 8.7 — grow large flashes & replace 10x10 shards
         if RUN_STAGE8_7:
@@ -451,6 +454,7 @@ def main():
             )
             AUDIT.record_params('08_7_large_flash_bfs')
             AUDIT.copy_snapshot('08_7_large_flash_bfs', csv_path)
+            rebuild_fireflies_logits_from_main(csv_path)
 
         # Re-run 8.5 AFTER 8.7 so replacements/center shifts are re-checked
         if RUN_STAGE8_5_AFTER_8_7:
@@ -465,6 +469,7 @@ def main():
             )
             AUDIT.record_params('08_5_blob_area', area_threshold_px=AREA_THRESHOLD_PX)
             AUDIT.copy_snapshot('08_5_blob_area', csv_path)
+            rebuild_fireflies_logits_from_main(csv_path)
 
 
 
