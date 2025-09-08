@@ -50,7 +50,7 @@ from stage8_sync import rebuild_fireflies_logits_from_main
 # ──────────────────────────────────────────────────────────────
 # Root & I/O locations
 # ──────────────────────────────────────────────────────────────
-ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/concurrency testing frontalis inference data')
+ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/concurrency testing forresti inference data')
 
 
 # ──────────────────────────────────────────────────────────────
@@ -194,7 +194,7 @@ AREA_THRESHOLD_PX = 6
 
 # Stage 4 — CNN classify/filter
 USE_CNN_FILTER             = True
-CNN_MODEL_PATH             = Path('/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/background subtraction detection method/actual background subtraction code/forresti, fixing FPs and box overlap/Proof of concept code/models and other data/frontalis, tremulans and forresti global models/colored_ResNet_18_Frontalis_best_model.pt')  # ← SET THIS to your .pt file
+CNN_MODEL_PATH             = Path('/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/background subtraction detection method/actual background subtraction code/forresti, fixing FPs and box overlap/Proof of concept code/models and other data/frontalis, tremulans and forresti global models/resnet18_Forresti_best_model.pt')  # ← SET THIS to your .pt file
 CNN_BACKBONE               = 'resnet18'
 CNN_CLASS_TO_KEEP          = 1               # firefly class idx
 CNN_PATCH_W                = 10
@@ -257,7 +257,7 @@ STAGE8_9_GAUSSIAN_SIGMA = STAGE8_GAUSSIAN_SIGMA  # reuse Stage-8 sigma; set >0 f
 
 # Stage 9 — validation vs ground truth
 GT_CSV_PATH                = ROOT / 'ground truth' / 'gt.csv'  # GT (x,y,t), t is raw & will be normalized
-GT_T_OFFSET                = 9000
+GT_T_OFFSET                = 4000
 DIST_THRESHOLDS_PX         = [1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0]                   # sweep
 STAGE9_CROP_W              = 10
 STAGE9_CROP_H              = 10
