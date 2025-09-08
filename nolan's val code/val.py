@@ -151,8 +151,8 @@ def plot_xt_by_time(df):
 
 
 
-true_df = pd.read_csv('/Users/arnavps/Desktop/New DL project data to transfer to external disk/fixing stage9 val/frontalis/csv files/gt_norm_offsetplus9000.csv')
-model_df_raw = pd.read_csv('/Users/arnavps/Desktop/New DL project data to transfer to external disk/fixing stage9 val/frontalis/csv files/val_9k-14k_frontalis_clip_fireflies_logits.csv')
+true_df = pd.read_csv('/Users/arnavps/Desktop/New DL project data to transfer to external disk/fixing stage9 val/forresti/csv files/gt_norm_offsetplus4000.csv')
+model_df_raw = pd.read_csv('/Users/arnavps/Desktop/New DL project data to transfer to external disk/fixing stage9 val/forresti/csv files/4k_to_4_5k_chopped_Forresti_C0107_fireflies_logits.csv')
 DISTANCE_THRESHOLD = 10.0
 
 resnet_results_df = classify_points(true_df, model_df_raw, DISTANCE_THRESHOLD)

@@ -32,9 +32,9 @@ def _basename(p: str | Path) -> str:
 
 # ───────── global paths ─────────
 DEFAULT_IMAGE_FOLDER = (
-    '/Users/arnavps/Desktop/New DL project data to transfer to external disk/to annotate frames/forresti')
+    '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/raw frames/20240606_cam1_GS010064')
 DEFAULT_CSV_FILE = (
-'/Users/arnavps/Desktop/New DL project data to transfer to external disk/to annotate frames/forresti ground truth_4k_to_4_5k.csv')
+'/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/raw frames/20240606_cam1_GS010064.csv')
 
 BOX_SIZE      = 10                    # also used as hover patch size
 SEARCH_RADIUS = 30
