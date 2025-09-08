@@ -109,13 +109,13 @@ RUN_STAGE7 = True
 RUN_STAGE8 = True
 RUN_STAGE8_5 = True
 RUN_STAGE8_6 = True
-RUN_STAGE8_9 = False
+RUN_STAGE8_9 = True
 # After your existing toggles (RUN_STAGE8_5, RUN_STAGE8_6, RUN_STAGE8_7, …)
 RUN_STAGE8_5_AFTER_8_7 = True
 
 
 # THESE ARE THE VALIDATION STAGES, WILL ONLY RUN IF YOU HAVE GROUND TRUTH
-RUN_STAGE9 = False
+RUN_STAGE9 = True
 RUN_STAGE10 = True   # will only execute if RUN_STAGE9 is also True
 RUN_STAGE11 = True
 RUN_STAGE12 = True
@@ -125,6 +125,52 @@ RUN_STAGE12 = True
 # ──────────────────────────────────────────────────────────────
 # Stage-specific parameters
 # ──────────────────────────────────────────────────────────────
+
+
+
+
+
+# ── Stage-1 variant (leave existing blob call intact)
+# 'blob' (default) = your current SimpleBlobDetector path (no changes)
+# 'cc_cpu'         = CPU connected components (separate file)
+# 'cc_cuda'        = GPU connected components (separate file; CuPy+cuCIM)
+STAGE1_VARIANT = 'cc_cpu'
+
+
+
+
+
+
+# CC-only params (kept separate from your existing SBD_* knobs)
+CC_MIN_AREA_PX      = 4          # pixels
+CC_MAX_AREA_SCALE   = 1.00       # fraction of frame area (0–1]
+CC_USE_CLAHE        = True
+CC_CLAHE_CLIP       = 2.0
+CC_CLAHE_TILE       = 8          # side length (CLAHE grid is TILE×TILE)
+CC_USE_TOPHAT       = False
+CC_TOPHAT_KSIZE     = 7
+CC_USE_DOG          = True
+CC_DOG_SIGMA1       = 0.6
+CC_DOG_SIGMA2       = 1.2
+
+
+
+# CC segmentation + labeling knobs
+CC_THRESHOLD_METHOD = 'adaptive_gaussian'     # 'otsu' | 'fixed' | 'adaptive_mean' | 'adaptive_gaussian'
+CC_FIXED_THRESHOLD  = 110        # used only if method == 'fixed'
+CC_OPEN_KSIZE       = 1          # odd int: 3,5,...
+CC_CONNECTIVITY     = 8          # 4 or 8
+
+
+
+
+
+
+
+
+
+
+
 
 # Stage 1 — detector & preproc knobs
 SBD_MIN_AREA_PX     = 0.5
@@ -322,27 +368,71 @@ def main():
 
         # Stage 1 — detect
         if RUN_STAGE1:
-            _t0 = time.perf_counter()
-            detect_blobs_to_csv(
-                orig_path=orig_path,
-                csv_path=csv_path,
-                max_frames=MAX_FRAMES,
-                sbd_min_area_px=SBD_MIN_AREA_PX,
-                sbd_max_area_scale=SBD_MAX_AREA_SCALE,
-                sbd_min_dist=SBD_MIN_DIST,
-                sbd_min_repeat=SBD_MIN_REPEAT,
-                use_clahe=USE_CLAHE,
-                clahe_clip=CLAHE_CLIP,
-                clahe_tile=CLAHE_TILE,
-                use_tophat=USE_TOPHAT,
-                tophat_ksize=TOPHAT_KSIZE,
-                use_dog=USE_DOG,
-                dog_sigma1=DOG_SIGMA1,
-                dog_sigma2=DOG_SIGMA2,
-            )
-            stage_times['01_detect'] = time.perf_counter() - _t0
-            AUDIT.record_params('01_detect')
-            AUDIT.copy_snapshot('01_detect', csv_path)
+            if STAGE1_VARIANT == 'blob':
+                _t0 = time.perf_counter()
+                detect_blobs_to_csv(
+                    orig_path=orig_path,
+                    csv_path=csv_path,
+                    max_frames=MAX_FRAMES,
+                    sbd_min_area_px=SBD_MIN_AREA_PX,
+                    sbd_max_area_scale=SBD_MAX_AREA_SCALE,
+                    sbd_min_dist=SBD_MIN_DIST,
+                    sbd_min_repeat=SBD_MIN_REPEAT,
+                    use_clahe=USE_CLAHE,
+                    clahe_clip=CLAHE_CLIP,
+                    clahe_tile=CLAHE_TILE,
+                    use_tophat=USE_TOPHAT,
+                    tophat_ksize=TOPHAT_KSIZE,
+                    use_dog=USE_DOG,
+                    dog_sigma1=DOG_SIGMA1,
+                    dog_sigma2=DOG_SIGMA2,
+                )
+                stage_times['01_detect'] = time.perf_counter() - _t0
+                AUDIT.record_params('01_detect')
+                AUDIT.copy_snapshot('01_detect', csv_path)
+            else:
+                # --- call separate CC implementation based on STAGE1_VARIANT ---
+                if STAGE1_VARIANT == 'cc_cpu':
+                    from stage1_detect_cc_cpu import detect_stage1_to_csv as _stage1_cc
+                elif STAGE1_VARIIANT == 'cc_cuda':
+                    from stage1_detect_cc_cuda import detect_stage1_to_csv as _stage1_cc
+                else:
+                    raise ValueError(f"Unknown STAGE1_VARIANT={STAGE1_VARIANT!r} (expected 'blob'|'cc_cpu'|'cc_cuda')")
+
+                _t0 = time.perf_counter()
+                _stage1_cc(
+                    orig_path=orig_path,
+                    csv_path=csv_path,
+                    max_frames=MAX_FRAMES,
+                    # CC-specific gates (separate from SBD_*):
+                    min_area_px=CC_MIN_AREA_PX,
+                    max_area_scale=CC_MAX_AREA_SCALE,
+                    # CC-specific preproc:
+                    use_clahe=CC_USE_CLAHE,
+                    clahe_clip=CC_CLAHE_CLIP,
+                    clahe_tile=CC_CLAHE_TILE,
+                    use_tophat=CC_USE_TOPHAT,
+                    tophat_ksize=CC_TOPHAT_KSIZE,
+                    use_dog=CC_USE_DOG,
+                    dog_sigma1=CC_DOG_SIGMA1,
+                    dog_sigma2=CC_DOG_SIGMA2,
+                    # CC segmentation + labeling:
+                    threshold_method=CC_THRESHOLD_METHOD,
+                    fixed_threshold=CC_FIXED_THRESHOLD,
+                    open_ksize=CC_OPEN_KSIZE,
+                    connectivity=CC_CONNECTIVITY,
+                )
+                stage_times['01_detect'] = time.perf_counter() - _t0
+                AUDIT.record_params(
+                    '01_detect',
+                    variant=STAGE1_VARIANT,
+                    cc_threshold_method=CC_THRESHOLD_METHOD,
+                    cc_open_ksize=CC_OPEN_KSIZE,
+                    cc_connectivity=CC_CONNECTIVITY,
+                    cc_min_area_px=CC_MIN_AREA_PX,
+                    cc_max_area_scale=CC_MAX_AREA_SCALE,
+                )
+                AUDIT.copy_snapshot('01_detect', csv_path)
 
         # Stage 2 — recenter via intensity centroid (drop dim crops)
         if RUN_STAGE2:
