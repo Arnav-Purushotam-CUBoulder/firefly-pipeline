@@ -20,6 +20,7 @@ from pathlib import Path
 import sys
 import time
 from audit_trail import AuditTrail
+from collections import OrderedDict
 
 # ──────────────────────────────────────────────────────────────
 # Imports for each stage
@@ -49,7 +50,7 @@ from stage8_sync import rebuild_fireflies_logits_from_main
 # ──────────────────────────────────────────────────────────────
 # Root & I/O locations
 # ──────────────────────────────────────────────────────────────
-ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/orc pipeline FFT model inference output/tremulans inference data')
+ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/concurrency testing tremulans inference data')
 
 
 # ──────────────────────────────────────────────────────────────
@@ -108,13 +109,13 @@ RUN_STAGE7 = True
 RUN_STAGE8 = True
 RUN_STAGE8_5 = True
 RUN_STAGE8_6 = True
-RUN_STAGE8_9 = True
+RUN_STAGE8_9 = False
 # After your existing toggles (RUN_STAGE8_5, RUN_STAGE8_6, RUN_STAGE8_7, …)
 RUN_STAGE8_5_AFTER_8_7 = True
 
 
 # THESE ARE THE VALIDATION STAGES, WILL ONLY RUN IF YOU HAVE GROUND TRUTH
-RUN_STAGE9 = True
+RUN_STAGE9 = False
 RUN_STAGE10 = True   # will only execute if RUN_STAGE9 is also True
 RUN_STAGE11 = True
 RUN_STAGE12 = True
@@ -147,7 +148,7 @@ AREA_THRESHOLD_PX = 6
 
 # Stage 4 — CNN classify/filter
 USE_CNN_FILTER             = True
-CNN_MODEL_PATH             = Path('/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/background subtraction detection method/actual background subtraction code/frontalis, tremulans and forresti global models/resnet18_FFT_best_model.pt')  # ← SET THIS to your .pt file
+CNN_MODEL_PATH             = Path('/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/background subtraction detection method/actual background subtraction code/forresti, fixing FPs and box overlap/Proof of concept code/models and other data/frontalis, tremulans and forresti global models/resnet18_Tremulans_best_model.pt')  # ← SET THIS to your .pt file
 CNN_BACKBONE               = 'resnet18'
 CNN_CLASS_TO_KEEP          = 1               # firefly class idx
 CNN_PATCH_W                = 10
@@ -242,6 +243,53 @@ SAVE_ANN_10PX              = True
 VIDEO_EXTS = {'.mp4', '.avi', '.mov', '.mkv'}
 
 
+
+
+
+
+
+
+
+def _print_stage_timing(stage_times: dict, video_stem: str):
+    # Stages counted toward the *detection pipeline* time (rendering excluded)
+    pipeline_order = [
+        '01_detect','02_recenter','03_area_filter','04_cnn',
+        '07_merge','08_gauss','08_5_blob_area','08_6_neighbor_hunt',
+        '08_7_large_flash_bfs','08_5_after_8_7'  # <- included if present
+    ]
+    # Rendering-only (excluded from pipeline total; printed separately)
+    render_order = ['05_render','06_render10']
+
+    p_times = OrderedDict((k, stage_times[k]) for k in pipeline_order if k in stage_times)
+    r_times = OrderedDict((k, stage_times[k]) for k in render_order   if k in stage_times)
+
+    p_total = sum(p_times.values())
+    r_total = sum(r_times.values())
+
+    # Pipeline breakdown (≤ 8.7 plus optional 8.5-after-8.7)
+    print(f"\n[time] {video_stem} — detection pipeline (≤ 8.7)")
+    if p_total <= 0:
+        print("  (no timed pipeline stages)")
+    else:
+        for k, dt in p_times.items():
+            pct = (100.0 * dt / p_total) if p_total else 0.0
+            print(f"  {k:>20}: {dt:8.2f}s  ({pct:5.1f}%)")
+        print(f"  {'TOTAL (pipeline)':>20}: {p_total:8.2f}s  (100.0%)")
+
+    # Rendering breakdown (excluded from pipeline total)
+    if r_times:
+        print(f"\n[time] {video_stem} — rendering (excluded from pipeline total)")
+        for k, dt in r_times.items():
+            print(f"  {k:>20}: {dt:8.2f}s")
+        print(f"  {'TOTAL (rendering)':>20}: {r_total:8.2f}s\n")
+    else:
+        print()  # blank line for spacing
+
+
+
+
+
+
 def _iter_videos(dir_path: Path):
     if not dir_path.exists():
         return []
@@ -260,6 +308,7 @@ def main():
     for orig_path in orig_videos:
         base = orig_path.stem
         print(f"\n=== Processing: {base} ===")
+        stage_times = {}
 
         # Optional BS video with same basename
         bs_path = None
@@ -273,6 +322,7 @@ def main():
 
         # Stage 1 — detect
         if RUN_STAGE1:
+            _t0 = time.perf_counter()
             detect_blobs_to_csv(
                 orig_path=orig_path,
                 csv_path=csv_path,
@@ -290,11 +340,13 @@ def main():
                 dog_sigma1=DOG_SIGMA1,
                 dog_sigma2=DOG_SIGMA2,
             )
+            stage_times['01_detect'] = time.perf_counter() - _t0
             AUDIT.record_params('01_detect')
             AUDIT.copy_snapshot('01_detect', csv_path)
 
         # Stage 2 — recenter via intensity centroid (drop dim crops)
         if RUN_STAGE2:
+            _t0 = time.perf_counter()
             recenter_boxes_with_centroid(
                 orig_path=orig_path,
                 csv_path=csv_path,
@@ -304,11 +356,13 @@ def main():
                 audit_video_path=orig_path,
 
             )
+            stage_times['02_recenter'] = time.perf_counter() - _t0
             AUDIT.record_params('02_recenter', bright_max_threshold=BRIGHT_MAX_THRESHOLD)
             AUDIT.copy_snapshot('02_recenter', csv_path)
 
         # Stage 3 — area filter (in-place) + snapshot
         if RUN_STAGE3:
+            _t0 = time.perf_counter()
             snapshot_csv = csv_path.parent / f"{csv_path.stem}_area_snapshot.csv"
             filter_boxes_by_area(
                 csv_path=csv_path,
@@ -316,11 +370,13 @@ def main():
                 snapshot_csv_path=snapshot_csv,
                 audit=AUDIT,
             )
+            stage_times['03_area_filter'] = time.perf_counter() - _t0
             AUDIT.record_params('03_area_filter', area_threshold_px=AREA_THRESHOLD_PX)
             AUDIT.copy_snapshot('03_area_filter', csv_path)
 
         # Stage 4 — CNN classify/filter (adds logits/confidence/class)
         if RUN_STAGE4 and USE_CNN_FILTER:
+            _t0 = time.perf_counter()
             classify_and_filter_csv(
                 orig_path=orig_path,
                 csv_path=csv_path,
@@ -339,11 +395,13 @@ def main():
                 debug_save_patches_dir=DEBUG_SAVE_PATCHES_DIR,
                 audit=AUDIT,
             )
+            stage_times['04_cnn'] = time.perf_counter() - _t0
             AUDIT.record_params('04_cnn', model=str(CNN_MODEL_PATH), backbone=CNN_BACKBONE)
             AUDIT.copy_snapshot('04_cnn', csv_path)
 
         # Stage 5 — render dynamic boxes on BS and/or original
         if RUN_STAGE5:
+            _t0 = time.perf_counter()
             if SAVE_ANN_BG and bs_path is not None:
                 out_bg_path = DIR_OUT_BGS / f"{base}_bs_annotated.mp4"
                 render_from_csv(
@@ -368,9 +426,11 @@ def main():
                     draw_background=DRAW_BACKGROUND_BOXES,
                     background_color=(0, 255, 0),
                 )
+            stage_times['05_render'] = time.perf_counter() - _t0
 
         # Stage 6 — render fixed 10×10 on original
         if RUN_STAGE6 and SAVE_ANN_10PX:
+            _t0 = time.perf_counter()
             out_orig_10px_path = DIR_OUT_ORIG_10 / f"{base}_orig_10px.mp4"
             render_fixed_10px_from_csv(
                 video_path=orig_path,
@@ -382,9 +442,11 @@ def main():
                 draw_background=DRAW_BACKGROUND_BOXES,
                 background_color=(0, 255, 0),
             )
+            stage_times['06_render10'] = time.perf_counter() - _t0
 
         # Stage 7 — prune overlaps (union-find keep-heaviest)
         if RUN_STAGE7:
+            _t0 = time.perf_counter()
             prune_overlaps_keep_heaviest_unionfind(
                 orig_video_path=orig_path,
                 csv_path=csv_path,
@@ -393,6 +455,7 @@ def main():
                 verbose=STAGE7_VERBOSE,
                 audit=AUDIT,
             )
+            stage_times['07_merge'] = time.perf_counter() - _t0
             AUDIT.record_params('07_merge', dist_threshold_px=STAGE7_DIST_THRESHOLD_PX)
             AUDIT.copy_snapshot('07_merge', csv_path)
             rebuild_fireflies_logits_from_main(csv_path)
@@ -400,6 +463,7 @@ def main():
 
         # Stage 8 — Gaussian centroid recenter (rewrites CSV; x,y become centers; w,h fixed to patch; adds xy_semantics='center')
         if RUN_STAGE8:
+            _t0 = time.perf_counter()
             recenter_gaussian_centroid(
                 orig_video_path=orig_path,
                 csv_path=csv_path,
@@ -411,12 +475,14 @@ def main():
                 crop_dir=DIR_STAGE8_CROPS / base,   # optional per-video dump
                 audit=AUDIT,
             )
+            stage_times['08_gauss'] = time.perf_counter() - _t0
             AUDIT.record_params('08_gauss', patch_w=STAGE8_PATCH_W, patch_h=STAGE8_PATCH_H, sigma=STAGE8_GAUSSIAN_SIGMA)
             AUDIT.copy_snapshot('08_gauss', csv_path)
             rebuild_fireflies_logits_from_main(csv_path)
         
         # Stage 8.5 — prune firefly detections by blob area (> brightness floor), keep files in sync
         if RUN_STAGE8_5:
+            _t0 = time.perf_counter()
             stage8_5_prune_by_blob_area(
                 orig_video_path=orig_path,
                 csv_path=csv_path,
@@ -426,22 +492,26 @@ def main():
                 verbose=True,
                 audit=AUDIT,
             )
+            stage_times['08_5_blob_area'] = time.perf_counter() - _t0
             AUDIT.record_params('08_5_blob_area', area_threshold_px=AREA_THRESHOLD_PX)
             AUDIT.copy_snapshot('08_5_blob_area', csv_path)
             rebuild_fireflies_logits_from_main(csv_path)
 
         if RUN_STAGE8_6:
+            _t0 = time.perf_counter()
             _added = stage8_6_run(
                 orig_video_path=orig_path,
                 main_csv_path=csv_path,
                 num_runs=STAGE8_6_RUNS,
             )
+            stage_times['08_6_neighbor_hunt'] = time.perf_counter() - _t0
             AUDIT.record_params('08_6_neighbor_hunt', runs=STAGE8_6_RUNS)
             AUDIT.copy_snapshot('08_6_neighbor_hunt', csv_path)
             rebuild_fireflies_logits_from_main(csv_path)
 
          # ── NEW: Stage 8.7 — grow large flashes & replace 10x10 shards
         if RUN_STAGE8_7:
+            _t0 = time.perf_counter()
             stage8_7_expand_large_fireflies(
                 orig_video_path=orig_path,
                 main_csv_path=csv_path,
@@ -452,12 +522,14 @@ def main():
                 max_frames=MAX_FRAMES,
                 verbose=True,
             )
+            stage_times['08_7_large_flash_bfs'] = time.perf_counter() - _t0
             AUDIT.record_params('08_7_large_flash_bfs')
             AUDIT.copy_snapshot('08_7_large_flash_bfs', csv_path)
             rebuild_fireflies_logits_from_main(csv_path)
 
         # Re-run 8.5 AFTER 8.7 so replacements/center shifts are re-checked
         if RUN_STAGE8_5_AFTER_8_7:
+            _t0 = time.perf_counter()
             stage8_5_prune_by_blob_area(
                 orig_video_path=orig_path,
                 csv_path=csv_path,
@@ -467,9 +539,13 @@ def main():
                 verbose=True,
                 audit=AUDIT,
             )
+            stage_times['08_5_after_8_7'] = time.perf_counter() - _t0
             AUDIT.record_params('08_5_blob_area', area_threshold_px=AREA_THRESHOLD_PX)
             AUDIT.copy_snapshot('08_5_blob_area', csv_path)
             rebuild_fireflies_logits_from_main(csv_path)
+        
+
+        _print_stage_timing(stage_times, base)
 
 
 
