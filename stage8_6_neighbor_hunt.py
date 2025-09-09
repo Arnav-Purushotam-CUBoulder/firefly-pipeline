@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Stage 8.6 — Iterative blackout + full re-run (uses orchestrator's params directly)
+Stage 8.6 Iterative blackout + full re-run (uses orchestrator's params directly)
 
 Per RUN:
   1) Read the current MAIN CSV (already post Stage 8/8.5).
-  2) Build a blacked video by painting 10×10 black squares at every firefly center (per frame).
-  3) Run Stage1→2→3→4→7→8→8.5 directly on that blacked video using the SAME params you set in the orchestrator.
+  2) Build a blacked video by painting 10�10 black squares at every firefly center (per frame).
+  3) Run Stage1�2�3�4�7�8�8.5 directly on that blacked video using the SAME params you set in the orchestrator.
   4) Merge the run's final CSV into the MAIN CSV (+ append matching rows into main *_fireflies_logits.csv)
      with a tiny proximity dedupe (default 2 px).
 
@@ -16,16 +16,15 @@ All Stage 8.6 artifacts live under:
 from __future__ import annotations
 import csv
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple, Optional
 
 import cv2
 import numpy as np
 from audit_trail import AuditTrail
 
-# ──────────────────────────────────────────────────────────────
+#####################################################################################
 # Import the stage functions (same names you use in orchestrator)
-# ──────────────────────────────────────────────────────────────
-from stage1_detect import detect_blobs_to_csv as STAGE1_DETECT
+#####################################################################################
 from stage2_recenter import recenter_boxes_with_centroid as STAGE2_RECENTER
 from stage3_area_filter import filter_boxes_by_area as STAGE3_AREA_FILTER
 from stage4_cnn_filter import classify_and_filter_csv as STAGE4_CNN_FILTER
@@ -33,20 +32,70 @@ from stage7_merge import prune_overlaps_keep_heaviest_unionfind as STAGE7_MERGE
 from stage8_gaussian_centroid import recenter_gaussian_centroid as STAGE8_GAUSSIAN_CENTROID
 from stage8_5_blob_area_filter import stage8_5_prune_by_blob_area as STAGE8_5_BLOB_FILTER
 
+#####################################################################################
+# Stage-1 resolver and safe-call (handles differing signatures)
+#####################################################################################
+import inspect
 
-# ──────────────────────────────────────────────────────────────
+def _resolve_stage1(stage1_impl: str):
+    if stage1_impl == 'blob':
+        from stage1_detect import detect_blobs_to_csv as f
+    elif stage1_impl == 'cc_cpu':
+        from stage1_detect_cc_cpu import detect_stage1_to_csv as f
+    elif stage1_impl == 'cc_cuda':
+        from stage1_detect_cc_cuda import detect_stage1_to_csv as f
+    else:
+        raise ValueError(f"Unknown stage1_impl={stage1_impl!r} (expected 'blob'|'cc_cpu'|'cc_cuda')")
+    return f
+
+def _filtered_call(fn, **kwargs):
+    sig = inspect.signature(fn)
+    call_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    return fn(**call_kwargs)
+
+#####################################################################################
 # Pull ALL params/paths directly from the running orchestrator.
 # (Avoid circular imports by reading __main__ at call time.)
-# ──────────────────────────────────────────────────────────────
+#####################################################################################
 def _orc():
     """Return the running orchestrator module (loaded as __main__)."""
     import __main__ as ORC  # orchestrator.py when executed is __main__
     return ORC
 
+def _pack_stage1_params_for(ORC, variant: str) -> dict:
+    """Build the right Stage-1 kwargs from orchestrator constants for the chosen variant."""
+    if variant == 'blob':
+        return dict(
+            sbd_min_area_px=ORC.SBD_MIN_AREA_PX,
+            sbd_max_area_scale=ORC.SBD_MAX_AREA_SCALE,
+            sbd_min_dist=ORC.SBD_MIN_DIST,
+            sbd_min_repeat=ORC.SBD_MIN_REPEAT,
+            use_clahe=ORC.USE_CLAHE, clahe_clip=ORC.CLAHE_CLIP, clahe_tile=ORC.CLAHE_TILE,
+            use_tophat=ORC.USE_TOPHAT, tophat_ksize=ORC.TOPHAT_KSIZE,
+            use_dog=ORC.USE_DOG, dog_sigma1=ORC.DOG_SIGMA1, dog_sigma2=ORC.DOG_SIGMA2,
+        )
+    elif variant in ('cc_cpu', 'cc_cuda'):
+        d = dict(
+            min_area_px=ORC.CC_MIN_AREA_PX, max_area_scale=ORC.CC_MAX_AREA_SCALE,
+            use_clahe=ORC.CC_USE_CLAHE, clahe_clip=ORC.CC_CLAHE_CLIP, clahe_tile=ORC.CC_CLAHE_TILE,
+            use_tophat=ORC.CC_USE_TOPHAT, tophat_ksize=ORC.CC_TOPHAT_KSIZE,
+            use_dog=ORC.CC_USE_DOG, dog_sigma1=ORC.CC_DOG_SIGMA1, dog_sigma2=ORC.CC_DOG_SIGMA2,
+            threshold_method=ORC.CC_THRESHOLD_METHOD, fixed_threshold=ORC.CC_FIXED_THRESHOLD,
+            open_ksize=ORC.CC_OPEN_KSIZE, connectivity=ORC.CC_CONNECTIVITY,
+        )
+        if variant == 'cc_cuda':
+            # only cc_cuda understands these; guard with hasattr for safety
+            if hasattr(ORC, "CC_BATCH_SIZE"):
+                d["batch_size"] = ORC.CC_BATCH_SIZE
+            if hasattr(ORC, "CC_PREPROC_BACKEND"):
+                d["preproc_backend"] = ORC.CC_PREPROC_BACKEND
+        return d
+    else:
+        raise ValueError(f"Unknown Stage-1 variant: {variant!r}")
 
-# ──────────────────────────────────────────────────────────────
+#####################################################################################
 # CSV helpers
-# ──────────────────────────────────────────────────────────────
+#####################################################################################
 def _read_csv_rows(p: Path) -> List[dict]:
     try:
         with p.open("r", newline="") as f:
@@ -86,10 +135,9 @@ def _frame_firefly_centers(rows: List[dict]) -> Dict[int, List[Tuple[float,float
             continue
     return out
 
-
-# ──────────────────────────────────────────────────────────────
+#####################################################################################
 # Video helpers
-# ──────────────────────────────────────────────────────────────
+#####################################################################################
 def _open_writer_like(cap: cv2.VideoCapture, out_path: Path) -> cv2.VideoWriter:
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
@@ -149,12 +197,11 @@ def _build_blacked_video(
         import sys; sys.stdout.write('\n')
     except Exception:
         pass
-    print(f"[stage8.6] Blacked video → {out_video_path}")
+    print(f"[stage8.6] Blacked video � {out_video_path}")
 
-
-# ──────────────────────────────────────────────────────────────
+#####################################################################################
 # Merge helpers
-# ──────────────────────────────────────────────────────────────
+#####################################################################################
 def _euclid2(a: Tuple[float,float], b: Tuple[float,float]) -> float:
     dx = float(a[0]) - float(b[0]); dy = float(a[1]) - float(b[1])
     return dx*dx + dy*dy
@@ -203,35 +250,28 @@ def _dedupe_merge(base_rows: List[dict], add_rows: List[dict], dist_px: float) -
             dropped.append(r)
     return kept, dropped
 
-
-# ──────────────────────────────────────────────────────────────
+#####################################################################################
 # Public API
-# ──────────────────────────────────────────────────────────────
-def stage8_6_run(*, orig_video_path: Path, main_csv_path: Path, num_runs: int | None = None, audit: AuditTrail | None = None) -> int:
+#####################################################################################
+def stage8_6_run(
+    *,
+    orig_video_path: Path,
+    main_csv_path: Path,
+    num_runs: int | None = None,
+    audit: Optional[AuditTrail] = None,
+    stage1_impl: Optional[str] = None,
+    stage1_params: Optional[dict] = None,
+) -> int:
     """
     Execute Stage 8.6 end-to-end using orchestrator params. Returns total rows added to MAIN CSV.
     """
     ORC = _orc()
 
-    # —— derive knobs from orchestrator (single source of truth)
+    # derive knobs from orchestrator (single source of truth)
     ROOT                     = ORC.ROOT
     MAX_FRAMES               = ORC.MAX_FRAMES
     RUN_STAGE4               = ORC.RUN_STAGE4
     USE_CNN_FILTER           = ORC.USE_CNN_FILTER
-
-    # Stage-1 params
-    SBD_MIN_AREA_PX          = ORC.SBD_MIN_AREA_PX
-    SBD_MAX_AREA_SCALE       = ORC.SBD_MAX_AREA_SCALE
-    SBD_MIN_DIST             = ORC.SBD_MIN_DIST
-    SBD_MIN_REPEAT           = ORC.SBD_MIN_REPEAT
-    USE_CLAHE                = ORC.USE_CLAHE
-    CLAHE_CLIP               = ORC.CLAHE_CLIP
-    CLAHE_TILE               = ORC.CLAHE_TILE
-    USE_TOPHAT               = ORC.USE_TOPHAT
-    TOPHAT_KSIZE             = ORC.TOPHAT_KSIZE
-    USE_DOG                  = ORC.USE_DOG
-    DOG_SIGMA1               = ORC.DOG_SIGMA1
-    DOG_SIGMA2               = ORC.DOG_SIGMA2
 
     # Stage-2
     BRIGHT_MAX_THRESHOLD     = ORC.BRIGHT_MAX_THRESHOLD
@@ -267,7 +307,7 @@ def stage8_6_run(*, orig_video_path: Path, main_csv_path: Path, num_runs: int | 
     MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION = ORC.MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION
 
     # Stage-8.6 knobs
-    STAGE8_6_RUNS            = getattr(ORC, "STAGE8_6_RUNS", 1)  # you add this in orchestrator
+    STAGE8_6_RUNS            = getattr(ORC, "STAGE8_6_RUNS", 1)
     MERGE_DEDUPE_PX          = getattr(ORC, "STAGE8_6_DEDUPE_PX", 2.0)
 
     runs = int(num_runs if num_runs is not None else STAGE8_6_RUNS)
@@ -275,10 +315,19 @@ def stage8_6_run(*, orig_video_path: Path, main_csv_path: Path, num_runs: int | 
         print("[stage8.6] Skipping (STAGE8_6_RUNS <= 0)")
         return 0
 
+    # Stage-1 choice and params: default to orchestrator if not provided
+    if stage1_impl is None:
+        stage1_impl = getattr(ORC, "STAGE1_VARIANT", "blob")
+    if stage1_params is None:
+        stage1_params = _pack_stage1_params_for(ORC, stage1_impl)
+
+    # Resolve Stage-1 function once
+    STAGE1_DETECT = _resolve_stage1(stage1_impl)
+
     # Load MAIN CSV
     base_rows = _read_csv_rows(main_csv_path)
     if not base_rows:
-        print("[stage8.6] Main CSV is empty—nothing to blackout.")
+        print("[stage8.6] Main CSV is empty nothing to blackout.")
         return 0
     field_order = list(base_rows[0].keys())
 
@@ -315,23 +364,14 @@ def stage8_6_run(*, orig_video_path: Path, main_csv_path: Path, num_runs: int | 
         )
 
         # 2) Run standard pipeline on the blacked video (using orchestrator's params)
-        # Stage 1
-        STAGE1_DETECT(
+
+        # Stage 1 (resolved variant + filtered kwargs)
+        _filtered_call(
+            STAGE1_DETECT,
             orig_path=blacked_video,
             csv_path=sub_csv,
             max_frames=MAX_FRAMES,
-            sbd_min_area_px=SBD_MIN_AREA_PX,
-            sbd_max_area_scale=SBD_MAX_AREA_SCALE,
-            sbd_min_dist=SBD_MIN_DIST,
-            sbd_min_repeat=SBD_MIN_REPEAT,
-            use_clahe=USE_CLAHE,
-            clahe_clip=CLAHE_CLIP,
-            clahe_tile=CLAHE_TILE,
-            use_tophat=USE_TOPHAT,
-            tophat_ksize=TOPHAT_KSIZE,
-            use_dog=USE_DOG,
-            dog_sigma1=DOG_SIGMA1,
-            dog_sigma2=DOG_SIGMA2,
+            **(stage1_params or {}),
         )
 
         # Stage 2
@@ -353,7 +393,7 @@ def stage8_6_run(*, orig_video_path: Path, main_csv_path: Path, num_runs: int | 
         )
 
         # Stage 4 (only if enabled in orchestrator)
-        if RUN_STAGE4 and USE_CNN_FILTER:
+        if ORC.RUN_STAGE4 and USE_CNN_FILTER:
             STAGE4_CNN_FILTER(
                 orig_path=blacked_video,
                 csv_path=sub_csv,
@@ -478,7 +518,7 @@ def stage8_6_run(*, orig_video_path: Path, main_csv_path: Path, num_runs: int | 
                 for r in new_ff_rows:
                     w.writerow({k: r.get(k, "") for k in ff_cols})
 
-        print(f"[stage8.6] RUN {run_idx}: added {len(kept)} new rows → {main_csv_path.name}")
+        print(f"[stage8.6] RUN {run_idx}: added {len(kept)} new rows � {main_csv_path.name}")
         total_added += len(kept)
 
     print(f"[stage8.6] TOTAL new rows added across runs: {total_added}")

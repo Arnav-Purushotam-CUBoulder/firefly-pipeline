@@ -335,6 +335,34 @@ def _print_stage_timing(stage_times: dict, video_stem: str):
         print()  # blank line for spacing
 
 
+# --- helper: build the right kwargs for the chosen Stage-1 variant
+def _pack_stage1_params_for(variant: str) -> dict:
+    if variant == 'blob':
+        return dict(
+            sbd_min_area_px=SBD_MIN_AREA_PX,
+            sbd_max_area_scale=SBD_MAX_AREA_SCALE,
+            sbd_min_dist=SBD_MIN_DIST,
+            sbd_min_repeat=SBD_MIN_REPEAT,
+            use_clahe=USE_CLAHE, clahe_clip=CLAHE_CLIP, clahe_tile=CLAHE_TILE,
+            use_tophat=USE_TOPHAT, tophat_ksize=TOPHAT_KSIZE,
+            use_dog=USE_DOG, dog_sigma1=DOG_SIGMA1, dog_sigma2=DOG_SIGMA2,
+        )
+    elif variant in ('cc_cpu', 'cc_cuda'):
+        d = dict(
+            min_area_px=CC_MIN_AREA_PX, max_area_scale=CC_MAX_AREA_SCALE,
+            use_clahe=CC_USE_CLAHE, clahe_clip=CC_CLAHE_CLIP, clahe_tile=CC_CLAHE_TILE,
+            use_tophat=CC_USE_TOPHAT, tophat_ksize=CC_TOPHAT_KSIZE,
+            use_dog=CC_USE_DOG, dog_sigma1=CC_DOG_SIGMA1, dog_sigma2=CC_DOG_SIGMA2,
+            threshold_method=CC_THRESHOLD_METHOD, fixed_threshold=CC_FIXED_THRESHOLD,
+            open_ksize=CC_OPEN_KSIZE, connectivity=CC_CONNECTIVITY,
+        )
+        if variant == 'cc_cuda':
+            # only cc_cuda understands these
+            d.update(batch_size=CC_BATCH_SIZE, preproc_backend=CC_PREPROC_BACKEND)
+        return d
+    else:
+        raise ValueError(f"Unknown Stage-1 variant: {variant!r}")
+
 
 
 
@@ -598,6 +626,8 @@ def main():
                 orig_video_path=orig_path,
                 main_csv_path=csv_path,
                 num_runs=STAGE8_6_RUNS,
+                stage1_impl=STAGE1_VARIANT,
+                stage1_params=_pack_stage1_params_for(STAGE1_VARIANT),
             )
             stage_times['08_6_neighbor_hunt'] = time.perf_counter() - _t0
             AUDIT.record_params('08_6_neighbor_hunt', runs=STAGE8_6_RUNS)
