@@ -1,6 +1,11 @@
+#!/usr/bin/env python3
+# stage2_recenter.py (optimized but results-identical)
 import csv, sys
 from collections import defaultdict
+from functools import lru_cache
 from pathlib import Path
+from typing import Tuple
+
 import cv2
 import numpy as np
 from audit_trail import AuditTrail
@@ -13,13 +18,22 @@ def progress(i, total, tag=''):
     sys.stdout.flush()
     if i == total: sys.stdout.write('\n')
 
-def intensity_weighted_centroid(gray_patch: np.ndarray) -> tuple[float, float]:
-    ys, xs = np.indices(gray_patch.shape, dtype=np.float32)
-    total = float(gray_patch.sum())
+# ---- centroid helpers (cached indices to avoid per-patch allocations) ----
+@lru_cache(maxsize=512)
+def _cached_indices(h: int, w: int) -> Tuple[np.ndarray, np.ndarray]:
+    # float32 matches original math and preserves results
+    ys, xs = np.indices((h, w), dtype=np.float32)
+    return ys, xs
+
+def intensity_weighted_centroid_cached(gray_patch_f32: np.ndarray) -> Tuple[float, float]:
+    h, w = gray_patch_f32.shape
+    total = float(gray_patch_f32.sum())
     if total <= 1e-9:
-        return (gray_patch.shape[1] - 1) / 2.0, (gray_patch.shape[0] - 1) / 2.0
-    cx = float((xs * gray_patch).sum() / total)
-    cy = float((ys * gray_patch).sum() / total)
+        # identical fallback as original: center of patch (0-indexed)
+        return (w - 1) / 2.0, (h - 1) / 2.0
+    ys, xs = _cached_indices(h, w)
+    cx = float((xs * gray_patch_f32).sum() / total)
+    cy = float((ys * gray_patch_f32).sum() / total)
     return cx, cy
 
 def recenter_boxes_with_centroid(
@@ -27,20 +41,23 @@ def recenter_boxes_with_centroid(
     csv_path: Path,
     max_frames=None,
     *,
-    bright_max_threshold: int = 50,   # ← threshold now comes from orchestrator
+    bright_max_threshold: int = 50,   # threshold still provided by orchestrator
     audit: AuditTrail | None = None,
     audit_video_path: Path | None = None,
 ):
     """
     For each CSV row (frame,x,y,w,h):
-      • Drop the row if the brightest pixel in the color crop < bright_max_threshold
+      • Drop the row if the brightest pixel in the crop < bright_max_threshold
       • Otherwise recenter using intensity-weighted centroid (on grayscale)
       • Overwrite the same CSV with refined x,y and only the rows that passed
+    (Behavior is identical to the original implementation; this version reduces
+     per-iteration allocations and duplicate color→gray conversions.)
     """
     rows = list(csv.DictReader(csv_path.open()))
     if not rows:
         print("No detections to recenter."); return
 
+    # Group rows by frame (unchanged)
     by_frame = defaultdict(list)
     max_frame_in_csv = 0
     for idx, r in enumerate(rows):
@@ -74,7 +91,10 @@ def recenter_boxes_with_centroid(
         if not ok: break
 
         if fr in by_frame:
-            gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            # 1) one grayscale conversion per frame
+            gray_u8 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # 2) float32 once per frame for centroid math (matches original)
+            gray_f32 = gray_u8.astype(np.float32)
 
             for row_idx, x, y, w, h in by_frame[fr]:
                 r = rows[row_idx]
@@ -82,13 +102,10 @@ def recenter_boxes_with_centroid(
                 w = max(1, min(w, W)); h = max(1, min(h, H))
                 x = max(0, min(x, W - w)); y = max(0, min(y, H - h))
 
-                color_patch = frame[y:y+h, x:x+w]
-                if color_patch.size == 0:
-                    keep_mask[row_idx] = False
-                    continue
-
-                # brightest-pixel guard (threshold comes from orchestrator)
-                patch_max = int(cv2.cvtColor(color_patch, cv2.COLOR_BGR2GRAY).max())
+                # --- brightest-pixel guard (read from precomputed gray_u8) ---
+                # this is IDENTICAL to max(cv2.cvtColor(color_patch, ...)) but avoids
+                # another conversion, since gray_u8 was created from the same frame.
+                patch_max = int(gray_u8[y:y+h, x:x+w].max()) if w > 0 and h > 0 else 0
                 if patch_max < int(bright_max_threshold):
                     keep_mask[row_idx] = False
                     if audit is not None:
@@ -102,13 +119,13 @@ def recenter_boxes_with_centroid(
                         })
                     continue
 
-                # recenter using centroid on grayscale
-                patch_gray = gray_full[y:y+h, x:x+w]
-                if patch_gray.size == 0:
+                # --- recenter using intensity-weighted centroid on gray_f32 ---
+                patch_gray_f32 = gray_f32[y:y+h, x:x+w]
+                if patch_gray_f32.size == 0:
                     keep_mask[row_idx] = False
                     continue
 
-                cx_rel, cy_rel = intensity_weighted_centroid(patch_gray)
+                cx_rel, cy_rel = intensity_weighted_centroid_cached(patch_gray_f32)
                 cx_full = x + cx_rel
                 cy_full = y + cy_rel
 
@@ -140,7 +157,7 @@ def recenter_boxes_with_centroid(
 
     cap.release()
 
-    # write back only rows that passed the brightest-pixel threshold
+    # Write back only rows that passed the brightness gate (unchanged)
     with csv_path.open('w', newline='') as f:
         fieldnames = ['frame','x','y','w','h']
         wri = csv.DictWriter(f, fieldnames=fieldnames)
@@ -154,7 +171,7 @@ def recenter_boxes_with_centroid(
                 'w': int(r['w']), 'h': int(r['h'])
             })
 
-    # audit sidecars
+    # ---- audit sidecars (unchanged) ----
     if audit is not None:
         if logs_removed:
             audit.log_removed('02_recenter', 'dim_seed', logs_removed, extra_cols=['bright_max','bright_min_thr'])

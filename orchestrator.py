@@ -56,10 +56,25 @@ ROOT = Path("/home/guest/Desktop/arnav's files/firefly pipeline inference data/t
 # ──────────────────────────────────────────────────────────────
 # Audit trail setup
 # ──────────────────────────────────────────────────────────────
-RUN_TAG = time.strftime("%Y%m%d_%H%M%S")
-AUDIT_ROOT = (ROOT / 'audit' / RUN_TAG).resolve()
-print(f"[orchestrator] AUDIT_ROOT: {AUDIT_ROOT}")
-AUDIT = AuditTrail(AUDIT_ROOT, run_tag=RUN_TAG)
+
+class NoOpAudit:
+    def record_params(self, *a, **k): pass
+    def copy_snapshot(self, *a, **k): pass
+    def log_kept(self, *a, **k): pass
+    def log_removed(self, *a, **k): pass
+    def log_pairs(self, *a, **k): pass
+    def save_crop(self, *a, **k): pass
+
+ENABLE_AUDIT = False  # global knob
+
+if ENABLE_AUDIT:
+    RUN_TAG = time.strftime("%Y%m%d_%H%M%S")
+    AUDIT_ROOT = (ROOT / 'audit' / RUN_TAG).resolve()
+    print(f"[orchestrator] AUDIT_ROOT: {AUDIT_ROOT}")
+    AUDIT = AuditTrail(AUDIT_ROOT, run_tag=RUN_TAG)
+else:
+    AUDIT_ROOT = None
+    AUDIT = NoOpAudit()
 
 
 
@@ -756,8 +771,9 @@ def main():
                 thickness=BBOX_THICKNESS,
                 verbose=True,
         )
-        
-        if ran_stage9:
+            
+        RUN_STAGE13 = True  # optional explicit toggle
+        if ran_stage9 and ENABLE_AUDIT and RUN_STAGE13 and (AUDIT_ROOT and AUDIT_ROOT.exists()):
             stage13_audit_trail_analysis(
                 stage9_video_dir=DIR_STAGE9_OUT / base,
                 audit_root=AUDIT_ROOT,
