@@ -56,6 +56,7 @@ ROOT = Path("/home/guest/Desktop/arnav's files/firefly pipeline inference data/t
 # ──────────────────────────────────────────────────────────────
 # Audit trail setup
 # ──────────────────────────────────────────────────────────────
+###
 
 class NoOpAudit:
     def record_params(self, *a, **k): pass
@@ -329,6 +330,7 @@ def _print_stage_timing(stage_times: dict, video_stem: str):
 
     p_total = sum(p_times.values())
     r_total = sum(r_times.values())
+    
 
     # Pipeline breakdown (≤ 8.7 plus optional 8.5-after-8.7)
     print(f"\n[time] {video_stem} — detection pipeline (≤ 8.7)")
