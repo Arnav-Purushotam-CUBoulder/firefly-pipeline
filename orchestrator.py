@@ -50,7 +50,7 @@ from stage8_sync import rebuild_fireflies_logits_from_main
 # ──────────────────────────────────────────────────────────────
 # Root & I/O locations
 # ──────────────────────────────────────────────────────────────
-ROOT = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/concurrency testing forresti inference data')
+ROOT = Path("/home/guest/Desktop/arnav's files/firefly pipeline inference data/tremulans inference")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -134,11 +134,14 @@ RUN_STAGE12 = True
 # 'blob' (default) = your current SimpleBlobDetector path (no changes)
 # 'cc_cpu'         = CPU connected components (separate file)
 # 'cc_cuda'        = GPU connected components (separate file; CuPy+cuCIM)
-STAGE1_VARIANT = 'cc_cpu'
+STAGE1_VARIANT = 'cc_cuda'
 
 
 
 
+# Stage-1 CUDA CC tuning
+CC_BATCH_SIZE        = 64         # try 32–64
+CC_PREPROC_BACKEND   = 'cupy' # 'cupy' | 'opencv_cuda'
 
 
 # CC-only params (kept separate from your existing SBD_* knobs)
@@ -194,7 +197,7 @@ AREA_THRESHOLD_PX = 6
 
 # Stage 4 — CNN classify/filter
 USE_CNN_FILTER             = True
-CNN_MODEL_PATH             = Path('/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/background subtraction detection method/actual background subtraction code/forresti, fixing FPs and box overlap/Proof of concept code/models and other data/frontalis, tremulans and forresti global models/resnet18_Forresti_best_model.pt')  # ← SET THIS to your .pt file
+CNN_MODEL_PATH             = Path("/home/guest/Desktop/arnav's files/firefly pipeline models/resnet18_Tremulans_best_model.pt")  # ← SET THIS to your .pt file
 CNN_BACKBONE               = 'resnet18'
 CNN_CLASS_TO_KEEP          = 1               # firefly class idx
 CNN_PATCH_W                = 10
@@ -394,7 +397,7 @@ def main():
                 # --- call separate CC implementation based on STAGE1_VARIANT ---
                 if STAGE1_VARIANT == 'cc_cpu':
                     from stage1_detect_cc_cpu import detect_stage1_to_csv as _stage1_cc
-                elif STAGE1_VARIIANT == 'cc_cuda':
+                elif STAGE1_VARIANT == 'cc_cuda':
                     from stage1_detect_cc_cuda import detect_stage1_to_csv as _stage1_cc
                 else:
                     raise ValueError(f"Unknown STAGE1_VARIANT={STAGE1_VARIANT!r} (expected 'blob'|'cc_cpu'|'cc_cuda')")
@@ -421,6 +424,8 @@ def main():
                     fixed_threshold=CC_FIXED_THRESHOLD,
                     open_ksize=CC_OPEN_KSIZE,
                     connectivity=CC_CONNECTIVITY,
+                    batch_size=CC_BATCH_SIZE, 
+                    preproc_backend=CC_PREPROC_BACKEND,
                 )
                 stage_times['01_detect'] = time.perf_counter() - _t0
                 AUDIT.record_params(
