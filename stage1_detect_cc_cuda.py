@@ -172,10 +172,13 @@ def detect_stage1_to_csv(
     except Exception:
         pass
 
-    use_cv2_cuda = (preproc_backend.lower() == "opencv_cuda") and hasattr(cv2, "cuda")
-    if preproc_backend.lower() == "opencv_cuda" and not use_cv2_cuda:
-        print("[cc_cuda] preproc_backend='opencv_cuda' requested but cv2.cuda is not available; falling back to 'cupy'.")
-        use_cv2_cuda = False
+    backend = (preproc_backend or "cupy").lower()
+    use_cv2_cuda = False
+    if backend == "opencv_cuda":
+        if hasattr(cv2, "cuda") and hasattr(cv2.cuda, "createCLAHE"):
+            use_cv2_cuda = True
+        else:
+            print("[cc_cuda] preproc_backend='opencv_cuda' requested but cv2.cuda.createCLAHE is unavailable; using CPU CLAHE + morphology.")
 
     pad = 2
     rows: list[tuple[int,int,int,int,int]] = []
@@ -217,12 +220,19 @@ def detect_stage1_to_csv(
                     # CPU CLAHE (still fine; we upload the batch once)
                     gray_batch = _cpu_clahe(gray_batch, clahe_clip, clahe_tile)
 
+            # Optionally apply CPU top-hat before uploading (when CUDA variant missing)
+            if backend == "opencv_cuda" and not use_cv2_cuda and use_tophat and tophat_ksize > 1:
+                # reuse CPU kernel so behavior matches the CPU detector
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(tophat_ksize), int(tophat_ksize)))
+                gray_batch = [cv2.morphologyEx(g, cv2.MORPH_TOPHAT, kernel) for g in gray_batch]
+
             # One batched upload to GPU: (N,H,W) uint8
             g = cp.asarray(np.stack(gray_batch, axis=0), dtype=cp.uint8)
 
             # ---- GPU preproc ----
             g = _gpu_pad_batched(g, pad=pad)  # (N,H+2p,W+2p)
-            g = _gpu_tophat(g, use_tophat, tophat_ksize)
+            if not (backend == "opencv_cuda" and not use_cv2_cuda):
+                g = _gpu_tophat(g, use_tophat, tophat_ksize)
             g = _gpu_dog(g, use_dog, dog_sigma1, dog_sigma2)
 
             # ---- Threshold (GPU) ----
