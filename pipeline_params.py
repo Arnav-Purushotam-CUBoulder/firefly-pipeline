@@ -45,6 +45,7 @@ RUN_STAGE11 = True
 RUN_STAGE12 = True
 RUN_STAGE13 = True
 RUN_STAGE14 = True
+RUN_PRE_RUN_CLEANUP = True
 
 # Stage-1 variant selection
 STAGE1_VARIANT = 'cc_cuda'
@@ -53,18 +54,19 @@ STAGE1_VARIANT = 'cc_cuda'
 CC_BATCH_SIZE = 64
 CC_PREPROC_BACKEND = 'cupy'
 
-CC_MIN_AREA_PX = 4
+CC_MIN_AREA_PX = 2
 CC_MAX_AREA_SCALE = 1.00
 CC_USE_CLAHE = True
 CC_CLAHE_CLIP = 2.0
 CC_CLAHE_TILE = 8
-CC_USE_TOPHAT = False
-CC_TOPHAT_KSIZE = 7
+CC_USE_TOPHAT = True
+CC_TOPHAT_KSIZE = 9
 CC_USE_DOG = True
 CC_DOG_SIGMA1 = 0.6
 CC_DOG_SIGMA2 = 1.2
+CC_ADAPTIVE_C = 2.0
 
-CC_THRESHOLD_METHOD = 'adaptive_gaussian'
+CC_THRESHOLD_METHOD = 'adaptive_mean'
 CC_FIXED_THRESHOLD = 110
 CC_OPEN_KSIZE = 1
 CC_CONNECTIVITY = 8
@@ -156,5 +158,8 @@ SAVE_ANN_10PX = True
 
 # File discovery
 VIDEO_EXTS = {'.mp4', '.avi', '.mov', '.mkv'}
+
+CLEANUP_KEEP_DIRS = ('ground truth', 'original videos')
+CLEANUP_GT_FILENAME = 'gt.csv'
 
 __all__ = [name for name in globals() if name.isupper()]

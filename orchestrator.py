@@ -44,8 +44,18 @@ from stage8_9_gt_gaussian_centroid import stage8_9_recenter_gt_gaussian_centroid
 from stage13_audit_analysis import stage13_audit_trail_analysis
 
 from stage8_sync import rebuild_fireflies_logits_from_main
+from stage0_cleanup import cleanup_inference_root
 from stage14_detection_summary import stage14_generate_detection_summary
 from pipeline_params import *  # noqa: F403
+
+if RUN_PRE_RUN_CLEANUP:
+    print("[stage0_cleanup] Running pre-run cleanup…")
+    cleanup_inference_root(
+        ROOT,
+        keep_dirs=CLEANUP_KEEP_DIRS,
+        gt_filename=CLEANUP_GT_FILENAME,
+        verbose=True,
+    )
 
 # ──────────────────────────────────────────────────────────────
 # Audit trail setup
@@ -144,7 +154,9 @@ def _pack_stage1_params_for(variant: str) -> dict:
         )
         if variant == 'cc_cuda':
             # only cc_cuda understands these
-            d.update(batch_size=CC_BATCH_SIZE, preproc_backend=CC_PREPROC_BACKEND)
+            d.update(batch_size=CC_BATCH_SIZE,
+                     preproc_backend=CC_PREPROC_BACKEND,
+                     adaptive_c=CC_ADAPTIVE_C)
         return d
     else:
         raise ValueError(f"Unknown Stage-1 variant: {variant!r}")
@@ -217,7 +229,7 @@ def main():
                     raise ValueError(f"Unknown STAGE1_VARIANT={STAGE1_VARIANT!r} (expected 'blob'|'cc_cpu'|'cc_cuda')")
 
                 _t0 = time.perf_counter()
-                _stage1_cc(
+                stage1_kwargs = dict(
                     orig_path=orig_path,
                     csv_path=csv_path,
                     max_frames=MAX_FRAMES,
@@ -238,9 +250,14 @@ def main():
                     fixed_threshold=CC_FIXED_THRESHOLD,
                     open_ksize=CC_OPEN_KSIZE,
                     connectivity=CC_CONNECTIVITY,
-                    batch_size=CC_BATCH_SIZE, 
-                    preproc_backend=CC_PREPROC_BACKEND,
                 )
+                if STAGE1_VARIANT == 'cc_cuda':
+                    stage1_kwargs.update(
+                        batch_size=CC_BATCH_SIZE,
+                        preproc_backend=CC_PREPROC_BACKEND,
+                        adaptive_c=CC_ADAPTIVE_C,
+                    )
+                _stage1_cc(**stage1_kwargs)
                 stage_times['01_detect'] = time.perf_counter() - _t0
                 AUDIT.record_params(
                     '01_detect',

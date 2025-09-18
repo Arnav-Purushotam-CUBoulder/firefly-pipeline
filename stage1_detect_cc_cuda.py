@@ -39,7 +39,7 @@ def _gpu_tophat(g: cp.ndarray, use: bool, ksize: int) -> cp.ndarray:
     if not use or ksize <= 1:
         return g
     k = int(max(1, ksize))
-    se = cp.ones((k, k), dtype=cp.bool_)  # square is fine for small k
+    se = cp.ones((1, k, k), dtype=cp.bool_)
     opened = cnd.grey_opening(g, footprint=se, mode="reflect")
     out = g.astype(cp.int16) - opened.astype(cp.int16)
     return cp.clip(out, 0, 255).astype(cp.uint8)
@@ -69,7 +69,7 @@ def _gpu_binary_open(mask: cp.ndarray, k: int) -> cp.ndarray:
     se = cp.ones((kk, kk), dtype=cp.bool_)
     return cnd.binary_opening(mask, structure=se, iterations=1)
 
-def _gpu_adaptive_threshold(g: cp.ndarray, method: str) -> cp.ndarray:
+def _gpu_adaptive_threshold(g: cp.ndarray, method: str, c_offset: float = 2.0) -> cp.ndarray:
     """
     Adaptive mean/gaussian with OpenCV-like defaults:
       blockSize = 11, C = 2
@@ -77,7 +77,7 @@ def _gpu_adaptive_threshold(g: cp.ndarray, method: str) -> cp.ndarray:
     """
     method = (method or "otsu").lower()
     block = 11
-    C = 2.0
+    C = float(c_offset)
 
     if method == "adaptive_mean":
         mean = cnd.uniform_filter(g.astype(cp.float32), size=(1, block, block), mode="reflect")
@@ -139,6 +139,7 @@ def detect_stage1_to_csv(
     # Segmentation + labeling:
     threshold_method: str,
     fixed_threshold: int,
+    adaptive_c: float = 2.0,
     open_ksize: int,
     connectivity: int,
     # NEW (optional) batching/CLAHE backend:
@@ -231,7 +232,7 @@ def detect_stage1_to_csv(
             else:
                 if thr_m not in ("adaptive_gaussian", "adaptive_mean", "otsu"):
                     thr_m = "otsu"
-                mask = _gpu_adaptive_threshold(g, thr_m)
+                mask = _gpu_adaptive_threshold(g, thr_m, c_offset=adaptive_c)
 
             # ---- Binary open (GPU) ----
             mask = _gpu_binary_open(mask, open_ksize)

@@ -89,6 +89,8 @@ def _pack_stage1_params_for(ORC, variant: str) -> dict:
                 d["batch_size"] = ORC.CC_BATCH_SIZE
             if hasattr(ORC, "CC_PREPROC_BACKEND"):
                 d["preproc_backend"] = ORC.CC_PREPROC_BACKEND
+            if hasattr(ORC, "CC_ADAPTIVE_C"):
+                d["adaptive_c"] = ORC.CC_ADAPTIVE_C
         return d
     else:
         raise ValueError(f"Unknown Stage-1 variant: {variant!r}")

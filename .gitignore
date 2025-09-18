@@ -6,3 +6,7 @@
 *.tflite
 *.pb
 *.weights
+
+# Python bytecode
+__pycache__/
+*.pyc
