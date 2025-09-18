@@ -18,7 +18,7 @@ DIR_STAGE10_OUT = ROOT / 'stage10 overlay videos'
 DIR_STAGE8_9_OUT = ROOT / 'stage8.9 gt centroid crops'
 
 # Audit toggle
-ENABLE_AUDIT = False
+ENABLE_AUDIT = True
 
 # Global knobs / flags
 MAX_FRAMES = None
@@ -44,6 +44,7 @@ RUN_STAGE10 = True
 RUN_STAGE11 = True
 RUN_STAGE12 = True
 RUN_STAGE13 = True
+RUN_STAGE14 = True
 
 # Stage-1 variant selection
 STAGE1_VARIANT = 'cc_cuda'

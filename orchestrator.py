@@ -44,6 +44,7 @@ from stage8_9_gt_gaussian_centroid import stage8_9_recenter_gt_gaussian_centroid
 from stage13_audit_analysis import stage13_audit_trail_analysis
 
 from stage8_sync import rebuild_fireflies_logits_from_main
+from stage14_detection_summary import stage14_generate_detection_summary
 from pipeline_params import *  # noqa: F403
 
 # ──────────────────────────────────────────────────────────────
@@ -556,6 +557,16 @@ def main():
 
 
 
+
+
+        if ran_stage9 and ENABLE_AUDIT and RUN_STAGE14 and AUDIT_ROOT:
+            summary_dir = AUDIT_ROOT / base
+            stage14_generate_detection_summary(
+                stage9_video_dir=DIR_STAGE9_OUT / base,
+                output_dir=summary_dir,
+                include_nearest_tp=True,
+                verbose=True,
+            )
 
 
         # Stage 10 — overlay GT (GREEN), model (RED), overlap (YELLOW) on one video
