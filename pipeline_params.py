@@ -18,7 +18,7 @@ DIR_STAGE10_OUT = ROOT / 'stage10 overlay videos'
 DIR_STAGE8_9_OUT = ROOT / 'stage8.9 gt centroid crops'
 
 # Audit toggle
-ENABLE_AUDIT = True
+ENABLE_AUDIT = False
 
 # Global knobs / flags
 MAX_FRAMES = None
@@ -48,7 +48,23 @@ RUN_STAGE14 = True
 RUN_PRE_RUN_CLEANUP = True
 
 # Stage-1 variant selection
-STAGE1_VARIANT = 'cc_cuda'
+STAGE1_VARIANT = 'cucim'
+
+# Stage-1 cuCIM GPU blob detector
+CUCIM_DETECTOR = 'log'  # 'log' | 'dog' | 'doh'
+CUCIM_MIN_SIGMA = 0.75
+CUCIM_MAX_SIGMA = 4.0
+CUCIM_NUM_SIGMA = 10
+CUCIM_SIGMA_RATIO = 1.6
+CUCIM_THRESHOLD = 0.08
+CUCIM_OVERLAP = 0.5
+CUCIM_LOG_SCALE = False
+CUCIM_MIN_AREA_PX = 4
+CUCIM_MAX_AREA_SCALE = 1.0
+CUCIM_PAD_PX = 2
+CUCIM_USE_CLAHE = True
+CUCIM_CLAHE_CLIP = 2.0
+CUCIM_CLAHE_TILE = 8
 
 # Stage-1 CUDA CC tuning
 CC_BATCH_SIZE = 64
@@ -119,7 +135,7 @@ STAGE8_VERBOSE = True
 MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION = 20
 
 # Stage 8.6 — neighbor hunt
-STAGE8_6_RUNS = 2
+STAGE8_6_RUNS = 1
 STAGE8_6_DEDUPE_PX = 4.0
 
 # Stage 8.7 — large-flash fixer

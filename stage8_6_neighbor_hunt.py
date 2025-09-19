@@ -44,8 +44,10 @@ def _resolve_stage1(stage1_impl: str):
         from stage1_detect_cc_cpu import detect_stage1_to_csv as f
     elif stage1_impl == 'cc_cuda':
         from stage1_detect_cc_cuda import detect_stage1_to_csv as f
+    elif stage1_impl == 'cucim':
+        from stage1_detect_cucim import detect_stage1_to_csv as f
     else:
-        raise ValueError(f"Unknown stage1_impl={stage1_impl!r} (expected 'blob'|'cc_cpu'|'cc_cuda')")
+        raise ValueError(f"Unknown stage1_impl={stage1_impl!r} (expected 'blob'|'cc_cpu'|'cc_cuda'|'cucim')")
     return f
 
 def _filtered_call(fn, **kwargs):
@@ -92,6 +94,23 @@ def _pack_stage1_params_for(ORC, variant: str) -> dict:
             if hasattr(ORC, "CC_ADAPTIVE_C"):
                 d["adaptive_c"] = ORC.CC_ADAPTIVE_C
         return d
+    elif variant == 'cucim':
+        return dict(
+            detector=ORC.CUCIM_DETECTOR,
+            min_sigma=ORC.CUCIM_MIN_SIGMA,
+            max_sigma=ORC.CUCIM_MAX_SIGMA,
+            num_sigma=ORC.CUCIM_NUM_SIGMA,
+            sigma_ratio=ORC.CUCIM_SIGMA_RATIO,
+            threshold=ORC.CUCIM_THRESHOLD,
+            overlap=ORC.CUCIM_OVERLAP,
+            log_scale=ORC.CUCIM_LOG_SCALE,
+            min_area_px=ORC.CUCIM_MIN_AREA_PX,
+            max_area_scale=ORC.CUCIM_MAX_AREA_SCALE,
+            pad_px=ORC.CUCIM_PAD_PX,
+            use_clahe=ORC.CUCIM_USE_CLAHE,
+            clahe_clip=ORC.CUCIM_CLAHE_CLIP,
+            clahe_tile=ORC.CUCIM_CLAHE_TILE,
+        )
     else:
         raise ValueError(f"Unknown Stage-1 variant: {variant!r}")
 

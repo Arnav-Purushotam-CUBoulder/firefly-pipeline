@@ -158,6 +158,23 @@ def _pack_stage1_params_for(variant: str) -> dict:
                      preproc_backend=CC_PREPROC_BACKEND,
                      adaptive_c=CC_ADAPTIVE_C)
         return d
+    elif variant == 'cucim':
+        return dict(
+            detector=CUCIM_DETECTOR,
+            min_sigma=CUCIM_MIN_SIGMA,
+            max_sigma=CUCIM_MAX_SIGMA,
+            num_sigma=CUCIM_NUM_SIGMA,
+            sigma_ratio=CUCIM_SIGMA_RATIO,
+            threshold=CUCIM_THRESHOLD,
+            overlap=CUCIM_OVERLAP,
+            log_scale=CUCIM_LOG_SCALE,
+            min_area_px=CUCIM_MIN_AREA_PX,
+            max_area_scale=CUCIM_MAX_AREA_SCALE,
+            pad_px=CUCIM_PAD_PX,
+            use_clahe=CUCIM_USE_CLAHE,
+            clahe_clip=CUCIM_CLAHE_CLIP,
+            clahe_tile=CUCIM_CLAHE_TILE,
+        )
     else:
         raise ValueError(f"Unknown Stage-1 variant: {variant!r}")
 
@@ -219,57 +236,45 @@ def main():
                 stage_times['01_detect'] = time.perf_counter() - _t0
                 AUDIT.record_params('01_detect')
                 AUDIT.copy_snapshot('01_detect', csv_path)
-            else:
-                # --- call separate CC implementation based on STAGE1_VARIANT ---
+            elif STAGE1_VARIANT in ('cc_cpu', 'cc_cuda', 'cucim'):
                 if STAGE1_VARIANT == 'cc_cpu':
-                    from stage1_detect_cc_cpu import detect_stage1_to_csv as _stage1_cc
+                    from stage1_detect_cc_cpu import detect_stage1_to_csv as _stage1_impl
                 elif STAGE1_VARIANT == 'cc_cuda':
-                    from stage1_detect_cc_cuda import detect_stage1_to_csv as _stage1_cc
+                    from stage1_detect_cc_cuda import detect_stage1_to_csv as _stage1_impl
                 else:
-                    raise ValueError(f"Unknown STAGE1_VARIANT={STAGE1_VARIANT!r} (expected 'blob'|'cc_cpu'|'cc_cuda')")
+                    from stage1_detect_cucim import detect_stage1_to_csv as _stage1_impl
 
                 _t0 = time.perf_counter()
                 stage1_kwargs = dict(
                     orig_path=orig_path,
                     csv_path=csv_path,
                     max_frames=MAX_FRAMES,
-                    # CC-specific gates (separate from SBD_*):
-                    min_area_px=CC_MIN_AREA_PX,
-                    max_area_scale=CC_MAX_AREA_SCALE,
-                    # CC-specific preproc:
-                    use_clahe=CC_USE_CLAHE,
-                    clahe_clip=CC_CLAHE_CLIP,
-                    clahe_tile=CC_CLAHE_TILE,
-                    use_tophat=CC_USE_TOPHAT,
-                    tophat_ksize=CC_TOPHAT_KSIZE,
-                    use_dog=CC_USE_DOG,
-                    dog_sigma1=CC_DOG_SIGMA1,
-                    dog_sigma2=CC_DOG_SIGMA2,
-                    # CC segmentation + labeling:
-                    threshold_method=CC_THRESHOLD_METHOD,
-                    fixed_threshold=CC_FIXED_THRESHOLD,
-                    open_ksize=CC_OPEN_KSIZE,
-                    connectivity=CC_CONNECTIVITY,
+                    **_pack_stage1_params_for(STAGE1_VARIANT),
                 )
-                if STAGE1_VARIANT == 'cc_cuda':
-                    stage1_kwargs.update(
-                        batch_size=CC_BATCH_SIZE,
-                        preproc_backend=CC_PREPROC_BACKEND,
-                        adaptive_c=CC_ADAPTIVE_C,
-                    )
-                _stage1_cc(**stage1_kwargs)
+                _stage1_impl(**stage1_kwargs)
                 stage_times['01_detect'] = time.perf_counter() - _t0
-                AUDIT.record_params(
-                    '01_detect',
-                    variant=STAGE1_VARIANT,
-                    cc_threshold_method=CC_THRESHOLD_METHOD,
-                    cc_open_ksize=CC_OPEN_KSIZE,
-                    cc_connectivity=CC_CONNECTIVITY,
-                    cc_min_area_px=CC_MIN_AREA_PX,
-                    cc_max_area_scale=CC_MAX_AREA_SCALE,
-                )
-                AUDIT.copy_snapshot('01_detect', csv_path)
 
+                audit_kwargs = dict(variant=STAGE1_VARIANT)
+                if STAGE1_VARIANT.startswith('cc_'):
+                    audit_kwargs.update(
+                        cc_threshold_method=CC_THRESHOLD_METHOD,
+                        cc_open_ksize=CC_OPEN_KSIZE,
+                        cc_connectivity=CC_CONNECTIVITY,
+                        cc_min_area_px=CC_MIN_AREA_PX,
+                        cc_max_area_scale=CC_MAX_AREA_SCALE,
+                    )
+                elif STAGE1_VARIANT == 'cucim':
+                    audit_kwargs.update(
+                        cucim_detector=CUCIM_DETECTOR,
+                        cucim_min_sigma=CUCIM_MIN_SIGMA,
+                        cucim_max_sigma=CUCIM_MAX_SIGMA,
+                        cucim_threshold=CUCIM_THRESHOLD,
+                        cucim_overlap=CUCIM_OVERLAP,
+                    )
+                AUDIT.record_params('01_detect', **audit_kwargs)
+                AUDIT.copy_snapshot('01_detect', csv_path)
+            else:
+                raise ValueError(f"Unknown STAGE1_VARIANT={STAGE1_VARIANT!r} (expected 'blob'|'cc_cpu'|'cc_cuda'|'cucim')")
         # Stage 2 — recenter via intensity centroid (drop dim crops)
         if RUN_STAGE2:
             _t0 = time.perf_counter()
