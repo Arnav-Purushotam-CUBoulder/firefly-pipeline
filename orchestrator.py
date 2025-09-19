@@ -13,7 +13,7 @@ Pipeline:
   8) recenter_gaussian_centroid(): refine centers with (Gaussian-optional) intensity centroid, overwrite CSV
   9) stage9_validate_against_gt(): validate predictions vs ground truth, save FP/TP/FN crops & metrics
   10) overlay_gt_vs_model(): render GT (GREEN), Model (RED), overlap (YELLOW) on a single video (runs only if Stage 9 ran)
-      and render per-threshold videos (TP=YELLOW, FP=RED, FN=GREEN).
+      and render per-threshold videos (TP=YELLOW, FP=RED, FN=GREEN).   
 """
 
 from pathlib import Path
