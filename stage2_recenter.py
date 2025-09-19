@@ -69,11 +69,12 @@ def recenter_boxes_with_centroid(
     if not cap.isOpened():
         sys.exit(f"Could not open original video: {orig_path}")
 
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-    effective_limit = min(max_frame_in_csv, total)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    # Only iterate up to the highest frame index present in CSV (and honor max_frames)
+    effective_limit = min(max_frame_in_csv, total_frames)
     if max_frames is not None:
         effective_limit = min(effective_limit, max_frames)
-    total = effective_limit
+    total = effective_limit  # for the progress bar
 
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -82,15 +83,24 @@ def recenter_boxes_with_centroid(
     logs_removed = []
     logs_kept = []
 
-    fr = 0
-    while True:
-        if max_frames is not None and fr > max_frames:
-            break
+    # Decide access strategy:
+    # Random seek can be slower than sequential scan on many containers.
+    # Use random access ONLY when the set of frames is very sparse.
+    frames_needed = sorted(by_frame.keys())
+    span = float(max(1, effective_limit + 1))
+    sparse_ratio = len(frames_needed) / span
+    use_random_access = (sparse_ratio <= 0.10)  # <=10% of frames requested
 
-        ok, frame = cap.read()
-        if not ok: break
-
-        if fr in by_frame:
+    if use_random_access:
+        total = len(frames_needed)
+        for i, fr in enumerate(frames_needed):
+            if max_frames is not None and fr >= max_frames:
+                break
+            # Random seek is safe/fast for MJPG and sparse access
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(fr))
+            ok, frame = cap.read()
+            if not ok:
+                continue
             # 1) one grayscale conversion per frame
             gray_u8 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             # 2) float32 once per frame for centroid math (matches original)
@@ -152,8 +162,65 @@ def recenter_boxes_with_centroid(
 
                 rows[row_idx]['x'] = str(new_x)
                 rows[row_idx]['y'] = str(new_y)
+            progress(i+1, total, 'recenter')
+    else:
+        fr = 0
+        while True:
+            if fr >= effective_limit:
+                break
+            ok, frame = cap.read()
+            if not ok:
+                break
 
-        progress(fr+1, total, 'recenter'); fr += 1
+            if fr in by_frame:
+                gray_u8 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray_f32 = gray_u8.astype(np.float32)
+                for row_idx, x, y, w, h in by_frame[fr]:
+                    r = rows[row_idx]
+                    w = max(1, min(w, W)); h = max(1, min(h, H))
+                    x = max(0, min(x, W - w)); y = max(0, min(y, H - h))
+                    patch_max = int(gray_u8[y:y+h, x:x+w].max()) if w > 0 and h > 0 else 0
+                    if patch_max < int(bright_max_threshold):
+                        keep_mask[row_idx] = False
+                        if audit is not None:
+                            logs_removed.append({
+                                'video': str(orig_path),
+                                'frame': int(r['frame']),
+                                'x': int(x), 'y': int(y),
+                                'w': int(w), 'h': int(h),
+                                'bright_max': int(patch_max),
+                                'bright_min_thr': int(bright_max_threshold),
+                            })
+                        continue
+                    patch_gray_f32 = gray_f32[y:y+h, x:x+w]
+                    if patch_gray_f32.size == 0:
+                        keep_mask[row_idx] = False
+                        continue
+                    cx_rel, cy_rel = intensity_weighted_centroid_cached(patch_gray_f32)
+                    cx_full = x + cx_rel
+                    cy_full = y + cy_rel
+                    new_x = int(round(cx_full - w/2))
+                    new_y = int(round(cy_full - h/2))
+                    new_x = max(0, min(new_x, W - w))
+                    new_y = max(0, min(new_y, H - h))
+                    if audit is not None:
+                        try:
+                            shift_dx = int(new_x - int(r['x']))
+                            shift_dy = int(new_y - int(r['y']))
+                        except Exception:
+                            shift_dx = int(new_x - x)
+                            shift_dy = int(new_y - y)
+                        logs_kept.append({
+                            'video': str(orig_path),
+                            'frame': int(r['frame']),
+                            'x': int(new_x), 'y': int(new_y),
+                            'w': int(w), 'h': int(h),
+                            'shift_dx': shift_dx, 'shift_dy': shift_dy,
+                            'bright_max': int(patch_max),
+                        })
+                    rows[row_idx]['x'] = str(new_x)
+                    rows[row_idx]['y'] = str(new_y)
+            progress(fr+1, total, 'recenter'); fr += 1
 
     cap.release()
 

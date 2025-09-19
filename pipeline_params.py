@@ -18,7 +18,7 @@ DIR_STAGE10_OUT = ROOT / 'stage10 overlay videos'
 DIR_STAGE8_9_OUT = ROOT / 'stage8.9 gt centroid crops'
 
 # Audit toggle
-ENABLE_AUDIT = False
+ENABLE_AUDIT = True
 
 # Global knobs / flags
 MAX_FRAMES = None
@@ -49,6 +49,9 @@ RUN_PRE_RUN_CLEANUP = True
 
 # Stage-1 variant selection
 STAGE1_VARIANT = 'cucim'
+# Optional: override Stage-1 just for Stage 8.6 replay
+# e.g., use 'cc_cuda' for a fast blackout pass while keeping 'cucim' for the main pass
+STAGE8_6_STAGE1_IMPL = STAGE1_VARIANT
 
 # Stage-1 cuCIM GPU blob detector
 CUCIM_DETECTOR = 'log'  # 'log' | 'dog' | 'doh'
@@ -137,6 +140,7 @@ MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION = 20
 # Stage 8.6 — neighbor hunt
 STAGE8_6_RUNS = 1
 STAGE8_6_DEDUPE_PX = 4.0
+STAGE8_6_DISABLE_CLAHE = False
 
 # Stage 8.7 — large-flash fixer
 STAGE8_7_INTENSITY_THR = 70

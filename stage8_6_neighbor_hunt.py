@@ -16,6 +16,7 @@ All Stage 8.6 artifacts live under:
 from __future__ import annotations
 import csv
 from pathlib import Path
+import time
 from typing import Dict, List, Sequence, Tuple, Optional
 
 import cv2
@@ -165,7 +166,8 @@ def _open_writer_like(cap: cv2.VideoCapture, out_path: Path) -> cv2.VideoWriter:
     fps = cap.get(cv2.CAP_PROP_FPS)
     if not fps or float(fps) <= 1e-3:
         fps = 30.0
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    # Use MJPG for fast CPU encode/decode of temporary blackout video
+    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
     return cv2.VideoWriter(str(out_path), fourcc, float(fps), (W, H))
 
 def _clamped_center_box(cx: float, cy: float, w: int, h: int, W: int, H: int) -> Tuple[int,int,int,int]:
@@ -191,6 +193,8 @@ def _build_blacked_video(
 
     fr = 0
     BAR = 50
+    # Update progress at most 50 times (every ~2% or at last frame)
+    step = max(1, total // BAR) if total else 1
     while True:
         if max_frames is not None and fr >= max_frames:
             break
@@ -202,15 +206,16 @@ def _build_blacked_video(
             frame[y0:y1, x0:x1] = 0  # fill black
         out.write(frame)
 
-        # progress
-        frac = 0 if total == 0 else min(1.0, max(0.0, (fr+1) / total))
-        bar  = '=' * int(frac * BAR) + ' ' * (BAR - int(frac * BAR))
-        try:
-            import sys
-            sys.stdout.write(f'\r[stage8.6] build blacked video [{bar}] {int(frac*100):3d}%')
-            sys.stdout.flush()
-        except Exception:
-            pass
+        # progress (throttled)
+        if ((fr + 1) % step == 0) or (fr + 1 == total):
+            frac = 0 if total == 0 else min(1.0, max(0.0, (fr+1) / total))
+            bar  = '=' * int(frac * BAR) + ' ' * (BAR - int(frac * BAR))
+            try:
+                import sys
+                sys.stdout.write(f'\r[stage8.6] build blacked video [{bar}] {int(frac*100):3d}%')
+                sys.stdout.flush()
+            except Exception:
+                pass
         fr += 1
 
     cap.release(); out.release()
@@ -336,11 +341,15 @@ def stage8_6_run(
         print("[stage8.6] Skipping (STAGE8_6_RUNS <= 0)")
         return 0
 
-    # Stage-1 choice and params: default to orchestrator if not provided
+    # Stage-1 choice and params: allow dedicated 8.6 override, else default to orchestrator
     if stage1_impl is None:
-        stage1_impl = getattr(ORC, "STAGE1_VARIANT", "blob")
+        stage1_impl = getattr(ORC, "STAGE8_6_STAGE1_IMPL",
+                              getattr(ORC, "STAGE1_VARIANT", "blob"))
     if stage1_params is None:
         stage1_params = _pack_stage1_params_for(ORC, stage1_impl)
+        # Optional: disable CLAHE just for 8.6 replay to speed up Stage-1
+        if stage1_impl == 'cucim' and getattr(ORC, 'STAGE8_6_DISABLE_CLAHE', False):
+            stage1_params['use_clahe'] = False
 
     # Resolve Stage-1 function once
     STAGE1_DETECT = _resolve_stage1(stage1_impl)
@@ -361,6 +370,9 @@ def stage8_6_run(
     total_added = 0
     for run_idx in range(1, runs + 1):
         print(f"[stage8.6] RUN {run_idx}/{runs}")
+        _run_t0 = time.perf_counter()
+        _t = {k: 0.0 for k in (
+            'centers','build_blacked','s1','s2','s3','s4','s7','s8','s8_5','merge','logits')}
 
         # Paths for this run
         run_dir = stage86_root / f"run_{run_idx:02d}"
@@ -368,14 +380,16 @@ def stage8_6_run(
         (run_dir / "stage8 crops").mkdir(parents=True, exist_ok=True)
 
         run_tag        = f"{main_csv_path.stem}__s8_6run{run_idx}"
-        blacked_video  = run_dir / "blacked.mp4"
+        # Use AVI container for MJPG so OpenCV/FFmpeg decodes quickly
+        blacked_video  = run_dir / "blacked.avi"
         sub_csv        = run_dir / "csv files" / f"{run_tag}.csv"
         sub_ff_logits  = run_dir / "csv files" / f"{run_tag}_fireflies_logits.csv"
         sub_area_snap  = run_dir / "csv files" / f"{run_tag}_area_snapshot.csv"
         sub_s8_crops   = run_dir / "stage8 crops"  # for Stage 8
 
         # 1) Build blacked video from CURRENT base_rows
-        centers_by_frame = _frame_firefly_centers(base_rows)
+        _t0 = time.perf_counter(); centers_by_frame = _frame_firefly_centers(base_rows); _t['centers'] = time.perf_counter()-_t0
+        _t0 = time.perf_counter()
         _build_blacked_video(
             orig_video_path=orig_video_path,
             centers_by_frame=centers_by_frame,
@@ -383,10 +397,12 @@ def stage8_6_run(
             blackout_w=10, blackout_h=10,
             max_frames=MAX_FRAMES,
         )
+        _t['build_blacked'] = time.perf_counter() - _t0
 
         # 2) Run standard pipeline on the blacked video (using orchestrator's params)
 
         # Stage 1 (resolved variant + filtered kwargs)
+        _t0 = time.perf_counter()
         _filtered_call(
             STAGE1_DETECT,
             orig_path=blacked_video,
@@ -394,8 +410,10 @@ def stage8_6_run(
             max_frames=MAX_FRAMES,
             **(stage1_params or {}),
         )
+        _t['s1'] = time.perf_counter() - _t0
 
         # Stage 2
+        _t0 = time.perf_counter()
         STAGE2_RECENTER(
             orig_path=blacked_video,
             csv_path=sub_csv,
@@ -404,17 +422,21 @@ def stage8_6_run(
             audit=audit,
             audit_video_path=blacked_video,
         )
+        _t['s2'] = time.perf_counter() - _t0
 
         # Stage 3
+        _t0 = time.perf_counter()
         STAGE3_AREA_FILTER(
             csv_path=sub_csv,
             area_threshold_px=AREA_THRESHOLD_PX,
             snapshot_csv_path=sub_area_snap,
             audit=audit,
         )
+        _t['s3'] = time.perf_counter() - _t0
 
         # Stage 4 (only if enabled in orchestrator)
         if ORC.RUN_STAGE4 and USE_CNN_FILTER:
+            _t0 = time.perf_counter()
             STAGE4_CNN_FILTER(
                 orig_path=blacked_video,
                 csv_path=sub_csv,
@@ -433,8 +455,10 @@ def stage8_6_run(
                 debug_save_patches_dir=DEBUG_SAVE_PATCHES_DIR,
                 audit=audit,
             )
+            _t['s4'] = time.perf_counter() - _t0
 
         # Stage 7
+        _t0 = time.perf_counter()
         STAGE7_MERGE(
             orig_video_path=blacked_video,
             csv_path=sub_csv,
@@ -443,8 +467,10 @@ def stage8_6_run(
             verbose=STAGE7_VERBOSE,
             audit=audit,
         )
+        _t['s7'] = time.perf_counter() - _t0
 
         # Stage 8
+        _t0 = time.perf_counter()
         STAGE8_GAUSSIAN_CENTROID(
             orig_video_path=blacked_video,
             csv_path=sub_csv,
@@ -456,8 +482,10 @@ def stage8_6_run(
             crop_dir=sub_s8_crops,
             audit=audit,
         )
+        _t['s8'] = time.perf_counter() - _t0
 
         # Stage 8.5
+        _t0 = time.perf_counter()
         STAGE8_5_BLOB_FILTER(
             orig_video_path=blacked_video,
             csv_path=sub_csv,
@@ -467,9 +495,10 @@ def stage8_6_run(
             verbose=True,
             audit=audit,
         )
+        _t['s8_5'] = time.perf_counter() - _t0
 
         # 3) Merge run results into MAIN CSV (+ logits)
-        run_rows = _read_csv_rows(sub_csv)
+        _t0 = time.perf_counter(); run_rows = _read_csv_rows(sub_csv); _t_merge_io = time.perf_counter() - _t0
         if not run_rows:
             print(f"[stage8.6] RUN {run_idx}: produced no rows.")
             continue
@@ -485,7 +514,7 @@ def stage8_6_run(
             except Exception:
                 continue
 
-        kept, _dropped = _dedupe_merge(base_rows, add_rows, MERGE_DEDUPE_PX)
+        _t0 = time.perf_counter(); kept, _dropped = _dedupe_merge(base_rows, add_rows, MERGE_DEDUPE_PX); _t['merge'] = time.perf_counter() - _t0
 
         # audit: what we tried to add vs what dedupe rejected
         if audit is not None:
@@ -500,10 +529,11 @@ def stage8_6_run(
 
         # append to main CSV
         base_rows = base_rows + kept
-        _write_csv_rows(main_csv_path, base_rows, field_order)
+        _t0 = time.perf_counter(); _write_csv_rows(main_csv_path, base_rows, field_order); _t['merge'] += time.perf_counter() - _t0 + _t_merge_io
 
         # append to main fireflies_logits.csv (match by frame,int(x),int(y))
         if sub_ff_logits.exists():
+            _t0 = time.perf_counter()
             ff_cols = ["x","y","t","background_logit","firefly_logit"]
             existing = []
             if main_ff_logits_path.exists():
@@ -538,8 +568,18 @@ def stage8_6_run(
                     w.writerow({k: r.get(k, "") for k in ff_cols})
                 for r in new_ff_rows:
                     w.writerow({k: r.get(k, "") for k in ff_cols})
+            _t['logits'] = time.perf_counter() - _t0
 
-        print(f"[stage8.6] RUN {run_idx}: added {len(kept)} new rows � {main_csv_path.name}")
+        run_dt = time.perf_counter() - _run_t0
+        subtotal = sum(_t.values())
+        overhead = max(0.0, run_dt - subtotal)
+        print(f"[stage8.6] RUN {run_idx}: added {len(kept)} rows — {main_csv_path.name}")
+        print(
+            f"[stage8.6 timing] run {run_idx}: build_blacked={_t['build_blacked']:.2f}s, "
+            f"s1={_t['s1']:.2f}s, s2={_t['s2']:.2f}s, s3={_t['s3']:.2f}s, "
+            f"s4={_t['s4']:.2f}s, s7={_t['s7']:.2f}s, s8={_t['s8']:.2f}s, s8.5={_t['s8_5']:.2f}s, "
+            f"merge+io={_t['merge']:.2f}s, logits={_t['logits']:.2f}s, total={run_dt:.2f}s, overhead={overhead:.2f}s"
+        )
         total_added += len(kept)
 
     print(f"[stage8.6] TOTAL new rows added across runs: {total_added}")
