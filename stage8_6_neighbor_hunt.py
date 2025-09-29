@@ -111,6 +111,7 @@ def _pack_stage1_params_for(ORC, variant: str) -> dict:
             use_clahe=ORC.CUCIM_USE_CLAHE,
             clahe_clip=ORC.CUCIM_CLAHE_CLIP,
             clahe_tile=ORC.CUCIM_CLAHE_TILE,
+            batch_size=getattr(ORC, 'CUCIM_BATCH_SIZE', 8),
         )
     else:
         raise ValueError(f"Unknown Stage-1 variant: {variant!r}")

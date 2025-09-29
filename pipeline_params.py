@@ -18,7 +18,7 @@ DIR_STAGE10_OUT = ROOT / 'stage10 overlay videos'
 DIR_STAGE8_9_OUT = ROOT / 'stage8.9 gt centroid crops'
 
 # Audit toggle
-ENABLE_AUDIT = True
+ENABLE_AUDIT = False
 
 # Global knobs / flags
 MAX_FRAMES = None
@@ -37,9 +37,9 @@ RUN_STAGE8 = True
 RUN_STAGE8_5 = True
 RUN_STAGE8_6 = True
 RUN_STAGE8_7 = True
-RUN_STAGE8_9 = True
+RUN_STAGE8_9 = False
 RUN_STAGE8_5_AFTER_8_7 = True
-RUN_STAGE9 = True
+RUN_STAGE9 = False
 RUN_STAGE10 = True
 RUN_STAGE11 = True
 RUN_STAGE12 = True
@@ -68,6 +68,7 @@ CUCIM_PAD_PX = 2
 CUCIM_USE_CLAHE = True
 CUCIM_CLAHE_CLIP = 2.0
 CUCIM_CLAHE_TILE = 8
+CUCIM_BATCH_SIZE = 250     #number of frames to be sent to the gpu at once
 
 # Stage-1 CUDA CC tuning
 CC_BATCH_SIZE = 64

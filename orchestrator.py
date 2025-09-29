@@ -174,6 +174,7 @@ def _pack_stage1_params_for(variant: str) -> dict:
             use_clahe=CUCIM_USE_CLAHE,
             clahe_clip=CUCIM_CLAHE_CLIP,
             clahe_tile=CUCIM_CLAHE_TILE,
+            batch_size=CUCIM_BATCH_SIZE,
         )
     else:
         raise ValueError(f"Unknown Stage-1 variant: {variant!r}")
