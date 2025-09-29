@@ -448,6 +448,7 @@ def stage8_6_run(
                 class_to_keep=CNN_CLASS_TO_KEEP,
                 patch_w=CNN_PATCH_W,
                 patch_h=CNN_PATCH_H,
+                patch_batch_size=getattr(ORC, 'NUM_PATCHES_BATCH_SIZE', 0),
                 firefly_conf_thresh=FIREFLY_CONF_THRESH,
                 drop_background_rows=DROP_BACKGROUND_ROWS,
                 imagenet_normalize=IMAGENET_NORMALIZE,

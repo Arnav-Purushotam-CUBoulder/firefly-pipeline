@@ -69,6 +69,7 @@ def classify_and_filter_csv(
     class_to_keep: int = 1,         # FIREFLY index
     patch_w: int = 10,
     patch_h: int = 10,
+    patch_batch_size: int = 0,      # 0/<=0 = per-frame batches; >0 = cross-frame patch batching
     firefly_conf_thresh: float = 0.5,
     drop_background_rows: bool = False,
     imagenet_normalize: bool = False,       # set True only if your model expects it
@@ -142,6 +143,33 @@ def classify_and_filter_csv(
     has_xy_sem = ('xy_semantics' in rows[0].keys())
 
     labeled_rows: List[dict] = []
+
+    # Helper to flush an accumulated cross-frame patch batch
+    def _flush(pending_tensors: List[torch.Tensor], pending_meta: List[Tuple[dict, float, float]]):
+        if not pending_tensors:
+            return [], []
+        batch = torch.stack(pending_tensors, dim=0).to(device)
+        logits = model(batch)
+        FIRE_IDX = int(class_to_keep)
+        BACK_IDX = 1 - FIRE_IDX
+        out_rows: List[dict] = []
+        for i, (r, _cx, _cy) in enumerate(pending_meta):
+            lg = logits[i].detach().float().cpu().numpy().tolist()
+            bg = float(lg[BACK_IDX]); ff = float(lg[FIRE_IDX])
+            conf = _softmax_fire_prob(bg, ff)
+            cls  = 'firefly' if conf >= float(firefly_conf_thresh) else 'background'
+            out = dict(r)
+            out['class'] = cls
+            out['background_logit'] = bg
+            out['firefly_logit'] = ff
+            out['firefly_confidence'] = conf
+            out_rows.append(out)
+        return out_rows, []
+
+    # Accumulator for cross-frame batching (enabled if patch_batch_size > 0)
+    pending_tensors: List[torch.Tensor] = []
+    pending_meta: List[Tuple[dict, float, float]] = []
+
     fr = 0
     while True:
         if max_frames is not None and fr >= max_frames:
@@ -151,56 +179,51 @@ def classify_and_filter_csv(
             break
 
         dets = by_frame.get(fr, [])
-        if not dets:
-            progress(fr+1, max_frames or total_frames, 'stage4'); fr += 1
-            continue
+        if dets:
+            for r in dets:
+                try:
+                    x = float(r['x']); y = float(r['y'])
+                    w = int(float(r['w'])); h = int(float(r['h']))
+                except Exception:
+                    continue
 
-        # Build batch
-        batch_tensors = []
-        meta: List[Tuple[dict, float, float]] = []  # (row, cx, cy)
-        for r in dets:
-            try:
-                x = float(r['x']); y = float(r['y'])
-                w = int(float(r['w'])); h = int(float(r['h']))
-            except Exception:
-                continue
+                if has_xy_sem and str(r.get('xy_semantics','')).lower() == 'center':
+                    cx, cy = x, y
+                else:
+                    cx, cy = x + w/2.0, y + h/2.0
 
-            if has_xy_sem and str(r.get('xy_semantics','')).lower() == 'center':
-                cx, cy = x, y
-            else:
-                cx, cy = x + w/2.0, y + h/2.0
+                pil = _center_crop_clamped_bgr_to_pil(frame, cx, cy, patch_w, patch_h)
+                if debug_save_patches_dir:
+                    debug_save_patches_dir.mkdir(parents=True, exist_ok=True)
+                    pil.save(debug_save_patches_dir / f"f{fr:06d}_cx{int(round(cx))}_cy{int(round(cy))}.png")
 
-            pil = _center_crop_clamped_bgr_to_pil(frame, cx, cy, patch_w, patch_h)
-            if debug_save_patches_dir:
-                debug_save_patches_dir.mkdir(parents=True, exist_ok=True)
-                pil.save(debug_save_patches_dir / f"f{fr:06d}_cx{int(round(cx))}_cy{int(round(cy))}.png")
+                ten = transform(pil)
+                if patch_batch_size and patch_batch_size > 0:
+                    pending_tensors.append(ten)
+                    pending_meta.append((r, cx, cy))
+                    if len(pending_tensors) >= int(patch_batch_size):
+                        outs, _ = _flush(pending_tensors, pending_meta)
+                        labeled_rows.extend(outs)
+                        pending_tensors.clear(); pending_meta.clear()
+                else:
+                    # Per-frame behavior: run immediately when this frame is done
+                    pending_tensors.append(ten)
+                    pending_meta.append((r, cx, cy))
 
-            ten = transform(pil)  # [3,h,w]
-            batch_tensors.append(ten)
-            meta.append((r, cx, cy))
-
-        if batch_tensors:
-            batch = torch.stack(batch_tensors, dim=0).to(device)  # [N,3,h,w]
-            logits = model(batch)  # [N,2]
-            FIRE_IDX = int(class_to_keep)
-            BACK_IDX = 1 - FIRE_IDX
-
-            for i, (r, cx, cy) in enumerate(meta):
-                lg = logits[i].detach().float().cpu().numpy().tolist()
-                bg = float(lg[BACK_IDX]); ff = float(lg[FIRE_IDX])
-                conf = _softmax_fire_prob(bg, ff)
-                cls  = 'firefly' if conf >= float(firefly_conf_thresh) else 'background'
-
-                out = dict(r)  # preserve original fields
-                out['class'] = cls
-                out['background_logit'] = bg
-                out['firefly_logit'] = ff
-                out['firefly_confidence'] = conf
-                labeled_rows.append(out)
+        # If per-frame batching, flush now
+        if not (patch_batch_size and patch_batch_size > 0) and pending_tensors:
+            outs, _ = _flush(pending_tensors, pending_meta)
+            labeled_rows.extend(outs)
+            pending_tensors.clear(); pending_meta.clear()
 
         progress(fr+1, max_frames or total_frames, 'stage4'); fr += 1
 
     cap.release()
+
+    # Flush any remaining cross-frame patches
+    if pending_tensors:
+        outs, _ = _flush(pending_tensors, pending_meta)
+        labeled_rows.extend(outs)
 
     # audit: log all scores before any drop
     if audit is not None and labeled_rows:

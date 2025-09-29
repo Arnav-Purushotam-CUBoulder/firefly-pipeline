@@ -18,7 +18,7 @@ DIR_STAGE10_OUT = ROOT / 'stage10 overlay videos'
 DIR_STAGE8_9_OUT = ROOT / 'stage8.9 gt centroid crops'
 
 # Audit toggle
-ENABLE_AUDIT = False
+ENABLE_AUDIT = True
 
 # Global knobs / flags
 MAX_FRAMES = None
@@ -37,9 +37,9 @@ RUN_STAGE8 = True
 RUN_STAGE8_5 = True
 RUN_STAGE8_6 = True
 RUN_STAGE8_7 = True
-RUN_STAGE8_9 = False
+RUN_STAGE8_9 = True
 RUN_STAGE8_5_AFTER_8_7 = True
-RUN_STAGE9 = False
+RUN_STAGE9 = True
 RUN_STAGE10 = True
 RUN_STAGE11 = True
 RUN_STAGE12 = True
@@ -118,6 +118,7 @@ CNN_BACKBONE = 'resnet18'
 CNN_CLASS_TO_KEEP = 1
 CNN_PATCH_W = 10
 CNN_PATCH_H = 10
+NUM_PATCHES_BATCH_SIZE = 16384      # if the input video contains more noise, then increase this, otherwise decrease this
 FIREFLY_CONF_THRESH = 0.5
 DROP_BACKGROUND_ROWS = False
 IMAGENET_NORMALIZE = False

@@ -319,6 +319,7 @@ def main():
                 class_to_keep=CNN_CLASS_TO_KEEP,
                 patch_w=CNN_PATCH_W,
                 patch_h=CNN_PATCH_H,
+                patch_batch_size=NUM_PATCHES_BATCH_SIZE,
                 firefly_conf_thresh=FIREFLY_CONF_THRESH,
                 drop_background_rows=DROP_BACKGROUND_ROWS,
                 imagenet_normalize=IMAGENET_NORMALIZE,
@@ -328,7 +329,7 @@ def main():
                 audit=AUDIT,
             )
             stage_times['04_cnn'] = time.perf_counter() - _t0
-            AUDIT.record_params('04_cnn', model=str(CNN_MODEL_PATH), backbone=CNN_BACKBONE)
+            AUDIT.record_params('04_cnn', model=str(CNN_MODEL_PATH), backbone=CNN_BACKBONE, patch_batch_size=NUM_PATCHES_BATCH_SIZE)
             AUDIT.copy_snapshot('04_cnn', csv_path)
 
         # Stage 5 — render dynamic boxes on BS and/or original
