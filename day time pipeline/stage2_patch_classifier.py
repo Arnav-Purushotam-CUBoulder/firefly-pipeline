@@ -104,55 +104,65 @@ def _load_model(model_path: Path):
     return m, dev
 
 
-def _load_stage1_rows(stem: str) -> dict[int, dict]:
-    s1_csv = (params.STAGE1_DIR / stem) / f"{stem}_trajectories.csv"
-    out: dict[int, dict] = {}
-    with s1_csv.open("r", newline="") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            gid = int(row["global_id"])  # unique id assigned in stage1
-            out[gid] = row
-    return out
+def _load_stage1_xyts(stem: str):
+    """Load Stage 1 telemetry CSV (x,y,t,global_component_id).
 
-
-def _all_gids_from_stage1(rows: dict[int, dict]) -> list[int]:
-    return sorted(int(g) for g in rows.keys())
+    Returns arrays (xs, ys, ts, cids) or (None, None, None, None) if missing/empty.
+    """
+    csv_path = (params.STAGE1_DIR / stem) / f"{stem}_pixels_xy_t.csv"
+    if not csv_path.exists():
+        print(f"Stage2  ERROR: Stage1 telemetry CSV not found: {csv_path}")
+        return None, None, None, None
+    try:
+        data = np.loadtxt(str(csv_path), delimiter=",", skiprows=1, dtype=np.int64)
+        if data.ndim == 1 and data.size == 4:
+            data = data.reshape(1, 4)
+        if data.size == 0:
+            print("Stage2  NOTE: Stage1 telemetry CSV has no rows.")
+            return None, None, None, None
+        xs = data[:, 0]
+        ys = data[:, 1]
+        ts = data[:, 2]
+        cids = data[:, 3]
+        return xs, ys, ts, cids
+    except Exception as e:
+        print(f"Stage2  ERROR: failed to read telemetry CSV: {e}")
+        return None, None, None, None
 
 
 def run_for_video(video_path: Path) -> Path:
     stem = video_path.stem
-    s1_rows = _load_stage1_rows(stem)
-    # Use ALL Stage 1 candidates
-    selected = set(_all_gids_from_stage1(s1_rows))
+    # Load Stage 1 telemetry (per-pixel xyts)
+    xs, ys, ts, cids = _load_stage1_xyts(stem)
 
     out_root = (params.STAGE2_DIR / stem)
     pos_dir = out_root / "crops" / "positives"
     neg_dir = out_root / "crops" / "negatives"
-    pos_dir.mkdir(parents=True, exist_ok=True)
-    neg_dir.mkdir(parents=True, exist_ok=True)
+    if bool(getattr(params, 'SAVE_EXTRAS', True)):
+        pos_dir.mkdir(parents=True, exist_ok=True)
+        neg_dir.mkdir(parents=True, exist_ok=True)
 
     cap, W, H, fps, total = open_video(video_path)
 
-    # Index: frame -> list[(gid, cx, cy)]
+    # If no telemetry, write header-only CSV and return
+    out_csv = out_root / f"{stem}_patches.csv"
+    if xs is None or ys is None or ts is None or cids is None:
+        with out_csv.open("w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["x", "y", "w", "h", "frame_number", "global_trajectory_id"])
+        cap.release()
+        print("Stage2  NOTE: No telemetry available; wrote empty CSV.")
+        return out_csv
+
+    # Index: frame -> list[(gid, cx, cy)] from telemetry rows
     by_frame = defaultdict(list)
-    for gid in selected:
-        row = s1_rows.get(gid)
-        if not row:
-            continue
-        x = int(row["x"])
-        y = int(row["y"])
-        w = int(row["w"])
-        h = int(row["h"])
-        t = int(row["first_t"])
-        cx = x + w / 2.0
-        cy = y + h / 2.0
-        by_frame[int(t)].append((gid, cx, cy))
+    for x, y, t, gid in zip(xs, ys, ts, cids):
+        by_frame[int(t)].append((int(gid), float(x), float(y)))
 
     # Load model + transform
     model, dev = _load_model(params.PATCH_MODEL_PATH)
     import torch
 
-    out_csv = out_root / f"{stem}_patches.csv"
     total_patches = 0
     pos_count = 0
     neg_count = 0
@@ -161,8 +171,8 @@ def run_for_video(video_path: Path) -> Path:
 
     with out_csv.open("w", newline="") as f:
         writer = csv.writer(f)
-        # As requested: x,y,w,h,frame_number
-        writer.writerow(["x", "y", "w", "h", "frame_number"])
+        # Include gid to enable end-to-end tracing
+        writer.writerow(["x", "y", "w", "h", "frame_number", "global_trajectory_id"])
 
         frames_sorted = sorted(by_frame.keys())
         # Respect global frame cap if provided
@@ -172,7 +182,7 @@ def run_for_video(video_path: Path) -> Path:
 
         if not frames_sorted:
             print("Stage2  NOTE: No frames to process (possibly due to MAX_FRAMES).")
-            print(f"Stage2  Candidates from Stage1: {len(selected)}; frames_in_range=0")
+            print(f"Stage2  Telemetry rows: {len(xs)}; frames_in_range=0")
             # leave only header in CSV and return
             cap.release()
             print("Stage2  Summary: patches=0, positives=0, negatives=0")
@@ -207,15 +217,16 @@ def run_for_video(video_path: Path) -> Path:
             total_patches += len(metas)
             for (gid, cx, cy), is_pos, p_conf in zip(metas, preds, probs_np):
                 patch, _, _ = center_crop_with_pad(frame, cx, cy, params.PATCH_SIZE_PX, params.PATCH_SIZE_PX)
-                out_dir = pos_dir if is_pos else neg_dir
-                # Filename: frame number + x_y_w_h + model confidence
-                out_name = (
-                    f"t_{int(t):06d}_x{int(round(cx))}_y{int(round(cy))}_"
-                    f"w{int(params.PATCH_SIZE_PX)}_h{int(params.PATCH_SIZE_PX)}_p{float(p_conf):.3f}.png"
-                )
-                cv2.imwrite(str(out_dir / out_name), patch)
+                if bool(getattr(params, 'SAVE_EXTRAS', True)):
+                    out_dir = pos_dir if is_pos else neg_dir
+                    # Filename: frame number + x_y_w_h + model confidence
+                    out_name = (
+                        f"gid_{int(gid):06d}_t_{int(t):06d}_x{int(round(cx))}_y{int(round(cy))}_"
+                        f"w{int(params.PATCH_SIZE_PX)}_h{int(params.PATCH_SIZE_PX)}_p{float(p_conf):.3f}.png"
+                    )
+                    cv2.imwrite(str(out_dir / out_name), patch)
                 if is_pos:
-                    writer.writerow([float(cx), float(cy), int(params.PATCH_SIZE_PX), int(params.PATCH_SIZE_PX), int(t)])
+                    writer.writerow([float(cx), float(cy), int(params.PATCH_SIZE_PX), int(params.PATCH_SIZE_PX), int(t), int(gid)])
                     pos_count += 1
                 else:
                     neg_count += 1

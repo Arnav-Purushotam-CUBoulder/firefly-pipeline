@@ -12,18 +12,18 @@ from utils import open_video, make_writer, progress
 
 
 def run_for_video(video_path: Path) -> Path:
-    """Render the final video with boxes drawn from Stage 3 CSV."""
+    """Render the final video with boxes drawn from Stage 4 CSV."""
     stem = video_path.stem
-    s3_csv = (params.STAGE3_DIR / stem) / f"{stem}_gauss.csv"
-    assert s3_csv.exists(), f"Missing Stage3 CSV for {stem}: {s3_csv}"
+    s4_csv = (params.STAGE4_DIR / stem) / f"{stem}_gauss.csv"
+    assert s4_csv.exists(), f"Missing Stage4 CSV for {stem}: {s4_csv}"
 
-    out_root = params.STAGE4_DIR / stem
+    out_root = params.STAGE5_DIR / stem
     out_root.mkdir(parents=True, exist_ok=True)
     out_path = out_root / f"{stem}_detections.mp4"
 
     # Read boxes by frame
     boxes_by_t: dict[int, list[tuple[float, float, int, int]]] = defaultdict(list)
-    with s3_csv.open("r", newline="") as f:
+    with s4_csv.open("r", newline="") as f:
         r = csv.DictReader(f)
         for row in r:
             cx = float(row["x"])
@@ -51,18 +51,26 @@ def run_for_video(video_path: Path) -> Path:
                     y0 = int(round(cy - h / 2.0))
                     x1 = x0 + int(w)
                     y1 = y0 + int(h)
-                    cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 0, 255), 1, cv2.LINE_AA)
+                    cv2.rectangle(
+                        frame,
+                        (x0, y0),
+                        (x1, y1),
+                        (0, 0, 255),
+                        int(getattr(params, 'RENDER_BOX_THICKNESS', 1)),
+                        cv2.LINE_AA,
+                    )
             writer.write(frame)
             t += 1
             if t % 50 == 0:
-                progress(t, max_frames or t, "Stage4 render")
-        progress(t, max_frames or t or 1, "Stage4 render done")
+                progress(t, max_frames or t, "Stage5 render")
+        progress(t, max_frames or t or 1, "Stage5 render done")
     finally:
         cap.release()
         writer.release()
 
-    print(f"Stage4  Wrote rendered video → {out_path}")
+    print(f"Stage5  Wrote rendered video → {out_path}")
     return out_path
 
 
 __all__ = ["run_for_video"]
+

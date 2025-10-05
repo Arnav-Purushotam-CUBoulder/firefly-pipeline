@@ -29,8 +29,12 @@ ORIGINAL_VIDEOS_DIR: Path = ROOT / "original videos"
 # Stage 1: trajectories; Stage 2: patch classifier; Stage 3: gaussian centroid; Stage 4: rendering
 STAGE1_DIR: Path = ROOT / "stage1_trajectories"
 STAGE2_DIR: Path = ROOT / "stage2_patch_classifier"
-STAGE3_DIR: Path = ROOT / "stage3_gaussian_centroid"
-STAGE4_DIR: Path = ROOT / "stage4_rendering"
+# New Stage 3: merge overlapping boxes (union-find)
+STAGE3_DIR: Path = ROOT / "stage3_merge"
+# Stage 4: Gaussian centroid refinement (moved from old Stage 3)
+STAGE4_DIR: Path = ROOT / "stage4_gaussian_centroid"
+# Stage 5: Rendering (moved from old Stage 4)
+STAGE5_DIR: Path = ROOT / "stage5_rendering"
 
 # Patch model (ResNet18 binary classifier). Provide a direct path, not under ROOT.
 # - Set to the absolute path of your trained .pt file.
@@ -52,9 +56,9 @@ NUM_WORKERS: int = 0
 # - *_POSITIVE_THRESHOLD: probability threshold to label positive.
 # - STAGE2_DEVICE: 'auto' | 'cpu' | 'cuda' | 'mps' (auto chooses best available)
 STAGE2_INPUT_SIZE: int = 10  # match training (10x10 patches)
-STAGE2_BATCH_SIZE: int = 64
+STAGE2_BATCH_SIZE: int = 512
 STAGE2_POSITIVE_CLASS_INDEX: int = 1
-STAGE2_POSITIVE_THRESHOLD: float = 0.75
+STAGE2_POSITIVE_THRESHOLD: float = 0.96
 STAGE2_DEVICE: str = 'auto'
 
 # Stage 2 (patch classifier) — uses STAGE2_* parameters above
@@ -65,19 +69,52 @@ STAGE2_DEVICE: str = 'auto'
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
 RUN_PRE_RUN_CLEANUP: bool = True
 
+# Global switch to disable saving of non-essential artifacts ("extras").
+# - If False, stages avoid writing debug/visualization crops/videos where possible.
+# - Stage 1 essentials: the two CSVs it produces.
+# - Stage 2 essentials: the patches CSV; crops are extras.
+# - Stage 3 essentials: merged CSV (no extras).
+# - Stage 4 essentials: refined CSV; crops are extras.
+# - Stage 5 essentials: rendered video (no extras).
+SAVE_EXTRAS: bool = True
+
 # Frame cap for fast iteration / testing
 # - MAX_FRAMES: if an integer, process only the first N frames of each video.
 #               If None, process the entire video.
 MAX_FRAMES: int | None = 500
 
-# Stage 1 — Long-exposure OR image per chunk, CC candidates
-# - CHUNK_SIZE: build a trails image every CHUNK_SIZE frames.
-# - TRAILS_INTENSITY_THRESHOLD: grayscale threshold (0..255) to consider a pixel "bright".
-# - CC_MIN_AREA/CC_MAX_AREA: area filter for connected components (0 => unlimited max).
-CHUNK_SIZE: int = 500
-TRAILS_INTENSITY_THRESHOLD: int = 230
-CC_MIN_AREA: int = 20
-CC_MAX_AREA: int = 10_000
+
+
+# Stage 1 — Threshold → BG-sub → Long-exposure OR → CC
+# Thresholding (applied to grayscale)
+THRESHOLD_8BIT: int = 70           # 0..255
+
+# Background subtraction (OpenCV MOG2)
+BGS_DETECT_SHADOWS: bool = True     # shadows get value 127
+BGS_HISTORY: int = 1000
+BGS_LEARNING_RATE: float = -1.0     # -1 => OpenCV decides
+
+# Long-exposure (OR) from FG mask video
+LONG_EXP_START_FRAME: int = 30      # skip early frames for BG model warm-up
+FG_MASK_THRESHOLD: int = 200        # treat pixels >= this as FG (ignore shadows=127)
+LONG_EXP_DILATE_ITERS: int = 1      # 0=off; 1–2 thicken trails slightly
+LONG_EXP_DILATE_KERNEL: int = 3     # odd size (3/5/7)
+LONG_EXP_BLUR_KSIZE: int = 0        # 0=off; else odd (3/5) slight blur before OR
+LONG_EXP_CHUNK_SIZE: int = 500      # build one long-exposure image per N frames
+
+# Connected components (area filter)
+CC_MIN_AREA: int = 5               # keep components with area >= this
+CC_MAX_AREA: int = 3000             # 0 = no upper cap; else limit very large blobs
+
+# Stage 1 outputs toggles
+STAGE1_SAVE_OVERLAY: bool = False   # also save per-chunk overlay on a video frame
+STAGE1_OVERLAY_DRAW_CC: bool = True # draw CC boxes+ids on overlay if saved
+STAGE1_SAVE_PATCHES: bool = True    # save per-component per-time patches (10x10 PNGs)
+STAGE1_WRITE_PER_FRAME_CSV: bool = True  # write telemetry CSV (x,y,t,global_id)
+
+# Legacy aliases for compatibility (do not modify)
+CHUNK_SIZE: int = LONG_EXP_CHUNK_SIZE
+TRAILS_INTENSITY_THRESHOLD: int = FG_MASK_THRESHOLD
 
 # Stage 2 — patch size used to crop from frames
 # - The classifier sees a resized version (STAGE2_INPUT_SIZE); this controls crop size from frames.
@@ -92,6 +129,14 @@ GAUSS_SIGMA: float = 1.0
 # - RENDER_FPS_HINT: None to use source fps; else override.
 RENDER_CODEC: str = "mp4v"
 RENDER_FPS_HINT: float | None = None
+# - RENDER_BOX_THICKNESS: thickness of bboxes in rendered videos (Stage 1 overlay and Stage 4)
+RENDER_BOX_THICKNESS: int = 1
+
+# Stage 3 — Merge (union-find) params
+MERGE_DIST_THRESHOLD_PX: float = 10.0
+
+
+
 
 
 def list_videos() -> List[Path]:
@@ -112,11 +157,24 @@ __all__ = [
     "STAGE2_DIR",
     "STAGE3_DIR",
     "STAGE4_DIR",
+    "STAGE5_DIR",
     # models
     "PATCH_MODEL_PATH",
     # params
     "RUN_PRE_RUN_CLEANUP",
+    "SAVE_EXTRAS",
     "MAX_FRAMES",
+    "LONG_EXP_CHUNK_SIZE",
+    "THRESHOLD_8BIT",
+    "LONG_EXP_START_FRAME",
+    "FG_MASK_THRESHOLD",
+    "LONG_EXP_DILATE_ITERS",
+    "LONG_EXP_DILATE_KERNEL",
+    "LONG_EXP_BLUR_KSIZE",
+    "BGS_DETECT_SHADOWS",
+    "BGS_HISTORY",
+    "BGS_LEARNING_RATE",
+    # legacy aliases
     "CHUNK_SIZE",
     "TRAILS_INTENSITY_THRESHOLD",
     "CC_MIN_AREA",
@@ -135,6 +193,12 @@ __all__ = [
     "GAUSS_SIGMA",
     "RENDER_CODEC",
     "RENDER_FPS_HINT",
+    "RENDER_BOX_THICKNESS",
+    "MERGE_DIST_THRESHOLD_PX",
+    "STAGE1_SAVE_OVERLAY",
+    "STAGE1_SAVE_PATCHES",
+    "STAGE1_OVERLAY_DRAW_CC",
+    "STAGE1_WRITE_PER_FRAME_CSV",
     # helpers
     "list_videos",
 ]

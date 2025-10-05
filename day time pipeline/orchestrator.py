@@ -7,20 +7,21 @@ from pathlib import Path
 
 import params
 from stage0_cleanup import cleanup_root
-from stage1_detect_trajectories import run_for_video as stage1_run
+from stage1_detect import run_for_video as stage1_run
 from stage2_patch_classifier import run_for_video as stage2_run
-from stage3_gaussian_centroid import run_for_video as stage3_run
-from stage4_render import run_for_video as stage4_run
+from stage3_merge import run_for_video as stage3_run
+from stage4_gaussian_centroid import run_for_video as stage4_run
+from stage5_render import run_for_video as stage5_run
 
 
 def _print_stage_times(stage_times: dict[str, float]) -> None:
-    keys_detect = ["stage1", "stage2", "stage3"]
+    keys_detect = ["stage1", "stage2", "stage3", "stage4"]
     s_detect = sum(stage_times.get(k, 0.0) for k in keys_detect)
     print("\nTiming summary:")
     for k in keys_detect:
         print(f"  {k}: {stage_times.get(k, 0.0):.2f}s")
-    print(f"  total(1-3): {s_detect:.2f}s")
-    print(f"  stage4(render): {stage_times.get('stage4', 0.0):.2f}s")
+    print(f"  total(1-4): {s_detect:.2f}s")
+    print(f"  stage5(render): {stage_times.get('stage5', 0.0):.2f}s")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -55,8 +56,12 @@ def main(argv: list[str] | None = None) -> int:
         stage_times["stage3"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        out_vid = stage4_run(vid)
+        s4_csv = stage4_run(vid)
         stage_times["stage4"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        out_vid = stage5_run(vid)
+        stage_times["stage5"] = time.perf_counter() - t0
 
         _print_stage_times(stage_times)
 

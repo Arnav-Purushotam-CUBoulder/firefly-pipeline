@@ -52,7 +52,7 @@ CC_ALL_CHUNKS_DIR     = LONG_EXP_IMAGE_PATH.parent / "cc_all_chunks"
 CC_FILTERED_CHUNKS_DIR= LONG_EXP_IMAGE_PATH.parent / "cc_filtered_chunks"
 CC_CROPS_DIR          = LONG_EXP_IMAGE_PATH.parent / "cc_crops"  # per-chunk subfolders
 
-MAX_FRAMES            = None       # None = full video
+MAX_FRAMES            = 1000       # None = full video
 OUTPUT_FPS            = None       # None = use source fps
 CODEC                 = "mp4v"
 

@@ -44,25 +44,27 @@ def _intensity_centroid(img_gray: np.ndarray, sigma: float) -> Tuple[float, floa
 
 
 def run_for_video(video_path: Path) -> Path:
-    """Recenter selected patches using Gaussian-weighted intensity centroid.
+    """Recenter selected patches using Gaussian-weighted intensity centroid (Stage 4).
 
-    Reads Stage 2 CSV (x,y as centers), refines center, saves rows and
-    crops with a red dot at the refined center.
+    Reads Stage 3 merged CSV (x,y as centers), refines center, saves rows and
+    crops with a red dot at the refined center. Also prints recentering stats.
     """
     stem = video_path.stem
-    s2_csv = (params.STAGE2_DIR / stem) / f"{stem}_patches.csv"
-    assert s2_csv.exists(), f"Missing Stage2 CSV for {stem}: {s2_csv}"
+    s3_csv = (params.STAGE3_DIR / stem) / f"{stem}_merge.csv"
+    assert s3_csv.exists(), f"Missing Stage3 CSV for {stem}: {s3_csv}"
 
-    out_root = params.STAGE3_DIR / stem
+    out_root = params.STAGE4_DIR / stem
     crops_dir = out_root / "crops"
-    crops_dir.mkdir(parents=True, exist_ok=True)
+    save_extras = bool(getattr(params, 'SAVE_EXTRAS', True))
+    if save_extras:
+        crops_dir.mkdir(parents=True, exist_ok=True)
 
     out_csv = out_root / f"{stem}_gauss.csv"
 
     cap, W, H, fps, total = open_video(video_path)
 
     rows = []
-    with s2_csv.open("r", newline="") as f:
+    with s3_csv.open("r", newline="") as f:
         r = csv.DictReader(f)
         for row in r:
             rows.append(row)
@@ -81,6 +83,9 @@ def run_for_video(video_path: Path) -> Path:
         if params.MAX_FRAMES is not None:
             max_idx = max(0, int(params.MAX_FRAMES) - 1)
             frames_sorted = [t for t in frames_sorted if t <= max_idx]
+        # Track stats: pixel shift between original and refined center
+        shifts: list[float] = []
+
         for idx, t in enumerate(frames_sorted):
             cap.set(cv2.CAP_PROP_POS_FRAMES, float(t))
             ok, frame = cap.read()
@@ -100,22 +105,36 @@ def run_for_video(video_path: Path) -> Path:
                 new_cx = x0 + ccx
                 new_cy = y0 + ccy
 
-                # Save marked crop (red dot at refined center)
-                crop_c, x0c, y0c = center_crop_with_pad(frame, new_cx, new_cy, w, h)
-                px = int(round(new_cx - x0c))
-                py = int(round(new_cy - y0c))
-                if 0 <= py < crop_c.shape[0] and 0 <= px < crop_c.shape[1]:
-                    crop_c[py, px] = (0, 0, 255)
-                out_name = f"gid_{gid:06d}_t{t:06d}_x{int(round(new_cx))}_y{int(round(new_cy))}_{w}x{h}.png"
-                cv2.imwrite(str(crops_dir / out_name), crop_c)
+                # accumulate shift stats
+                dx = float(new_cx - cx)
+                dy = float(new_cy - cy)
+                shifts.append(float((dx*dx + dy*dy) ** 0.5))
+
+                # Save marked crop (red dot) only when extras are enabled
+                if save_extras:
+                    crop_c, x0c, y0c = center_crop_with_pad(frame, new_cx, new_cy, w, h)
+                    px = int(round(new_cx - x0c))
+                    py = int(round(new_cy - y0c))
+                    if 0 <= py < crop_c.shape[0] and 0 <= px < crop_c.shape[1]:
+                        crop_c[py, px] = (0, 0, 255)
+                    out_name = f"gid_{gid:06d}_t{t:06d}_x{int(round(new_cx))}_y{int(round(new_cy))}_{w}x{h}.png"
+                    cv2.imwrite(str(crops_dir / out_name), crop_c)
 
                 wcsv.writerow([float(new_cx), float(new_cy), int(w), int(h), int(t), int(gid)])
             if idx % 20 == 0:
-                progress(idx + 1, max(1, len(frames_sorted)), "Stage3 refine")
-        progress(len(frames_sorted), max(1, len(frames_sorted)), "Stage3 refine done")
+                progress(idx + 1, max(1, len(frames_sorted)), "Stage4 refine")
+        progress(len(frames_sorted), max(1, len(frames_sorted)), "Stage4 refine done")
 
     cap.release()
-    print(f"Stage3  Wrote refined CSV → {out_csv}")
+    # Print stats
+    if 'shifts' in locals() and shifts:
+        import numpy as _np
+        arr = _np.asarray(shifts, dtype=_np.float32)
+        print(
+            f"Stage4  Stats: rows={arr.size} avg_shift={arr.mean():.2f}px p50={_np.percentile(arr,50):.2f}px "
+            f"p90={_np.percentile(arr,90):.2f}px max={arr.max():.2f}px"
+        )
+    print(f"Stage4  Wrote refined CSV → {out_csv}")
     return out_csv
 
 
