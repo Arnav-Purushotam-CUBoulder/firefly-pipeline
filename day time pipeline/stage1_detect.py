@@ -472,8 +472,13 @@ def run_for_video(video_path: Path) -> Path:
     )
 
     # Stage 1.2: background subtraction on the thresholded video (single-channel)
-    bg_path = out_dirs["root"] / f"{stem}_threshold_bgsub.mp4"
-    n2 = _write_bgsub_video(thr_path, bg_path, W, H, fps)
+    skip_bg = bool(getattr(params, 'STAGE1_SKIP_BG_SUB', False))
+    if skip_bg:
+        bg_path = thr_path  # use thresholded video directly for OR
+        n2 = 0
+    else:
+        bg_path = out_dirs["root"] / f"{stem}_threshold_bgsub.mp4"
+        n2 = _write_bgsub_video(thr_path, bg_path, W, H, fps)
 
     # Stage 1.3: long-exposure OR images (chunked) + telemetry CSV
     chunk_imgs = _render_or_and_telemetry(bg_path, out_dirs, stem)
@@ -534,7 +539,10 @@ def run_for_video(video_path: Path) -> Path:
         area_stats = "area_px: n/a"
     print("Stage1  Summary:")
     print(f"  Threshold frames: {n1}")
-    print(f"  BG-sub frames:   {n2}")
+    if skip_bg:
+        print(f"  BG-sub:          skipped (OR from threshold)")
+    else:
+        print(f"  BG-sub frames:   {n2}")
     print(f"  OR chunks:       {len(chunk_imgs)} ({out_dirs['or_chunks']})")
     print(f"  Telemetry CSV:   {telem_csv_path} (rows={telem_rows})")
     print(f"  Kept components: {len(kept_all)} ({area_stats})")

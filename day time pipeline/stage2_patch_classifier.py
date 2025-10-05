@@ -137,10 +137,8 @@ def run_for_video(video_path: Path) -> Path:
 
     out_root = (params.STAGE2_DIR / stem)
     pos_dir = out_root / "crops" / "positives"
-    neg_dir = out_root / "crops" / "negatives"
     if bool(getattr(params, 'SAVE_EXTRAS', True)):
         pos_dir.mkdir(parents=True, exist_ok=True)
-        neg_dir.mkdir(parents=True, exist_ok=True)
 
     cap, W, H, fps, total = open_video(video_path)
 
@@ -195,41 +193,46 @@ def run_for_video(video_path: Path) -> Path:
                 continue
 
             metas: List[tuple[int, float, float]] = by_frame[t]
-            np_patches = []
-            for gid, cx, cy in metas:
-                patch, x0, y0 = center_crop_with_pad(frame, cx, cy, params.PATCH_SIZE_PX, params.PATCH_SIZE_PX)
-                rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
-                rgb = np.ascontiguousarray(rgb)
-                np_patches.append(rgb)
-            if not np_patches:
+            if not metas:
                 continue
 
-            x = _to_tensor_batch(np_patches, int(getattr(params, 'STAGE2_INPUT_SIZE', 10))).to(dev)
-            with torch.inference_mode():
-                logits = model(x)
-                prob = torch.softmax(logits, dim=1)[:, int(getattr(params, 'STAGE2_POSITIVE_CLASS_INDEX', 1))]
-            thr = float(getattr(params, 'STAGE2_POSITIVE_THRESHOLD', 0.5))
-            preds = (prob >= thr).cpu().numpy().astype(bool)
-            probs_np = prob.detach().cpu().numpy()
-            # accumulate for overall summary
-            pos_probs_all.extend(probs_np.tolist())
+            bs = int(getattr(params, 'STAGE2_BATCH_SIZE', 64))
+            for s in range(0, len(metas), max(1, bs)):
+                batch = metas[s:s + max(1, bs)]
+                np_patches = []
+                for gid, cx, cy in batch:
+                    patch, x0, y0 = center_crop_with_pad(frame, cx, cy, params.PATCH_SIZE_PX, params.PATCH_SIZE_PX)
+                    rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
+                    rgb = np.ascontiguousarray(rgb)
+                    np_patches.append(rgb)
+                if not np_patches:
+                    continue
 
-            total_patches += len(metas)
-            for (gid, cx, cy), is_pos, p_conf in zip(metas, preds, probs_np):
-                patch, _, _ = center_crop_with_pad(frame, cx, cy, params.PATCH_SIZE_PX, params.PATCH_SIZE_PX)
-                if bool(getattr(params, 'SAVE_EXTRAS', True)):
-                    out_dir = pos_dir if is_pos else neg_dir
-                    # Filename: frame number + x_y_w_h + model confidence
-                    out_name = (
-                        f"gid_{int(gid):06d}_t_{int(t):06d}_x{int(round(cx))}_y{int(round(cy))}_"
-                        f"w{int(params.PATCH_SIZE_PX)}_h{int(params.PATCH_SIZE_PX)}_p{float(p_conf):.3f}.png"
-                    )
-                    cv2.imwrite(str(out_dir / out_name), patch)
-                if is_pos:
-                    writer.writerow([float(cx), float(cy), int(params.PATCH_SIZE_PX), int(params.PATCH_SIZE_PX), int(t), int(gid)])
-                    pos_count += 1
-                else:
-                    neg_count += 1
+                x = _to_tensor_batch(np_patches, int(getattr(params, 'STAGE2_INPUT_SIZE', 10))).to(dev)
+                with torch.inference_mode():
+                    logits = model(x)
+                    prob = torch.softmax(logits, dim=1)[:, int(getattr(params, 'STAGE2_POSITIVE_CLASS_INDEX', 1))]
+                thr = float(getattr(params, 'STAGE2_POSITIVE_THRESHOLD', 0.5))
+                preds = (prob >= thr).cpu().numpy().astype(bool)
+                probs_np = prob.detach().cpu().numpy()
+                # accumulate for overall summary
+                pos_probs_all.extend(probs_np.tolist())
+
+                total_patches += len(batch)
+                for (gid, cx, cy), is_pos, p_conf in zip(batch, preds, probs_np):
+                    patch, _, _ = center_crop_with_pad(frame, cx, cy, params.PATCH_SIZE_PX, params.PATCH_SIZE_PX)
+                    # Save only positive crops (negatives no longer saved)
+                    if bool(getattr(params, 'SAVE_EXTRAS', True)) and bool(is_pos):
+                        out_name = (
+                            f"gid_{int(gid):06d}_t_{int(t):06d}_x{int(round(cx))}_y{int(round(cy))}_"
+                            f"w{int(params.PATCH_SIZE_PX)}_h{int(params.PATCH_SIZE_PX)}_p{float(p_conf):.3f}.png"
+                        )
+                        cv2.imwrite(str(pos_dir / out_name), patch)
+                    if is_pos:
+                        writer.writerow([float(cx), float(cy), int(params.PATCH_SIZE_PX), int(params.PATCH_SIZE_PX), int(t), int(gid)])
+                        pos_count += 1
+                    else:
+                        neg_count += 1
 
             if idx % 10 == 0:
                 progress(idx + 1, max(1, len(frames_sorted)), "Stage2 classify")

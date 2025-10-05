@@ -56,7 +56,7 @@ NUM_WORKERS: int = 0
 # - *_POSITIVE_THRESHOLD: probability threshold to label positive.
 # - STAGE2_DEVICE: 'auto' | 'cpu' | 'cuda' | 'mps' (auto chooses best available)
 STAGE2_INPUT_SIZE: int = 10  # match training (10x10 patches)
-STAGE2_BATCH_SIZE: int = 512
+STAGE2_BATCH_SIZE: int = 4096
 STAGE2_POSITIVE_CLASS_INDEX: int = 1
 STAGE2_POSITIVE_THRESHOLD: float = 0.96
 STAGE2_DEVICE: str = 'auto'
@@ -101,6 +101,7 @@ LONG_EXP_DILATE_ITERS: int = 1      # 0=off; 1–2 thicken trails slightly
 LONG_EXP_DILATE_KERNEL: int = 3     # odd size (3/5/7)
 LONG_EXP_BLUR_KSIZE: int = 0        # 0=off; else odd (3/5) slight blur before OR
 LONG_EXP_CHUNK_SIZE: int = 500      # build one long-exposure image per N frames
+STAGE1_SKIP_BG_SUB: bool = False    # If True, skip MOG2; OR directly from thresholded video
 
 # Connected components (area filter)
 CC_MIN_AREA: int = 5               # keep components with area >= this
@@ -174,6 +175,7 @@ __all__ = [
     "BGS_DETECT_SHADOWS",
     "BGS_HISTORY",
     "BGS_LEARNING_RATE",
+    "STAGE1_SKIP_BG_SUB",
     # legacy aliases
     "CHUNK_SIZE",
     "TRAILS_INTENSITY_THRESHOLD",
