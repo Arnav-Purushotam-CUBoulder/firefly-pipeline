@@ -96,7 +96,7 @@ BGS_LEARNING_RATE: float = -1.0     # -1 => OpenCV decides
 
 # Long-exposure (OR) from FG mask video
 LONG_EXP_START_FRAME: int = 30      # skip early frames for BG model warm-up
-FG_MASK_THRESHOLD: int = 200        # treat pixels >= this as FG (ignore shadows=127)
+FG_MASK_THRESHOLD: int = 127        # treat pixels >= this as FG (ignore shadows=127)
 LONG_EXP_DILATE_ITERS: int = 1      # 0=off; 1–2 thicken trails slightly
 LONG_EXP_DILATE_KERNEL: int = 3     # odd size (3/5/7)
 LONG_EXP_BLUR_KSIZE: int = 0        # 0=off; else odd (3/5) slight blur before OR

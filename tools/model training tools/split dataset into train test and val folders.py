@@ -7,14 +7,14 @@ and print a per-class + overall summary when done.
 # ─── GLOBAL CONFIG (edit) ──────────────────────────────────────────────
 SRC_DIR   = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset/initial dataset' # has firefly/ and background/
 DEST_DIR  = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset/final dataset'    # new root with train/ val/ test/
-TRAIN_PCT = 0.50
+TRAIN_PCT = 0.70
 VAL_PCT   = 0.25
-TEST_PCT  = 0.25               # splits must sum to 1.0
+TEST_PCT  = 0.05               # splits must sum to 1.0
 SEED      = 1337
 
 # NEW: maximum number of images to copy per class (None for no cap)
-MAX_FIREFLY    = 10000   # e.g., 12000
-MAX_BACKGROUND = 100000   # e.g., 12000
+MAX_FIREFLY    = None   # e.g., 12000
+MAX_BACKGROUND = None   # e.g., 12000
 # ───────────────────────────────────────────────────────────────────────
 
 import random, shutil, os
