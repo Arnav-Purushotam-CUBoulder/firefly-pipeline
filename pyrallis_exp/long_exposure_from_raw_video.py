@@ -8,6 +8,8 @@ Create a long-exposure image from a video using one of three modes:
 Edit the globals below (MODE, INPUT_VIDEO_PATH, OUTPUT_DIR, etc.) and run.
 You can also set INTERVAL_FRAMES to produce one long-exposure image for
 every N-frame chunk of the video (e.g., 100 → one image per 100 frames).
+Outputs are written under OUTPUT_DIR/<video_stem>/ as PNG files named:
+  <interval>_<video_stem>_<mode>_<start>-<end>.png
 Dependencies: pip install opencv-python numpy
 """
 
@@ -26,7 +28,7 @@ INPUT_VIDEO_PATH = Path('/Users/arnavps/Desktop/New DL project data to transfer 
 OUTPUT_DIR = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset collection/long exposure shots')
 
 # Processing caps and progress
-MAX_FRAMES: int | None = 500     # None = full video
+MAX_FRAMES: int | None = None     # None = full video
 INTERVAL_FRAMES: int | None = 100  # None/<=0 → single image; else chunk size
 PROGRESS_EVERY = 50
 
@@ -316,6 +318,9 @@ def main():
     in_path = INPUT_VIDEO_PATH
     out_root = OUTPUT_DIR
     out_root.mkdir(parents=True, exist_ok=True)
+    video_stem = in_path.stem
+    out_video_dir = out_root / video_stem
+    out_video_dir.mkdir(parents=True, exist_ok=True)
 
     # Single full-image mode (no interval)
     if not INTERVAL_FRAMES or INTERVAL_FRAMES <= 0:
@@ -346,13 +351,10 @@ def main():
             )
         else:
             raise ValueError("MODE must be one of: 'lighten', 'average', 'trails'")
-        # Build output folder name: <interval_size>_<video_name>_<mode>_<start>-<end>
+        # Build output filename: <interval>_<video_stem>_<mode>_<start>-<end>.png
         interval_size = limit  # for full-range single image
         start, end = 0, max(0, limit - 1)
-        folder_name = f"{interval_size}_{in_path.stem}_{mode}_{start:06d}-{end:06d}"
-        out_folder = out_root / folder_name
-        out_folder.mkdir(parents=True, exist_ok=True)
-        out_path = out_folder / "long_exposure.png"
+        out_path = out_video_dir / f"{interval_size}_{video_stem}_{mode}_{start:06d}-{end:06d}.png"
         ok = cv2.imwrite(str(out_path), img)
         if not ok:
             raise RuntimeError(f"Failed to write output image: {out_path}")
@@ -372,11 +374,8 @@ def main():
     while start < limit:
         count = min(interval, limit - start)
         end = start + count
-        # Create folder: <interval_size>_<video_name>_<mode>_<start>-<end-1>/long_exposure.png
-        folder_name = f"{interval}_{in_path.stem}_{mode}_{start:06d}-{end-1:06d}"
-        out_folder = out_root / folder_name
-        out_folder.mkdir(parents=True, exist_ok=True)
-        out_path = out_folder / "long_exposure.png"
+        # Create filename: <interval>_<video_stem>_<mode>_<start>-<end-1>.png
+        out_path = out_video_dir / f"{interval}_{video_stem}_{mode}_{start:06d}-{end-1:06d}.png"
 
         if mode == "lighten":
             img = _lighten_range(in_path, start, count)
