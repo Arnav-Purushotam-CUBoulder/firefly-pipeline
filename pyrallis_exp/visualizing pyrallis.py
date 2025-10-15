@@ -5,6 +5,18 @@ Threshold → Background Subtraction → Long-Exposure (OR) Trails Image
 + Telemetry CSV for ML: per-pixel (x,y,t,global_component_id)
 + Stage 5: Per-component 10×10 crops from the original video using (x,y,t) telemetry.
 
+Now supports batch processing with simple paths:
+  - Provide one input directory containing videos
+  - Provide one output directory
+  - For each video, a subfolder is created under the output directory
+    and all artifacts for that video are written there.
+
+How to use (no CLI needed):
+  1) Set INPUT_DIR and OUTPUT_DIR globals below.
+  2) Run this script (e.g., from your IDE). It will scan the input
+     directory for videos and create one subfolder per video under the
+     output directory to store all artifacts.
+
 Install: pip install opencv-python numpy imageio
 """
 
@@ -17,14 +29,22 @@ import imageio.v2 as imageio
 
 # ───────────── GLOBAL PARAMETERS ─────────────
 
-# I/O (kept exactly as provided)
-INPUT_VIDEO_PATH    = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/raw videos/20240606_cam1_GS010064.mp4')
-OUTPUT_THRESH_PATH  = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/pinfield videos/100f_20240606_cam1_GS010064_pinfield.mp4')
+# Top-level directories (edit these)
+INPUT_DIR  = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset collection/raw input videos')   # directory containing your input videos
+OUTPUT_DIR = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset collection/output data')                 # root directory where per-video folders will be created
+
+# Video discovery
+VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".MP4", ".AVI", ".MOV", ".MKV"}
+RECURSIVE_SCAN = False  # set True to scan subfolders
+
+# I/O (set dynamically per video by main(); defaults allow import without editing)
+INPUT_VIDEO_PATH    = Path("input.mp4")
+OUTPUT_THRESH_PATH  = Path("threshold.mp4")
 OUTPUT_BGSUB_PATH   = None  # auto = "<threshold_stem>_bgsub.mp4"
 
-# Long-exposure stills (kept exactly as provided)
-LONG_EXP_IMAGE_PATH         = Path("/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/pinfield videos/output_long_exposure.png")
-LONG_EXP_OVERLAY_IMAGE_PATH = Path("/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/pinfield videos/output_long_exposure_overlay.png")
+# Long-exposure stills (dynamic per video)
+LONG_EXP_IMAGE_PATH         = Path("output_long_exposure.png")
+LONG_EXP_OVERLAY_IMAGE_PATH = Path("output_long_exposure_overlay.png")
 
 # Outputs for Connected Components (visuals)
 CC_ALL_VIS_PATH       = LONG_EXP_IMAGE_PATH.with_name("long_exp_components_all.png")
@@ -52,7 +72,7 @@ CC_ALL_CHUNKS_DIR     = LONG_EXP_IMAGE_PATH.parent / "cc_all_chunks"
 CC_FILTERED_CHUNKS_DIR= LONG_EXP_IMAGE_PATH.parent / "cc_filtered_chunks"
 CC_CROPS_DIR          = LONG_EXP_IMAGE_PATH.parent / "cc_crops"  # per-chunk subfolders
 
-MAX_FRAMES            = 1000       # None = full video
+MAX_FRAMES            = None       # None = full video
 OUTPUT_FPS            = None       # None = use source fps
 CODEC                 = "mp4v"
 
@@ -636,10 +656,52 @@ def make_component_gifs_from_csv(csv_path: Path,
 
 # ───────────── MAIN ─────────────
 
-def main():
+def _discover_videos(input_dir: Path) -> list[Path]:
+    """Find video files in input_dir (non-recursive by default)."""
+    if RECURSIVE_SCAN:
+        return sorted([p for p in input_dir.rglob("*") if p.is_file() and p.suffix in VIDEO_EXTS])
+    else:
+        return sorted([p for p in input_dir.iterdir() if p.is_file() and p.suffix in VIDEO_EXTS])
+
+
+def _setup_paths_for_video(video_path: Path, output_root: Path):
+    """Set module-level paths for a single video into its own subfolder."""
+    global INPUT_VIDEO_PATH, OUTPUT_THRESH_PATH, OUTPUT_BGSUB_PATH
+    global LONG_EXP_IMAGE_PATH, LONG_EXP_OVERLAY_IMAGE_PATH
+    global CC_ALL_VIS_PATH, CC_FILTERED_VIS_PATH, CC_PIXELS_CSV_PATH
+    global OR_CHUNKS_DIR, CC_ALL_CHUNKS_DIR, CC_FILTERED_CHUNKS_DIR, CC_CROPS_DIR
+    global GIF_OUTPUT_DIR
+
+    INPUT_VIDEO_PATH = video_path
+
+    vid_folder = output_root / video_path.stem
+    vid_folder.mkdir(parents=True, exist_ok=True)
+
+    OUTPUT_THRESH_PATH  = vid_folder / f"{video_path.stem}_threshold.mp4"
+    OUTPUT_BGSUB_PATH   = None  # will default based on threshold path
+
+    LONG_EXP_IMAGE_PATH         = vid_folder / "output_long_exposure.png"
+    LONG_EXP_OVERLAY_IMAGE_PATH = vid_folder / "output_long_exposure_overlay.png"
+
+    CC_ALL_VIS_PATH       = LONG_EXP_IMAGE_PATH.with_name("long_exp_components_all.png")
+    CC_FILTERED_VIS_PATH  = LONG_EXP_IMAGE_PATH.with_name("long_exp_components_filtered.png")
+    CC_PIXELS_CSV_PATH    = LONG_EXP_IMAGE_PATH.with_name("long_exp_components_pixels_xy_t.csv")
+
+    OR_CHUNKS_DIR          = vid_folder / "or_chunks"
+    CC_ALL_CHUNKS_DIR      = vid_folder / "cc_all_chunks"
+    CC_FILTERED_CHUNKS_DIR = vid_folder / "cc_filtered_chunks"
+    CC_CROPS_DIR           = vid_folder / "cc_crops"
+    GIF_OUTPUT_DIR         = vid_folder / "component_gifs"
+
+
+def _process_current_video() -> None:
+    """Run the 5-stage pipeline using current module-level paths (set per video)."""
     out_bg = OUTPUT_BGSUB_PATH or OUTPUT_THRESH_PATH.with_name(
         OUTPUT_THRESH_PATH.stem + "_bgsub" + OUTPUT_THRESH_PATH.suffix
     )
+
+    print(f"\n=== Processing video: {INPUT_VIDEO_PATH.name} ===")
+    print(f"Output folder: {LONG_EXP_IMAGE_PATH.parent}")
 
     # Stage 1: threshold video
     W, H, fps, n1 = write_threshold_video(INPUT_VIDEO_PATH, OUTPUT_THRESH_PATH, MAX_FRAMES, OUTPUT_FPS)
@@ -675,6 +737,7 @@ def main():
     )
 
     print("\nSummary:")
+    print(f"  Video:                    {INPUT_VIDEO_PATH.name}")
     print(f"  Threshold frames written: {n1}")
     print(f"  BG-sub frames written:    {n2}")
     print(f"  OR trails chunks folder:  {OR_CHUNKS_DIR}")
@@ -686,6 +749,26 @@ def main():
     print(f"  Component patches:        {made}  → {GIF_OUTPUT_DIR}")
     if LONG_EXP_OVERLAY:
         print(f"  Overlay images:           *_chunk_*.png next to {LONG_EXP_OVERLAY_IMAGE_PATH}")
+
+
+def main():
+    in_dir: Path = INPUT_DIR
+    out_root: Path = OUTPUT_DIR
+    assert in_dir.exists() and in_dir.is_dir(), f"Input dir not found: {in_dir}"
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    videos = _discover_videos(in_dir)
+    if not videos:
+        print(f"No videos found in {in_dir}")
+        return
+
+    for vp in videos:
+        try:
+            _setup_paths_for_video(vp, out_root)
+            _process_current_video()
+        except Exception as e:
+            print(f"\n!!! Failed processing {vp.name}: {e}")
+            # continue with other videos
 
 if __name__ == "__main__":
     main()
