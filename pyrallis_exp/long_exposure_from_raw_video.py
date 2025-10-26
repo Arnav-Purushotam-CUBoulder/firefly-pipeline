@@ -25,11 +25,11 @@ MODE = "lighten"
 
 # Input/output paths
 INPUT_VIDEO_PATH = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset collection/raw input videos/20240606_cam1_GS010064.mp4')
-OUTPUT_DIR = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset collection/long exposure shots')
+OUTPUT_DIR = Path('/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset collection/1000 frame each long exposure shots')
 
 # Processing caps and progress
 MAX_FRAMES: int | None = None     # None = full video
-INTERVAL_FRAMES: int | None = 100  # None/<=0 → single image; else chunk size
+INTERVAL_FRAMES: int | None = 1000  # None/<=0 → single image; else chunk size
 PROGRESS_EVERY = 50
 
 # Average-mode options
