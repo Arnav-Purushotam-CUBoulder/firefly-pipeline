@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 # Global variables: set these to your directories
-INPUT_DIR = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset collection/long exposure shots/temp testing dataset collection/10x10 patches'
+INPUT_DIR = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset collection/output data/20240606_cam1_GS010064/raw 10x10 crops from sbd'
 OUTPUT_DIR = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset/v2/initial dataset/background'
 
 # Behavior toggles

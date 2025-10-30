@@ -6,9 +6,9 @@ is unchanged from the original script, except we now feed RGB into the model.
 """
 
 # ── USER SETTINGS ───────────────────────────────────────────────
-DATA_DIR        = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset/final dataset'
+DATA_DIR        = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset/v2/final dataset'
 BEST_MODEL_PATH = '/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/background subtraction detection method/actual background subtraction code/forresti, fixing FPs and box overlap/Proof of concept code/models and other data/pyrallis gopro models resnet18/resnet18_pyrallis_gopro_best_model.pt'
-EPOCHS, BATCH_SIZE, LR = 40, 128, 3e-4
+EPOCHS, BATCH_SIZE, LR = 200, 128, 3e-4
 NUM_WORKERS = 2
 
 # choose your backbone: 'resnet18' | 'resnet34' | 'resnet50' | 'resnet101' | 'resnet152'
