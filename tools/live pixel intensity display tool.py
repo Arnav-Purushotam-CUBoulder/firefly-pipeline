@@ -5,7 +5,7 @@ from tkinter import ttk, filedialog, messagebox
 from PIL import Image
 
 # ───── GLOBAL CONFIG ─────────────────────────────────────────────────────────
-DEFAULT_IMAGE_PATH = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/orc pipeline frontalis only inference data/stage9 validation/val_9k-14k_frontalis_clip/thr_10.0px/crops/FP_t000064_x797_y901_conf0.9990_max239_area61.png'
+DEFAULT_IMAGE_PATH = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset collection/long exposure shots/20240606_cam1_GS010064/100_20240606_cam1_GS010064_lighten_000000-000099.png'
 DEFAULT_THRESHOLD  = 20          # initial luminance threshold
 PIXEL_SCALE        = 20          # preferred per-pixel block size
 MAX_VIEW_SIZE      = 600         # hard cap on displayed width/height

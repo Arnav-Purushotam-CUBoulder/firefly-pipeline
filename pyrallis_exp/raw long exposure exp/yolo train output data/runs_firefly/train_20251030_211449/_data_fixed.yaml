@@ -1,0 +1,13 @@
+train: /Users/arnavps/Downloads/streaks.v3i.yolov8/train/images
+val: /Users/arnavps/Downloads/streaks.v3i.yolov8/train/images
+test: ../test/images
+nc: 1
+names:
+- streak
+roboflow:
+  workspace: fireflytrack1
+  project: streaks-mysdl
+  version: 3
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/fireflytrack1/streaks-mysdl/dataset/3
+path: /Users/arnavps/Downloads/streaks.v3i.yolov8
