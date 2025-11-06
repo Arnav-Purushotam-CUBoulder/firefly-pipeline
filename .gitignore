@@ -10,3 +10,33 @@
 # Python bytecode
 __pycache__/
 *.pyc
+
+#image files
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tiff
+*.gif
+*.tif
+*.webp
+
+# video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# csv files
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.json
+*.jsonl
+
+# log files
+*.log
+
+
+*.DS_Store
