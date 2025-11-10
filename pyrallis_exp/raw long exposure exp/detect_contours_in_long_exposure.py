@@ -53,8 +53,19 @@ OUTPUT_DIR: Path | None = "/Users/arnavps/Desktop/RA info/New Deep Learning proj
 # Required: original source video path used to create the long‑exposure image
 SOURCE_VIDEO_PATH: Path | None = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset collection/raw input videos/20240606_cam1_GS010064.mp4'
 
+# ----------------- Stage toggles -----------------
+# Enable/disable individual stages of the pipeline
+ENABLE_STAGE1_PERSISTENT = True     # Stage 1: persistent‑bright removal over frame range
+ENABLE_STAGE2_THRESHOLD  = True     # Stage 2: long‑exposure threshold by MIN_AVG_INTENSITY
+ENABLE_STAGE3_CONTOURS   = True     # Stage 3: contour extraction
+ENABLE_STAGE4_AREA_FILTER= True     # Stage 4: area filtering of contours
+ENABLE_STAGE5_RENDER     = True     # Stage 5: render annotated image + masks
+ENABLE_STAGE6_STATS      = True     # Stage 6: print summary stats
+ENABLE_STAGE7_PERFRAME   = False     # Stage 7: per‑frame 10×10 classification + CSV
+ENABLE_STAGE8_OVERLAY    = False     # Stage 8: overlay video (depends on Stage 7)
+
 # Foreground rule: pixel kept if mean(R,G,B) >= this value (0..255)
-MIN_AVG_INTENSITY = 50
+MIN_AVG_INTENSITY = 30
 
 # Thickness and color of drawn bounding boxes
 BBOX_THICKNESS = 1
@@ -375,7 +386,7 @@ def run():
     # ================= Stage 1: persistent-bright removal (optional) =================
     persistent_mask = None
     used_frames = 0
-    if SOURCE_VIDEO_PATH is not None:
+    if ENABLE_STAGE1_PERSISTENT and SOURCE_VIDEO_PATH is not None:
         src_video = _to_path(SOURCE_VIDEO_PATH)
         if not src_video or not src_video.exists():
             raise FileNotFoundError(f"SOURCE_VIDEO_PATH not found: {SOURCE_VIDEO_PATH}")
@@ -391,7 +402,11 @@ def run():
         )
 
     # ================= Stage 2: long-exposure threshold =================
-    base_thresh_mask = _make_binary_mask(img, int(MIN_AVG_INTENSITY))
+    if ENABLE_STAGE2_THRESHOLD:
+        base_thresh_mask = _make_binary_mask(img, int(MIN_AVG_INTENSITY))
+    else:
+        # If disabled, default to keeping all pixels
+        base_thresh_mask = np.full((H, W), 255, dtype=np.uint8)
     if persistent_mask is not None:
         # keep thresholded foreground but drop persistent-bright pixels
         mask = cv2.bitwise_and(base_thresh_mask, cv2.bitwise_not(persistent_mask))
@@ -399,18 +414,19 @@ def run():
         mask = base_thresh_mask
 
     # ================= Stage 3: contours =================
-    contours = _find_contours(mask, RETRIEVAL_MODE)
+    contours = _find_contours(mask, RETRIEVAL_MODE) if ENABLE_STAGE3_CONTOURS else []
     contours_before = len(contours)
 
     # ================= Stage 4: area filtering + boxes =================
     boxes: list[tuple[int, int, int, int]] = []
     kept_contours = 0
     for c in contours:
-        area = float(cv2.contourArea(c))
-        if MIN_CONTOUR_AREA and area < float(MIN_CONTOUR_AREA):
-            continue
-        if MAX_CONTOUR_AREA and area > float(MAX_CONTOUR_AREA):
-            continue
+        if ENABLE_STAGE4_AREA_FILTER:
+            area = float(cv2.contourArea(c))
+            if MIN_CONTOUR_AREA and area < float(MIN_CONTOUR_AREA):
+                continue
+            if MAX_CONTOUR_AREA and area > float(MAX_CONTOUR_AREA):
+                continue
         x, y, w, h = cv2.boundingRect(c)
         boxes.append((int(x), int(y), int(w), int(h)))
         kept_contours += 1
@@ -421,15 +437,16 @@ def run():
     # 5) Save outputs
     out_img_path = out_dir / f"{in_path.stem}_contours_t{MIN_AVG_INTENSITY}.png"
     out_mask_path = out_dir / f"{in_path.stem}_mask_t{MIN_AVG_INTENSITY}.png"
-    cv2.imwrite(str(out_img_path), annotated)
-    cv2.imwrite(str(out_mask_path), mask)
-    if SAVE_INTERMEDIATE_MASKS:
-        # Save stage masks for debugging
-        if persistent_mask is not None:
-            persist_path = out_mask_path.parent / f"{in_path.stem}_persistent_mask_t{PERSISTENT_MIN_AVG_INTENSITY}.png"
-            cv2.imwrite(str(persist_path), persistent_mask)
-        base_mask_path = out_mask_path.parent / f"{in_path.stem}_threshold_mask_t{MIN_AVG_INTENSITY}.png"
-        cv2.imwrite(str(base_mask_path), base_thresh_mask)
+    if ENABLE_STAGE5_RENDER:
+        cv2.imwrite(str(out_img_path), annotated)
+        cv2.imwrite(str(out_mask_path), mask)
+        if SAVE_INTERMEDIATE_MASKS:
+            # Save stage masks for debugging
+            if persistent_mask is not None:
+                persist_path = out_mask_path.parent / f"{in_path.stem}_persistent_mask_t{PERSISTENT_MIN_AVG_INTENSITY}.png"
+                cv2.imwrite(str(persist_path), persistent_mask)
+            base_mask_path = out_mask_path.parent / f"{in_path.stem}_threshold_mask_t{MIN_AVG_INTENSITY}.png"
+            cv2.imwrite(str(base_mask_path), base_thresh_mask)
 
     # ================= Stage 6: long‑exposure stats =================
     total_contours = contours_before
@@ -439,30 +456,31 @@ def run():
     aspect_ratios = np.array([(max(w, 1) / max(h, 1)) for (_, _, w, h) in boxes], dtype=np.float64) if boxes else np.array([], dtype=np.float64)
     bright_ratio = float((mask > 0).sum()) / float(W * H) * 100.0
 
-    print("=== Contour Detection Summary ===")
-    print(f"Input:        {in_path}")
-    print(f"Saved image:  {out_img_path}")
-    print(f"Saved mask:   {out_mask_path}")
-    print(f"Image size:   {W}x{H}  ({W*H} px)")
-    print(f"Stage1:       frames used={used_frames}  persistent threshold >= {PERSISTENT_MIN_AVG_INTENSITY}")
-    if persistent_mask is not None:
-        persist_ratio = float((persistent_mask > 0).sum()) / float(W * H) * 100.0
-        print(f"              persistent bright px: {persist_ratio:.2f}%")
-    print(f"Stage2:       mean RGB >= {MIN_AVG_INTENSITY}")
-    max_area_disp = "None" if not MAX_CONTOUR_AREA else str(MAX_CONTOUR_AREA)
-    print(f"Contours:     {total_contours} found before filter, {num_boxes} kept (min area {MIN_CONTOUR_AREA}, max area {max_area_disp})")
-    print(f"Bright px:    {bright_ratio:.2f}% of image")
-    if num_boxes:
-        print(f"Box area:     total={box_areas.sum():.0f}  mean={box_areas.mean():.1f}  median={np.median(box_areas):.1f}  max={box_areas.max():.0f}")
-        print(f"Coverage:     {coverage:.3f}% of image")
-        print(f"Aspect ratio: mean={aspect_ratios.mean():.2f}  median={np.median(aspect_ratios):.2f}")
-    else:
-        print("No boxes kept after filtering.")
+    if ENABLE_STAGE6_STATS:
+        print("=== Contour Detection Summary ===")
+        print(f"Input:        {in_path}")
+        print(f"Saved image:  {out_img_path}")
+        print(f"Saved mask:   {out_mask_path}")
+        print(f"Image size:   {W}x{H}  ({W*H} px)")
+        print(f"Stage1:       enabled={ENABLE_STAGE1_PERSISTENT}  frames used={used_frames}  persistent threshold >= {PERSISTENT_MIN_AVG_INTENSITY}")
+        if persistent_mask is not None:
+            persist_ratio = float((persistent_mask > 0).sum()) / float(W * H) * 100.0
+            print(f"              persistent bright px: {persist_ratio:.2f}%")
+        print(f"Stage2:       enabled={ENABLE_STAGE2_THRESHOLD}  mean RGB >= {MIN_AVG_INTENSITY}")
+        max_area_disp = "None" if not MAX_CONTOUR_AREA else str(MAX_CONTOUR_AREA)
+        print(f"Contours:     {total_contours} found before filter, {num_boxes} kept (min area {MIN_CONTOUR_AREA}, max area {max_area_disp})")
+        print(f"Bright px:    {bright_ratio:.2f}% of image")
+        if num_boxes:
+            print(f"Box area:     total={box_areas.sum():.0f}  mean={box_areas.mean():.1f}  median={np.median(box_areas):.1f}  max={box_areas.max():.0f}")
+            print(f"Coverage:     {coverage:.3f}% of image")
+            print(f"Aspect ratio: mean={aspect_ratios.mean():.2f}  median={np.median(aspect_ratios):.2f}")
+        else:
+            print("No boxes kept after filtering.")
 
     # ================= Stage 7 (optional): per‑frame 10x10 model filtering + CSV =================
     # For each kept contour, scan each contributing frame, find the brightest pixel inside
     # the contour for that frame, center a 10x10 box there, classify, and keep if positive.
-    if SOURCE_VIDEO_PATH is not None and num_boxes > 0:
+    if ENABLE_STAGE7_PERFRAME and SOURCE_VIDEO_PATH is not None and num_boxes > 0:
         src_video = _to_path(SOURCE_VIDEO_PATH)
         meta = _parse_meta_from_image_path(in_path)
         start, end = int(meta["start"]), int(meta["end"])  # inclusive
@@ -590,27 +608,28 @@ def run():
                     frame_boxes[idxr].append((xr, yr, wr, hr))
 
             # ================= Stage 8 (optional): render overlay video =================
-            # Render annotated video using the per-frame boxes
-            fps = cap2.get(cv2.CAP_PROP_FPS) or 30.0
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            vid_out_path = _to_path(VIDEO_OUTPUT_PATH)
-            if vid_out_path is None:
-                vid_out_path = out_dir / f"{in_path.stem}_overlay.mp4"
-            writer = cv2.VideoWriter(str(vid_out_path), fourcc, float(fps), (W, H))
-            cap2.set(cv2.CAP_PROP_POS_FRAMES, start)
-            print("Rendering video with overlays…")
-            for idx in tqdm(range(start, end + 1), total=n_frames, ncols=100):
-                ok, frame = cap2.read()
-                if not ok:
-                    break
-                if (frame.shape[1], frame.shape[0]) != (W, H):
-                    frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
-                bxs = frame_boxes.get(idx, [])
-                for (rx, ry, rw, rh) in bxs:
-                    cv2.rectangle(frame, (rx, ry), (rx + rw, ry + rh), BBOX_COLOR, int(BBOX_THICKNESS))
-                writer.write(frame)
-            writer.release()
-            print(f"Saved overlay video → {vid_out_path}")
+            if ENABLE_STAGE8_OVERLAY:
+                # Render annotated video using the per-frame boxes
+                fps = cap2.get(cv2.CAP_PROP_FPS) or 30.0
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                vid_out_path = _to_path(VIDEO_OUTPUT_PATH)
+                if vid_out_path is None:
+                    vid_out_path = out_dir / f"{in_path.stem}_overlay.mp4"
+                writer = cv2.VideoWriter(str(vid_out_path), fourcc, float(fps), (W, H))
+                cap2.set(cv2.CAP_PROP_POS_FRAMES, start)
+                print("Rendering video with overlays…")
+                for idx in tqdm(range(start, end + 1), total=n_frames, ncols=100):
+                    ok, frame = cap2.read()
+                    if not ok:
+                        break
+                    if (frame.shape[1], frame.shape[0]) != (W, H):
+                        frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
+                    bxs = frame_boxes.get(idx, [])
+                    for (rx, ry, rw, rh) in bxs:
+                        cv2.rectangle(frame, (rx, ry), (rx + rw, ry + rh), BBOX_COLOR, int(BBOX_THICKNESS))
+                    writer.write(frame)
+                writer.release()
+                print(f"Saved overlay video → {vid_out_path}")
 
             # ------- Per-frame stats -------
             total_crops = len(rect_masks) * n_frames
