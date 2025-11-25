@@ -26,9 +26,12 @@ if not isinstance(ROOT, Path):
 ORIGINAL_VIDEOS_DIR: Path = ROOT / "original videos"
 
 # Stage output roots (one folder per stage). Each stage writes under its own dir.
-# Stage 1: long-exposure images; Stage 2: YOLO detections CSVs.
+# Stage 1: long-exposure images; Stage 2: YOLO detections CSVs;
+# Stage 3: patch classifier; Stage 4: rendered videos.
 STAGE1_DIR: Path = ROOT / "stage1_long_exposure"
 STAGE2_DIR: Path = ROOT / "stage2_yolo_detections"
+STAGE3_DIR: Path = ROOT / "stage3_patch_classifier"
+STAGE4_DIR: Path = ROOT / "stage4_rendering"
 
 # General
 # - VIDEO_EXTS: file extensions to treat as videos.
@@ -84,6 +87,42 @@ YOLO_CONF_THRES: float = 0.01
 YOLO_IOU_THRES: float = 0.15
 YOLO_DEVICE: str | int | None = "cpu"
 
+# Stage 3 — patch classifier on per-frame crops
+# Patch model (ResNet18 binary classifier). Provide a direct path.
+PATCH_MODEL_PATH: Path = Path(
+    "/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/"
+    "background subtraction detection method/actual background subtraction code/"
+    "forresti, fixing FPs and box overlap/Proof of concept code/models and other data/"
+    "pyrallis gopro models resnet18/resnet18_pyrallis_gopro_best_model v2.pt"
+)
+
+# Torch / transforms
+IMAGENET_NORMALIZE: bool = False
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+# Stage 3 classifier settings
+# - STAGE3_INPUT_SIZE: model input side length (square resize).
+# - STAGE3_BATCH_SIZE_GPU/CPU: batch sizes per device type.
+# - *_POSITIVE_CLASS_INDEX: index of positive class in logits.
+# - *_POSITIVE_THRESHOLD: probability threshold to mark positive.
+# - STAGE3_DEVICE: 'auto' | 'cpu' | 'cuda' | 'mps'
+STAGE3_INPUT_SIZE: int = 10
+STAGE3_BATCH_SIZE_GPU: int = 4096
+STAGE3_BATCH_SIZE_CPU: int = 512
+STAGE3_POSITIVE_CLASS_INDEX: int = 1
+STAGE3_POSITIVE_THRESHOLD: float = 0.98
+STAGE3_DEVICE: str = "auto"
+
+# Stage 3 — crop size used to extract patches from frames
+PATCH_SIZE_PX: int = 10
+
+# Stage 4 — rendering
+# - RENDER_CODEC: e.g. "mp4v", "avc1", "MJPG".
+# - RENDER_FPS_HINT: None to use source fps; else override.
+RENDER_CODEC: str = "mp4v"
+RENDER_FPS_HINT: float | None = None
+
 
 def list_videos() -> List[Path]:
     """Return all video files under ORIGINAL_VIDEOS_DIR."""
@@ -101,6 +140,8 @@ __all__ = [
     "ORIGINAL_VIDEOS_DIR",
     "STAGE1_DIR",
     "STAGE2_DIR",
+    "STAGE3_DIR",
+    "STAGE4_DIR",
     # general
     "RUN_PRE_RUN_CLEANUP",
     "VIDEO_EXTS",
@@ -126,7 +167,20 @@ __all__ = [
     "YOLO_CONF_THRES",
     "YOLO_IOU_THRES",
     "YOLO_DEVICE",
+    # patch classifier + render
+    "PATCH_MODEL_PATH",
+    "IMAGENET_NORMALIZE",
+    "IMAGENET_MEAN",
+    "IMAGENET_STD",
+    "STAGE3_INPUT_SIZE",
+    "STAGE3_BATCH_SIZE_GPU",
+    "STAGE3_BATCH_SIZE_CPU",
+    "STAGE3_POSITIVE_CLASS_INDEX",
+    "STAGE3_POSITIVE_THRESHOLD",
+    "STAGE3_DEVICE",
+    "PATCH_SIZE_PX",
+    "RENDER_CODEC",
+    "RENDER_FPS_HINT",
     # helpers
     "list_videos",
 ]
-
