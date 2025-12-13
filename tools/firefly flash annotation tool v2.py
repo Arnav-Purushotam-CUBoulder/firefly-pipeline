@@ -55,18 +55,21 @@ SEARCH_RADIUS = 30  # radius (in pixels) around click for brightest search
 MAX_CACHE_FRAMES = 64
 
 state: dict[str, object] = {
-    "video_path":   None,   # Path of currently loaded video
-    "cap":          None,   # cv2.VideoCapture
-    "total_frames": 0,
-    "idx":          0,      # current 0-based frame index
-    "boxes":        {},     # {frame_index: [(x,y), …]} in original pixels
-    "photo":        None,
-    "current_np":   None,   # RGB numpy array of full-res frame
-    "scale":        1.0,
-    "hover_id":     None,   # canvas text item for hover read-out
-    "cap_pos":      None,   # index of last decoded frame in cap
-    "frame_cache":  {},     # {frame_index: np.ndarray RGB}
-    "cache_order":  [],     # [frame_index, …] LRU-ish order
+    "video_path":     None,   # Path of currently loaded video
+    "cap":            None,   # cv2.VideoCapture
+    "total_frames":   0,
+    "idx":            0,      # current 0-based frame index
+    "boxes":          {},     # {frame_index: [(x,y), …]} in original pixels
+    "photo":          None,
+    "current_np":     None,   # RGB numpy array of full-res frame
+    "current_gray":   None,   # Grayscale numpy array of full-res frame
+    "scale":          1.0,
+    "hover_id":       None,   # canvas text item for hover read-out
+    "cap_pos":        None,   # index of last decoded frame in cap
+    "cursor_box_id":  None,   # canvas rect for custom cursor box
+    "cursor_center":  None,   # (x,y) in ORIGINAL coords where box will land
+    "frame_cache":    {},     # {frame_index: np.ndarray RGB}
+    "cache_order":    [],     # [frame_index, …] LRU-ish order
 }
 
 
@@ -148,6 +151,9 @@ def _close_cap() -> None:
     state["cap_pos"] = None
     state["frame_cache"] = {}
     state["cache_order"] = []
+    state["current_np"] = None
+    state["current_gray"] = None
+    state["cursor_center"] = None
     state["cap_pos"] = None
 
 
@@ -188,6 +194,7 @@ def load_video(p: str | Path) -> None:
         idx=start,
         boxes=boxes,
         current_np=None,
+        current_gray=None,
         scale=1.0,
         hover_id=None,
         photo=None,
@@ -394,8 +401,12 @@ def show_frame() -> None:
         interpolation=cv2.INTER_NEAREST if scale > 1 else cv2.INTER_AREA,
     )
 
-    state.update(current_np=full, scale=scale)
-    state["hover_id"] = None  # reset hover label on new frame
+    gray = cv2.cvtColor(full, cv2.COLOR_RGB2GRAY)
+
+    state.update(current_np=full, current_gray=gray, scale=scale)
+    state["hover_id"] = None       # reset hover label on new frame
+    state["cursor_box_id"] = None  # reset custom cursor box on new frame
+    state["cursor_center"] = None
 
     canvas.config(width=disp_w, height=disp_h)
     canvas.delete("all")
@@ -459,12 +470,49 @@ def hover_readout(event) -> None:
         canvas.coords(state["hover_id"], event.x + 10, event.y + 10)
         canvas.itemconfig(state["hover_id"], text=text)
 
+    # Create or update transparent box cursor showing where the annotation
+    # box will actually land (after brightest-pixel snapping).
+    gray = state.get("current_gray")
+    if gray is None:
+        frame = state["current_np"]
+        if frame is None:
+            return
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        state["current_gray"] = gray
+
+    bx, by = find_nearest_brightest(gray, ox, oy)
+    state["cursor_center"] = (bx, by)
+
+    s = state["scale"]
+    cx_disp = bx * s
+    cy_disp = by * s
+    half_box = BOX_SIZE / 2.0
+    x0 = cx_disp - half_box
+    y0 = cy_disp - half_box
+    x1 = cx_disp + half_box
+    y1 = cy_disp + half_box
+
+    if state["cursor_box_id"] is None:
+        state["cursor_box_id"] = canvas.create_rectangle(
+            x0,
+            y0,
+            x1,
+            y1,
+            outline="cyan",
+            width=1,
+        )
+    else:
+        canvas.coords(state["cursor_box_id"], x0, y0, x1, y1)
+
 
 def clear_hover(_event=None):
     """Remove hover label when leaving canvas."""
     if state["hover_id"] is not None:
         canvas.delete(state["hover_id"])
         state["hover_id"] = None
+    if state["cursor_box_id"] is not None:
+        canvas.delete(state["cursor_box_id"])
+        state["cursor_box_id"] = None
 
 
 # ───────── callbacks ─────────
@@ -473,15 +521,26 @@ def on_click(event) -> None:
     if total <= 0 or not state.get("video_path"):
         return
     s = state["scale"]
-    ox_img, oy_img = int(event.x / s), int(event.y / s)
     current = state["current_np"]
     if current is None:
         return
-    h, w = current.shape[:2]
-    if not (0 <= ox_img < w and 0 <= oy_img < h):
-        return
-    gray = cv2.cvtColor(current, cv2.COLOR_RGB2GRAY)
-    bx, by = find_nearest_brightest(gray, ox_img, oy_img)
+
+    # Prefer the precomputed cursor center (from hover), so the red box
+    # lands exactly under the cyan preview box. Fallback to computing from
+    # the click location if needed (e.g. no prior hover event).
+    cursor_center = state.get("cursor_center")
+    if isinstance(cursor_center, tuple) and len(cursor_center) == 2:
+        bx, by = cursor_center
+    else:
+        ox_img, oy_img = int(event.x / s), int(event.y / s)
+        h, w = current.shape[:2]
+        if not (0 <= ox_img < w and 0 <= oy_img < h):
+            return
+        gray = state.get("current_gray")
+        if gray is None:
+            gray = cv2.cvtColor(current, cv2.COLOR_RGB2GRAY)
+            state["current_gray"] = gray
+        bx, by = find_nearest_brightest(gray, ox_img, oy_img)
     idx = int(state["idx"])
     boxes: dict[int, list[tuple[int, int]]] = state["boxes"]  # type: ignore[assignment]
     boxes.setdefault(idx, []).append((bx, by))
@@ -572,7 +631,8 @@ ttk.Label(
 ttk.Label(header, textvariable=prog_var).pack(side=tk.LEFT, padx=10)
 
 # --- Canvas (resized per frame) ---
-canvas = tk.Canvas(tab_annot, bg="black", highlightthickness=0, cursor="crosshair")
+# Hide OS cursor on the canvas and draw our own transparent box cursor instead.
+canvas = tk.Canvas(tab_annot, bg="black", highlightthickness=0, cursor="none")
 canvas.pack()
 canvas.bind("<Button-1>", on_click)
 canvas.bind("<Left>", prev_frame)
