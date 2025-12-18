@@ -114,6 +114,14 @@ STAGE3_POSITIVE_CLASS_INDEX: int = 1
 STAGE3_POSITIVE_THRESHOLD: float = 0.98
 STAGE3_DEVICE: str = "auto"
 
+# Stage 3 — brightness / bright-area pre-filters on patches
+# - STAGE3_BRIGHT_MAX_THRESHOLD: drop patches whose brightest pixel < this (0–255 luminance).
+# - STAGE3_BRIGHT_AREA_INTENSITY_THR: pixels >= this are "bright" for area counting.
+# - STAGE3_MIN_BRIGHT_PIXELS: require at least this many bright pixels.
+STAGE3_BRIGHT_MAX_THRESHOLD: float | None = 120.0
+STAGE3_BRIGHT_AREA_INTENSITY_THR: float | None = 80.0
+STAGE3_MIN_BRIGHT_PIXELS: int | None = 4
+
 # Stage 3 — crop size used to extract patches from frames
 PATCH_SIZE_PX: int = 10
 
@@ -178,6 +186,9 @@ __all__ = [
     "STAGE3_POSITIVE_CLASS_INDEX",
     "STAGE3_POSITIVE_THRESHOLD",
     "STAGE3_DEVICE",
+    "STAGE3_BRIGHT_MAX_THRESHOLD",
+    "STAGE3_BRIGHT_AREA_INTENSITY_THR",
+    "STAGE3_MIN_BRIGHT_PIXELS",
     "PATCH_SIZE_PX",
     "RENDER_CODEC",
     "RENDER_FPS_HINT",

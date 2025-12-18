@@ -369,6 +369,27 @@ def run_for_video(video_path: Path) -> Path:
                 )
                 patch_rgb = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2RGB)
                 patch_rgb = np.ascontiguousarray(patch_rgb)
+                # Stage 3 pre-filters: max-brightness and bright-area pixel count
+                # (mirrors the caged_fireflies pipeline semantics).
+                if patch_rgb.size == 0:
+                    continue
+                bright_thr = getattr(params, "STAGE3_BRIGHT_MAX_THRESHOLD", None)
+                area_int_thr = getattr(params, "STAGE3_BRIGHT_AREA_INTENSITY_THR", None)
+                min_pix = getattr(params, "STAGE3_MIN_BRIGHT_PIXELS", None)
+                if bright_thr is not None or (area_int_thr is not None and min_pix is not None):
+                    lumin = (
+                        0.299 * patch_rgb[:, :, 0].astype(np.float32)
+                        + 0.587 * patch_rgb[:, :, 1].astype(np.float32)
+                        + 0.114 * patch_rgb[:, :, 2].astype(np.float32)
+                    )
+                    if bright_thr is not None:
+                        max_val = float(lumin.max()) if lumin.size else 0.0
+                        if max_val < float(bright_thr):
+                            continue
+                    if area_int_thr is not None and min_pix is not None:
+                        nbright = int((lumin >= float(area_int_thr)).sum())
+                        if nbright < int(min_pix):
+                            continue
                 cur_batch.append(
                     (int(t), int(px0), int(py0), int(patch_bgr.shape[1]), int(patch_bgr.shape[0]), patch_rgb, int(det_id))
                 )
@@ -465,4 +486,3 @@ def run_for_video(video_path: Path) -> Path:
 
 
 __all__ = ["run_for_video"]
-
