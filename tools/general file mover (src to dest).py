@@ -5,12 +5,14 @@ from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 # Global variables: set these to your directories
-INPUT_DIR = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset collection/output data/20240606_cam1_GS010064/raw 10x10 crops from sbd'
-OUTPUT_DIR = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset/v2/initial dataset/background'
+# SOURCE_DIR: where files currently live (e.g. freshly generated patches)
+# DEST_DIR:   where you want them moved (e.g. training dataset folder)
+SOURCE_DIR = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset/negative edge cases generation/patches'
+DEST_DIR = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset/v2/initial dataset/background'
 
 # Behavior toggles
 RECURSIVE = True                 # Move files in all subfolders
-PRESERVE_SUBDIRS = False         # Recreate subfolders under INPUT_DIR
+PRESERVE_SUBDIRS = False         # Recreate subfolders under SOURCE_DIR
 ON_CONFLICT = "rename"           # 'overwrite' | 'skip' | 'rename'
 DRY_RUN = False                  # True to preview without moving
 
@@ -92,9 +94,9 @@ def move_all(src_dir: Path, dst_dir: Path) -> Tuple[int, int]:
 
 
 def main():
-    # Move from INPUT_DIR to OUTPUT_DIR
-    src = Path(INPUT_DIR).expanduser()
-    dst = Path(OUTPUT_DIR).expanduser()
+    # Move from SOURCE_DIR to DEST_DIR
+    src = Path(SOURCE_DIR).expanduser()
+    dst = Path(DEST_DIR).expanduser()
     
     def count_files(d: Path) -> int:
         if not d.exists() or not d.is_dir():

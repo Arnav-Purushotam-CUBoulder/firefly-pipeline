@@ -53,7 +53,11 @@ def _make_writer(path: Path, w: int, h: int, fps: float, codec: str = "mp4v", is
 def run_for_video(video_path: Path) -> Path:
     """Render final video with boxes drawn from Stage 3 CSV."""
     stem = video_path.stem
-    s3_csv = (params.STAGE3_DIR / stem) / f"{stem}_patches.csv"
+    s3_dir = params.STAGE3_DIR / stem
+    # Prefer Stage3.1 curvy-filtered CSV if present; else fall back to raw Stage3.
+    preferred = s3_dir / f"{stem}_patches_curvy.csv"
+    fallback = s3_dir / f"{stem}_patches.csv"
+    s3_csv = preferred if preferred.exists() else fallback
     assert s3_csv.exists(), f"Missing Stage3 CSV for {stem}: {s3_csv}"
 
     out_root = params.STAGE4_DIR / stem

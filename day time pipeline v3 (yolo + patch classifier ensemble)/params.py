@@ -27,11 +27,12 @@ ORIGINAL_VIDEOS_DIR: Path = ROOT / "original videos"
 
 # Stage output roots (one folder per stage). Each stage writes under its own dir.
 # Stage 1: long-exposure images; Stage 2: YOLO detections CSVs;
-# Stage 3: patch classifier; Stage 4: rendered videos.
+# Stage 3: patch classifier; Stage 4: rendered videos; Stage 5: 3D analysis renders.
 STAGE1_DIR: Path = ROOT / "stage1_long_exposure"
 STAGE2_DIR: Path = ROOT / "stage2_yolo_detections"
 STAGE3_DIR: Path = ROOT / "stage3_patch_classifier"
 STAGE4_DIR: Path = ROOT / "stage4_rendering"
+STAGE5_DIR: Path = ROOT / "stage5_3d_render"
 
 # General
 # - VIDEO_EXTS: file extensions to treat as videos.
@@ -114,14 +115,6 @@ STAGE3_POSITIVE_CLASS_INDEX: int = 1
 STAGE3_POSITIVE_THRESHOLD: float = 0.98
 STAGE3_DEVICE: str = "auto"
 
-# Stage 3 — brightness / bright-area pre-filters on patches
-# - STAGE3_BRIGHT_MAX_THRESHOLD: drop patches whose brightest pixel < this (0–255 luminance).
-# - STAGE3_BRIGHT_AREA_INTENSITY_THR: pixels >= this are "bright" for area counting.
-# - STAGE3_MIN_BRIGHT_PIXELS: require at least this many bright pixels.
-STAGE3_BRIGHT_MAX_THRESHOLD: float | None = 120.0
-STAGE3_BRIGHT_AREA_INTENSITY_THR: float | None = 80.0
-STAGE3_MIN_BRIGHT_PIXELS: int | None = 4
-
 # Stage 3 — crop size used to extract patches from frames
 PATCH_SIZE_PX: int = 10
 
@@ -130,6 +123,20 @@ PATCH_SIZE_PX: int = 10
 # - RENDER_FPS_HINT: None to use source fps; else override.
 RENDER_CODEC: str = "mp4v"
 RENDER_FPS_HINT: float | None = None
+
+# Stage 5 — 3D analysis rendering (time as third dimension)
+# - STAGE5_BLOCK_SIZE_FRAMES: number of frames per 3D cube (e.g., 1000).
+# - STAGE5_SPHERE_RADIUS: radius of detection spheres in world units.
+STAGE5_BLOCK_SIZE_FRAMES: int = 1000
+STAGE5_SPHERE_RADIUS: float = 5.0
+
+# Stage 3.1 — trajectory grouping in (x,y,t) space (no filtering)
+# After Stage 3, group detections into trajectories via a distance metric
+# in (x,y,frame_idx) and write a CSV with traj_id per detection.
+RUN_STAGE3_1_TRAJECTORIES: bool = True
+STAGE3_1_LINK_RADIUS_PX: float = 12.0   # max 3D distance (pixels + time_scaled) to link detections
+STAGE3_1_MAX_FRAME_GAP: int = 3         # max frame gap when linking
+STAGE3_1_TIME_SCALE: float = 1.0        # scale factor for delta-frame in 3D distance
 
 
 def list_videos() -> List[Path]:
@@ -150,6 +157,7 @@ __all__ = [
     "STAGE2_DIR",
     "STAGE3_DIR",
     "STAGE4_DIR",
+    "STAGE5_DIR",
     # general
     "RUN_PRE_RUN_CLEANUP",
     "VIDEO_EXTS",
@@ -186,12 +194,15 @@ __all__ = [
     "STAGE3_POSITIVE_CLASS_INDEX",
     "STAGE3_POSITIVE_THRESHOLD",
     "STAGE3_DEVICE",
-    "STAGE3_BRIGHT_MAX_THRESHOLD",
-    "STAGE3_BRIGHT_AREA_INTENSITY_THR",
-    "STAGE3_MIN_BRIGHT_PIXELS",
     "PATCH_SIZE_PX",
     "RENDER_CODEC",
     "RENDER_FPS_HINT",
+    "STAGE5_BLOCK_SIZE_FRAMES",
+    "STAGE5_SPHERE_RADIUS",
+    "RUN_STAGE3_1_TRAJECTORIES",
+    "STAGE3_1_LINK_RADIUS_PX",
+    "STAGE3_1_MAX_FRAME_GAP",
+    "STAGE3_1_TIME_SCALE",
     # helpers
     "list_videos",
 ]
