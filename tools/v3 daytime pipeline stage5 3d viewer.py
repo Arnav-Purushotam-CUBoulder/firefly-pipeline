@@ -42,7 +42,7 @@ from tkinter import filedialog, messagebox
 # Set this to a specific .vtp file or a folder containing .vtp files
 # to avoid passing the path on the command line every time.
 # If left empty (""), the script will fall back to CLI args or a file dialog.
-VTP_PATH: str = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/v3 day time pipeline inference data/test1/stage5_3d_render/20240606_cam1_GS010064/20240606_cam1_GS010064_block_000000-000999.vtp'
+VTP_PATH: str = '/Users/arnavps/Desktop/RA inference data/v3 daytime pipeline inference data/stage5_3d_render/20240606_cam1_GS010064/20240606_cam1_GS010064_block_000000-000999.vtp'
 
 
 def _ensure_pyvista():
@@ -126,13 +126,42 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[stage5-viewer] Loaded {len(files)} file(s).")
 
+    def _add_mesh_with_colors(plotter, data, name: str):
+        # If 'rejected' data is present, use it to color points:
+        #   1 => rejected trajectories (blue)
+        #   0 => kept trajectories (red)
+        #
+        # (Legacy) If 'uniform' data is present, use it to color points:
+        #   1 => uniform-brightness trajectories (blue)
+        #   0 => varying brightness (red)
+        scalars_name = None
+        if "rejected" in data.point_data:
+            scalars_name = "rejected"
+        elif "rejected" in data.cell_data:
+            scalars_name = "rejected"
+        elif "uniform" in data.point_data:
+            scalars_name = "uniform"
+        elif "uniform" in data.cell_data:
+            scalars_name = "uniform"
+
+        if scalars_name is not None:
+            plotter.add_mesh(
+                data,
+                scalars=scalars_name,
+                cmap=["red", "blue"],  # 0 -> red, 1 -> blue
+                categories=True,
+                smooth_shading=True,
+            )
+        else:
+            plotter.add_mesh(data, color="red", smooth_shading=True)
+        plotter.add_axes()
+        plotter.add_text(name, font_size=10)
+
     # Single-file viewer (no navigation) is straightforward
     if len(files) == 1:
         data = pv.read(str(files[0]))
         plotter = pv.Plotter()
-        plotter.add_mesh(data, color="red", smooth_shading=True)
-        plotter.add_axes()
-        plotter.add_text(files[0].name, font_size=10)
+        _add_mesh_with_colors(plotter, data, files[0].name)
         plotter.show(title=f"Stage5 3D Viewer – {files[0].name}")
         return 0
 
@@ -140,15 +169,10 @@ def main(argv: list[str] | None = None) -> int:
     idx = 0
     data = pv.read(str(files[idx]))
     plotter = pv.Plotter()
-    actor = plotter.add_mesh(data, color="red", smooth_shading=True)
-    plotter.add_axes()
-    label = plotter.add_text(
-        f"{files[idx].name}   ({idx+1}/{len(files)})",
-        font_size=10,
-    )
+    _add_mesh_with_colors(plotter, data, f"{files[idx].name}   ({idx+1}/{len(files)})")
 
     def _update(delta: int) -> None:
-        nonlocal idx, actor, label
+        nonlocal idx
         if not files:
             return
         idx = (idx + delta) % len(files)
@@ -161,12 +185,7 @@ def main(argv: list[str] | None = None) -> int:
         # Preserve current camera position when switching
         cam = plotter.camera_position
         plotter.clear()
-        actor = plotter.add_mesh(new_data, color="red", smooth_shading=True)
-        plotter.add_axes()
-        label = plotter.add_text(
-            f"{files[idx].name}   ({idx+1}/{len(files)})",
-            font_size=10,
-        )
+        _add_mesh_with_colors(plotter, new_data, f"{files[idx].name}   ({idx+1}/{len(files)})")
         plotter.camera_position = cam
         plotter.render()
 

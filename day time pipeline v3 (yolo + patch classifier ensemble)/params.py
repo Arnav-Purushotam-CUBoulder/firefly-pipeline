@@ -15,7 +15,7 @@ from typing import List
 # Root folder for this pipeline (EDIT THIS)
 # - All stage outputs are saved here.
 # - Must contain a subfolder named "original videos" with input videos.
-ROOT: str | Path = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/v3 day time pipeline inference data/test1'
+ROOT: str | Path = '/Users/arnavps/Desktop/RA inference data/v3 daytime pipeline inference data'
 
 # Normalize ROOT to a Path object even if provided as a string
 if not isinstance(ROOT, Path):
@@ -43,7 +43,7 @@ RUN_PRE_RUN_CLEANUP: bool = True
 # Frame cap for fast iteration / testing
 # - MAX_FRAMES: if an integer, process only the first N frames of each video
 #               when forming long-exposure images. If None, process the full video.
-MAX_FRAMES: int | None = 500
+MAX_FRAMES: int | None = 150
 
 # Stage 1 — long-exposure generation from raw video
 # - LONG_EXPOSURE_MODE: 'lighten' | 'average' | 'trails'
@@ -94,7 +94,7 @@ PATCH_MODEL_PATH: Path = Path(
     "/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/"
     "background subtraction detection method/actual background subtraction code/"
     "forresti, fixing FPs and box overlap/Proof of concept code/models and other data/"
-    "pyrallis gopro models resnet18/resnet18_pyrallis_gopro_best_model v2.pt"
+    "pyrallis gopro models resnet18/resnet18_pyrallis_gopro_best_model v3.pt"
 )
 
 # Torch / transforms
@@ -112,7 +112,7 @@ STAGE3_INPUT_SIZE: int = 10
 STAGE3_BATCH_SIZE_GPU: int = 4096
 STAGE3_BATCH_SIZE_CPU: int = 512
 STAGE3_POSITIVE_CLASS_INDEX: int = 1
-STAGE3_POSITIVE_THRESHOLD: float = 0.98
+STAGE3_POSITIVE_THRESHOLD: float = 0.80
 STAGE3_DEVICE: str = "auto"
 
 # Stage 3 — crop size used to extract patches from frames
@@ -123,6 +123,9 @@ PATCH_SIZE_PX: int = 10
 # - RENDER_FPS_HINT: None to use source fps; else override.
 RENDER_CODEC: str = "mp4v"
 RENDER_FPS_HINT: float | None = None
+# If True and Stage3.1 produced `*_patches_motion_all.csv`, draw rejected
+# detections in blue and kept detections in red.
+STAGE4_DRAW_STAGE3_1_REJECTED: bool = False
 
 # Stage 5 — 3D analysis rendering (time as third dimension)
 # - STAGE5_BLOCK_SIZE_FRAMES: number of frames per 3D cube (e.g., 1000).
@@ -130,13 +133,50 @@ RENDER_FPS_HINT: float | None = None
 STAGE5_BLOCK_SIZE_FRAMES: int = 1000
 STAGE5_SPHERE_RADIUS: float = 5.0
 
-# Stage 3.1 — trajectory grouping in (x,y,t) space (no filtering)
-# After Stage 3, group detections into trajectories via a distance metric
-# in (x,y,frame_idx) and write a CSV with traj_id per detection.
-RUN_STAGE3_1_TRAJECTORIES: bool = True
-STAGE3_1_LINK_RADIUS_PX: float = 12.0   # max 3D distance (pixels + time_scaled) to link detections
-STAGE3_1_MAX_FRAME_GAP: int = 3         # max frame gap when linking
-STAGE3_1_TIME_SCALE: float = 1.0        # scale factor for delta-frame in 3D distance
+# Stage 3.1 — trajectory grouping + intensity selection
+# Groups Stage3 detections into trajectories in (x,y,t) space, then computes
+# per-trajectory intensity curves and selects "flash-like" (hill-shaped) ones.
+RUN_STAGE3_1_TRAJECTORY_INTENSITY_SELECTOR: bool = True
+# Backward-compat name (do not use for new code)
+RUN_STAGE3_1_MOTION_FILTER: bool = RUN_STAGE3_1_TRAJECTORY_INTENSITY_SELECTOR
+# Max XY pixels per frame to link detections into the same trajectory.
+# If a firefly moves ~10–12 px/frame, this must be > that (e.g. 15–25).
+STAGE3_1_LINK_RADIUS_PX: float = 15.0
+STAGE3_1_MAX_FRAME_GAP: int = 6
+STAGE3_1_TIME_SCALE: float = 1.0
+STAGE3_1_MIN_TRACK_POINTS: int = 3
+STAGE3_1_EXPORT_TRAJECTORY_CROPS: bool = True
+STAGE3_1_TRAJECTORY_CROPS_DIRNAME: str = "stage3_1_trajectory_crops"
+# Plot intensity curves (one curve per trajectory) as an SVG under STAGE3_DIR/<stem>/.
+STAGE3_1_PLOT_TRAJECTORY_INTENSITY: bool = True
+STAGE3_1_TRAJECTORY_INTENSITY_SVG_NAME: str = "stage3_1_trajectory_intensity_curves.svg"
+# Also write a second SVG containing only trajectories whose intensity curve
+# range (max(sum)-min(sum)) is at least this threshold.
+STAGE3_1_PLOT_TRAJECTORY_INTENSITY_HIGHVAR: bool = True
+STAGE3_1_TRAJECTORY_INTENSITY_HIGHVAR_MIN_RANGE: int = 3000
+STAGE3_1_TRAJECTORY_INTENSITY_HIGHVAR_SVG_NAME: str = "stage3_1_trajectory_intensity_curves_highvar.svg"
+STAGE3_1_EXPORT_HIGHVAR_TRAJECTORY_CROPS: bool = True
+STAGE3_1_HIGHVAR_TRAJECTORY_CROPS_DIRNAME: str = "stage3_1_highvar_trajectory_crops"
+# "Firefly-flash-like" hill filter: curve rises then falls (unimodal-ish).
+STAGE3_1_HIGHVAR_REQUIRE_HILL_SHAPE: bool = True
+STAGE3_1_HILL_SMOOTH_WINDOW: int = 1              # 1 disables smoothing
+STAGE3_1_HILL_MIN_UP_STEPS: int = 2               # min positive steps before peak
+STAGE3_1_HILL_MIN_DOWN_STEPS: int = 2             # min negative steps after peak
+STAGE3_1_HILL_MIN_MONOTONIC_FRAC: float = 0.60    # before/after peak sign consistency
+STAGE3_1_HILL_PEAK_POS_MIN_FRAC: float = 0.0     # peak not too close to start
+STAGE3_1_HILL_PEAK_POS_MAX_FRAC: float = 1.0     # peak not too close to end
+# Render a video under STAGE3_DIR/<video_stem>/ showing Stage3.1 selections:
+# - selected (hill/flash-like) boxes in red
+# - rejected boxes in blue
+STAGE3_1_RENDER_HIGHVAR_VIDEO: bool = True
+STAGE3_1_HIGHVAR_VIDEO_NAME: str = "stage3_1_highvar_trajectories.mp4"
+
+# Stage 3.2 — Gaussian centroid + logits CSV + annotated crops (selected only)
+RUN_STAGE3_2: bool = True
+STAGE3_2_DIRNAME: str = "stage3_2"
+STAGE3_2_GAUSSIAN_SIGMA: float = 1.0   # 0 => plain intensity centroid
+STAGE3_2_SAVE_ANNOTATED_CROPS: bool = True
+STAGE3_2_MARK_CENTROID_RED_PIXEL: bool = True
 
 
 def list_videos() -> List[Path]:
@@ -197,12 +237,38 @@ __all__ = [
     "PATCH_SIZE_PX",
     "RENDER_CODEC",
     "RENDER_FPS_HINT",
+    "STAGE4_DRAW_STAGE3_1_REJECTED",
     "STAGE5_BLOCK_SIZE_FRAMES",
     "STAGE5_SPHERE_RADIUS",
-    "RUN_STAGE3_1_TRAJECTORIES",
+    "RUN_STAGE3_1_TRAJECTORY_INTENSITY_SELECTOR",
+    "RUN_STAGE3_1_MOTION_FILTER",
     "STAGE3_1_LINK_RADIUS_PX",
     "STAGE3_1_MAX_FRAME_GAP",
     "STAGE3_1_TIME_SCALE",
+    "STAGE3_1_MIN_TRACK_POINTS",
+    "STAGE3_1_EXPORT_TRAJECTORY_CROPS",
+    "STAGE3_1_TRAJECTORY_CROPS_DIRNAME",
+    "STAGE3_1_PLOT_TRAJECTORY_INTENSITY",
+    "STAGE3_1_TRAJECTORY_INTENSITY_SVG_NAME",
+    "STAGE3_1_PLOT_TRAJECTORY_INTENSITY_HIGHVAR",
+    "STAGE3_1_TRAJECTORY_INTENSITY_HIGHVAR_MIN_RANGE",
+    "STAGE3_1_TRAJECTORY_INTENSITY_HIGHVAR_SVG_NAME",
+    "STAGE3_1_EXPORT_HIGHVAR_TRAJECTORY_CROPS",
+    "STAGE3_1_HIGHVAR_TRAJECTORY_CROPS_DIRNAME",
+    "STAGE3_1_HIGHVAR_REQUIRE_HILL_SHAPE",
+    "STAGE3_1_HILL_SMOOTH_WINDOW",
+    "STAGE3_1_HILL_MIN_UP_STEPS",
+    "STAGE3_1_HILL_MIN_DOWN_STEPS",
+    "STAGE3_1_HILL_MIN_MONOTONIC_FRAC",
+    "STAGE3_1_HILL_PEAK_POS_MIN_FRAC",
+    "STAGE3_1_HILL_PEAK_POS_MAX_FRAC",
+    "STAGE3_1_RENDER_HIGHVAR_VIDEO",
+    "STAGE3_1_HIGHVAR_VIDEO_NAME",
+    "RUN_STAGE3_2",
+    "STAGE3_2_DIRNAME",
+    "STAGE3_2_GAUSSIAN_SIGMA",
+    "STAGE3_2_SAVE_ANNOTATED_CROPS",
+    "STAGE3_2_MARK_CENTROID_RED_PIXEL",
     # helpers
     "list_videos",
 ]

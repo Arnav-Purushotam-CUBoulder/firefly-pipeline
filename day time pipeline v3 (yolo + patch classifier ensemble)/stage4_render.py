@@ -54,18 +54,27 @@ def run_for_video(video_path: Path) -> Path:
     """Render final video with boxes drawn from Stage 3 CSV."""
     stem = video_path.stem
     s3_dir = params.STAGE3_DIR / stem
-    # Prefer Stage3.1 curvy-filtered CSV if present; else fall back to raw Stage3.
-    preferred = s3_dir / f"{stem}_patches_curvy.csv"
+    # Prefer Stage3.1 CSVs if present; else fall back to raw Stage3.
+    # If STAGE4_DRAW_STAGE3_1_REJECTED is True, prefer *_patches_motion_all.csv
+    # (includes rejected rows with traj_is_selected=0).
+    preferred_all = s3_dir / f"{stem}_patches_motion_all.csv"
+    preferred = s3_dir / f"{stem}_patches_motion.csv"
     fallback = s3_dir / f"{stem}_patches.csv"
-    s3_csv = preferred if preferred.exists() else fallback
+    draw_rejected = bool(getattr(params, "STAGE4_DRAW_STAGE3_1_REJECTED", False))
+    if draw_rejected and preferred_all.exists():
+        s3_csv = preferred_all
+    elif preferred.exists():
+        s3_csv = preferred
+    else:
+        s3_csv = fallback
     assert s3_csv.exists(), f"Missing Stage3 CSV for {stem}: {s3_csv}"
 
     out_root = params.STAGE4_DIR / stem
     out_root.mkdir(parents=True, exist_ok=True)
     out_path = out_root / f"{stem}_patches.mp4"
 
-    # Read boxes by frame (top-left x,y,w,h)
-    boxes_by_t: dict[int, list[tuple[int, int, int, int]]] = defaultdict(list)
+    # Read boxes by frame (top-left x,y,w,h,rejected_flag)
+    boxes_by_t: dict[int, list[tuple[int, int, int, int, int]]] = defaultdict(list)
     with s3_csv.open("r", newline="") as f:
         r = csv.DictReader(f)
         for row in r:
@@ -77,7 +86,14 @@ def run_for_video(video_path: Path) -> Path:
                 h = int(float(row.get("h", params.PATCH_SIZE_PX)))
             except Exception:
                 continue
-            boxes_by_t[t].append((x, y, w, h))
+            rejected = 0
+            if draw_rejected:
+                sel_raw = row.get("traj_is_selected")
+                if sel_raw is not None:
+                    s = str(sel_raw).strip()
+                    if s in {"", "0", "False", "false"}:
+                        rejected = 1
+            boxes_by_t[t].append((x, y, w, h, rejected))
 
     cap, W, H, fps_src, total = _open_video(video_path)
     max_frames = int(params.MAX_FRAMES) if (params.MAX_FRAMES is not None) else total
@@ -91,17 +107,19 @@ def run_for_video(video_path: Path) -> Path:
             if not ok:
                 break
             if t in boxes_by_t:
-                for (x, y, w, h) in boxes_by_t[t]:
+                for (x, y, w, h, rejected) in boxes_by_t[t]:
                     x0 = int(x)
                     y0 = int(y)
                     x1 = x0 + int(w)
                     y1 = y0 + int(h)
-                    cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 0, 255), 1, cv2.LINE_AA)
+                    # red = kept, blue = rejected
+                    color = (255, 0, 0) if rejected else (0, 0, 255)
+                    cv2.rectangle(frame, (x0, y0), (x1, y1), color, 1, cv2.LINE_AA)
             writer.write(frame)
             t += 1
             if t % 50 == 0:
-                _progress(t, max_frames or t, "Stage5 render")
-        _progress(t, max_frames or t or 1, "Stage5 render done")
+                _progress(t, max_frames or t, "Stage4 render")
+        _progress(t, max_frames or t or 1, "Stage4 render done")
     finally:
         cap.release()
         writer.release()

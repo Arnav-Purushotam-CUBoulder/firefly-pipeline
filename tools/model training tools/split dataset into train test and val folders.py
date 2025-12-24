@@ -5,8 +5,8 @@ and print a per-class + overall summary when done.
 """
 
 # ─── GLOBAL CONFIG (edit) ──────────────────────────────────────────────
-SRC_DIR   = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset/v2/initial dataset' # has firefly/ and background/
-DEST_DIR  = '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset/v2/final dataset'   # new root with train/ val/ test/
+SRC_DIR   = '/Volumes/DL Project SSD/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset/v2/initial dataset' # has firefly/ and background/
+DEST_DIR  = '/Volumes/DL Project SSD/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset/v2/final dataset'   # new root with train/ val/ test/
 TRAIN_PCT = 0.80
 VAL_PCT   = 0.15
 TEST_PCT  = 0.05               # splits must sum to 1.0
