@@ -8,12 +8,12 @@ import params
 
 
 def cleanup_root(*, verbose: bool = True) -> None:
-    """Delete every directory under ROOT except \"original videos\".
+    """Delete every directory under ROOT except \"original videos\" and \"ground truth\".
 
     Only removes directories; leaves files alone.
     """
     root: Path = params.ROOT
-    keep = {"original videos"}
+    keep = {"original videos", "ground truth"}
     if verbose:
         print(f"[stage0_cleanup] Cleaning root: {root}")
     root.mkdir(parents=True, exist_ok=True)
@@ -33,4 +33,3 @@ def cleanup_root(*, verbose: bool = True) -> None:
 
 
 __all__ = ["cleanup_root"]
-

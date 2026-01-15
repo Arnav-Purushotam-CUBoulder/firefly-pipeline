@@ -41,10 +41,10 @@ def _basename(p: str | Path) -> str:
 # ───────── global paths ─────────
 # Keep these pointing near your data; auto-load only if the paths exist.
 DEFAULT_VIDEO_PATH = (
-    '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/raw data from drive/pyrallis gopro data/dataset collection/raw input videos/20240606_cam1_GS010064.mp4'
+    '/Users/arnavps/Desktop/RA inference data/v3 daytime pipeline inference data/20240606_cam1_GS010064/original videos/20240606_cam1_GS010064.mp4'
 )
 DEFAULT_CSV_FILE = (
-    '/Users/arnavps/Desktop/New DL project data to transfer to external disk/pyrallis related data/testing v2 firefly annotation tool/test1.csv'
+    '/Users/arnavps/Desktop/RA inference data/v3 daytime pipeline inference data/20240606_cam1_GS010064/ground truth csv/gt_20240606_cam1_GS010064.csv'
 )
 
 BOX_SIZE = 10       # also used as hover patch size

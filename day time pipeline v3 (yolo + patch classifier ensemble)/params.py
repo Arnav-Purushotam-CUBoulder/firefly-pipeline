@@ -15,7 +15,7 @@ from typing import List
 # Root folder for this pipeline (EDIT THIS)
 # - All stage outputs are saved here.
 # - Must contain a subfolder named "original videos" with input videos.
-ROOT: str | Path = '/Users/arnavps/Desktop/RA inference data/v3 daytime pipeline inference data'
+ROOT: str | Path = '/Users/arnavps/Desktop/RA inference data/v3 daytime pipeline inference data/20240606_cam1_GS010064'
 
 # Normalize ROOT to a Path object even if provided as a string
 if not isinstance(ROOT, Path):
@@ -27,12 +27,12 @@ ORIGINAL_VIDEOS_DIR: Path = ROOT / "original videos"
 
 # Stage output roots (one folder per stage). Each stage writes under its own dir.
 # Stage 1: long-exposure images; Stage 2: YOLO detections CSVs;
-# Stage 3: patch classifier; Stage 4: rendered videos; Stage 5: 3D analysis renders.
+# Stage 3: patch classifier; Stage 4: rendered videos; Stage 5+: post-pipeline test suite outputs.
 STAGE1_DIR: Path = ROOT / "stage1_long_exposure"
 STAGE2_DIR: Path = ROOT / "stage2_yolo_detections"
 STAGE3_DIR: Path = ROOT / "stage3_patch_classifier"
 STAGE4_DIR: Path = ROOT / "stage4_rendering"
-STAGE5_DIR: Path = ROOT / "stage5_3d_render"
+STAGE5_DIR: Path = ROOT / "stage5 validation"
 
 # General
 # - VIDEO_EXTS: file extensions to treat as videos.
@@ -43,7 +43,7 @@ RUN_PRE_RUN_CLEANUP: bool = True
 # Frame cap for fast iteration / testing
 # - MAX_FRAMES: if an integer, process only the first N frames of each video
 #               when forming long-exposure images. If None, process the full video.
-MAX_FRAMES: int | None = 150
+MAX_FRAMES: int | None = 200
 
 # Stage 1 — long-exposure generation from raw video
 # - LONG_EXPOSURE_MODE: 'lighten' | 'average' | 'trails'
@@ -127,12 +127,6 @@ RENDER_FPS_HINT: float | None = None
 # detections in blue and kept detections in red.
 STAGE4_DRAW_STAGE3_1_REJECTED: bool = False
 
-# Stage 5 — 3D analysis rendering (time as third dimension)
-# - STAGE5_BLOCK_SIZE_FRAMES: number of frames per 3D cube (e.g., 1000).
-# - STAGE5_SPHERE_RADIUS: radius of detection spheres in world units.
-STAGE5_BLOCK_SIZE_FRAMES: int = 1000
-STAGE5_SPHERE_RADIUS: float = 5.0
-
 # Stage 3.1 — trajectory grouping + intensity selection
 # Groups Stage3 detections into trajectories in (x,y,t) space, then computes
 # per-trajectory intensity curves and selects "flash-like" (hill-shaped) ones.
@@ -177,6 +171,58 @@ STAGE3_2_DIRNAME: str = "stage3_2"
 STAGE3_2_GAUSSIAN_SIGMA: float = 1.0   # 0 => plain intensity centroid
 STAGE3_2_SAVE_ANNOTATED_CROPS: bool = True
 STAGE3_2_MARK_CENTROID_RED_PIXEL: bool = True
+
+
+# ------------------------------------------------------------------
+# Post-pipeline test suite (Stage 5–9): GT validation + overlays + analysis
+# ------------------------------------------------------------------
+# These stages are implemented inside this v3 pipeline folder.
+RUN_STAGE5_VALIDATE: bool = True
+RUN_STAGE6_OVERLAY: bool = True
+RUN_STAGE7_FN_ANALYSIS: bool = True
+RUN_STAGE8_FP_ANALYSIS: bool = True
+RUN_STAGE9_DETECTION_SUMMARY: bool = True
+
+# Test output directories (under ROOT)
+# - Stage 5 writes per-video folders under STAGE5_DIR/<video_stem>/.
+STAGE6_DIR: Path = ROOT / "stage6 overlay videos"
+STAGE7_DIR: Path = ROOT / "stage7 fn analysis"
+STAGE8_DIR: Path = ROOT / "stage8 fp analysis"
+STAGE9_DIR: Path = ROOT / "stage9 detection summary"
+
+# Ground truth (GT) configuration
+# Supported GT filenames under GT_CSV_DIR (matched per input video stem):
+# - gt_<video_stem>.csv            (your common convention)
+# - <video_stem>.csv
+# - <video_stem>_gt.csv
+# - gt.csv                         (single-video fallback)
+GT_CSV_DIR: Path = ROOT / "ground truth"
+GT_CSV_PATH: Path | None = None
+GT_T_OFFSET: int = 0
+
+# Validation sweep thresholds (pixels)
+DIST_THRESHOLDS_PX: list[float] = [10.0]
+
+# Stage 5 crop size (also used for Stage 6/7/8 box visuals)
+STAGE5_CROP_W: int = int(PATCH_SIZE_PX)
+STAGE5_CROP_H: int = int(PATCH_SIZE_PX)
+STAGE6_GT_BOX_W: int = STAGE5_CROP_W
+STAGE6_GT_BOX_H: int = STAGE5_CROP_H
+OVERLAY_BOX_THICKNESS: int = 1
+
+# Stage 5 options
+STAGE5_ONLY_FIREFLY_ROWS: bool = True
+STAGE5_SHOW_PER_FRAME: bool = False
+STAGE5_MODEL_PATH: Path | None = PATCH_MODEL_PATH  # used only for FN confidence scoring
+STAGE5_BACKBONE: str = "resnet18"
+STAGE5_IMAGENET_NORM: bool = bool(IMAGENET_NORMALIZE)
+STAGE5_PRINT_LOAD_STATUS: bool = True
+
+# Stage 5 GT filtering + dedupe (same features as the copied validator)
+STAGE5_GT_AREA_THRESHOLD_PX: int = 4
+STAGE5_GT_BRIGHT_MAX_THRESHOLD: int = 50
+STAGE5_MIN_PIXEL_BRIGHTNESS_FOR_AREA_CALC: int = 50
+STAGE5_GT_DEDUPE_DIST_PX: float = 2.0
 
 
 def list_videos() -> List[Path]:
@@ -238,8 +284,6 @@ __all__ = [
     "RENDER_CODEC",
     "RENDER_FPS_HINT",
     "STAGE4_DRAW_STAGE3_1_REJECTED",
-    "STAGE5_BLOCK_SIZE_FRAMES",
-    "STAGE5_SPHERE_RADIUS",
     "RUN_STAGE3_1_TRAJECTORY_INTENSITY_SELECTOR",
     "RUN_STAGE3_1_MOTION_FILTER",
     "STAGE3_1_LINK_RADIUS_PX",
@@ -269,6 +313,35 @@ __all__ = [
     "STAGE3_2_GAUSSIAN_SIGMA",
     "STAGE3_2_SAVE_ANNOTATED_CROPS",
     "STAGE3_2_MARK_CENTROID_RED_PIXEL",
+    # post-pipeline test suite (Stage 5–9)
+    "RUN_STAGE5_VALIDATE",
+    "RUN_STAGE6_OVERLAY",
+    "RUN_STAGE7_FN_ANALYSIS",
+    "RUN_STAGE8_FP_ANALYSIS",
+    "RUN_STAGE9_DETECTION_SUMMARY",
+    "STAGE6_DIR",
+    "STAGE7_DIR",
+    "STAGE8_DIR",
+    "STAGE9_DIR",
+    "GT_CSV_DIR",
+    "GT_CSV_PATH",
+    "GT_T_OFFSET",
+    "DIST_THRESHOLDS_PX",
+    "STAGE5_CROP_W",
+    "STAGE5_CROP_H",
+    "STAGE6_GT_BOX_W",
+    "STAGE6_GT_BOX_H",
+    "OVERLAY_BOX_THICKNESS",
+    "STAGE5_ONLY_FIREFLY_ROWS",
+    "STAGE5_SHOW_PER_FRAME",
+    "STAGE5_MODEL_PATH",
+    "STAGE5_BACKBONE",
+    "STAGE5_IMAGENET_NORM",
+    "STAGE5_PRINT_LOAD_STATUS",
+    "STAGE5_GT_AREA_THRESHOLD_PX",
+    "STAGE5_GT_BRIGHT_MAX_THRESHOLD",
+    "STAGE5_MIN_PIXEL_BRIGHTNESS_FOR_AREA_CALC",
+    "STAGE5_GT_DEDUPE_DIST_PX",
     # helpers
     "list_videos",
 ]

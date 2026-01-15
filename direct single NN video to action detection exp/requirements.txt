@@ -1,0 +1,10 @@
+# Core
+torch
+numpy
+
+# Video I/O
+opencv-python
+
+# Optional (nice-to-have)
+tqdm
+
