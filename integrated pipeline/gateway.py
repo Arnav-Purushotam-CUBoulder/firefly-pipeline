@@ -43,6 +43,15 @@ DRY_RUN: bool = False
 # Max videos to process concurrently (each video runs in its own subprocess).
 MAX_CONCURRENT_VIDEOS: int = 2
 
+# Optional model overrides (passed into the pipelines; only applied when set).
+# - For day pipeline: overrides params.PATCH_MODEL_PATH (+ STAGE5_MODEL_PATH for FN scoring).
+# - For night pipeline: overrides pipeline_params.CNN_MODEL_PATH (+ STAGE9_MODEL_PATH).
+DAY_PATCH_MODEL_PATH: str | Path = ""
+NIGHT_CNN_MODEL_PATH: str | Path = ""
+
+# If True, force pipeline validation/test stages on (Stage5+ for day, Stage9+ for night).
+FORCE_TESTS: bool = False
+
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
 
@@ -127,12 +136,21 @@ def _start_subprocess_python(code: str, *, cwd: Path) -> subprocess.Popen:
     return subprocess.Popen([sys.executable, "-c", code], cwd=str(cwd))
 
 
-def _day_pipeline_code(video_path: Path, *, output_root: Path | None, force_no_cleanup: bool) -> str:
+def _day_pipeline_code(
+    video_path: Path,
+    *,
+    output_root: Path | None,
+    patch_model_path: Path | None,
+    force_tests: bool,
+    force_no_cleanup: bool,
+) -> str:
     return "\n".join(
         [
             "from pathlib import Path",
             "import params",
             f"output_root = Path({repr(str(output_root))}).expanduser().resolve() if {output_root is not None} else None",
+            f"patch_model_path = Path({repr(str(patch_model_path))}).expanduser().resolve() if {patch_model_path is not None} else None",
+            f"force_tests = {bool(force_tests)}",
             f"force_no_cleanup = {bool(force_no_cleanup)}",
             f"force_all_frames = {bool(FORCE_ALL_FRAMES)}",
             f"force_start_from_0 = {bool(FORCE_START_FROM_FRAME_0)}",
@@ -151,6 +169,10 @@ def _day_pipeline_code(video_path: Path, *, output_root: Path | None, force_no_c
             "    params.STAGE8_DIR = root / 'stage8 fp analysis'",
             "    params.STAGE9_DIR = root / 'stage9 detection summary'",
             "    params.GT_CSV_DIR = root / 'ground truth'",
+            "if patch_model_path is not None:",
+            "    params.PATCH_MODEL_PATH = patch_model_path",
+            "    if hasattr(params, 'STAGE5_MODEL_PATH'):",
+            "        params.STAGE5_MODEL_PATH = patch_model_path",
             "if force_all_frames:",
             "    params.MAX_FRAMES = None",
             "if force_start_from_0:",
@@ -162,6 +184,13 @@ def _day_pipeline_code(video_path: Path, *, output_root: Path | None, force_no_c
             "    ):",
             "        if hasattr(params, _name):",
             "            setattr(params, _name, 0)",
+            "if force_tests:",
+            "    for _name in (",
+            "        'RUN_STAGE5_VALIDATE','RUN_STAGE6_OVERLAY','RUN_STAGE7_FN_ANALYSIS',",
+            "        'RUN_STAGE8_FP_ANALYSIS','RUN_STAGE9_DETECTION_SUMMARY'",
+            "    ):",
+            "        if hasattr(params, _name):",
+            "            setattr(params, _name, True)",
             "if force_no_cleanup:",
             "    params.RUN_PRE_RUN_CLEANUP = False",
             "import orchestrator",
@@ -179,12 +208,21 @@ def _day_pipeline_code(video_path: Path, *, output_root: Path | None, force_no_c
     )
 
 
-def _night_pipeline_code(video_path: Path, *, output_root: Path | None, force_no_cleanup: bool) -> str:
+def _night_pipeline_code(
+    video_path: Path,
+    *,
+    output_root: Path | None,
+    cnn_model_path: Path | None,
+    force_tests: bool,
+    force_no_cleanup: bool,
+) -> str:
     return "\n".join(
         [
             "from pathlib import Path",
             "import pipeline_params as pp",
             f"output_root = Path({repr(str(output_root))}).expanduser().resolve() if {output_root is not None} else None",
+            f"cnn_model_path = Path({repr(str(cnn_model_path))}).expanduser().resolve() if {cnn_model_path is not None} else None",
+            f"force_tests = {bool(force_tests)}",
             f"force_no_cleanup = {bool(force_no_cleanup)}",
             f"force_all_frames = {bool(FORCE_ALL_FRAMES)}",
             f"force_start_from_0 = {bool(FORCE_START_FROM_FRAME_0)}",
@@ -203,6 +241,10 @@ def _night_pipeline_code(video_path: Path, *, output_root: Path | None, force_no
             "    pp.DIR_STAGE10_OUT = root / 'stage10 overlay videos'",
             "    pp.DIR_STAGE8_9_OUT = root / 'stage8.9 gt centroid crops'",
             "    pp.GT_CSV_PATH = root / 'ground truth' / 'gt.csv'",
+            "if cnn_model_path is not None:",
+            "    pp.CNN_MODEL_PATH = cnn_model_path",
+            "    if hasattr(pp, 'STAGE9_MODEL_PATH'):",
+            "        pp.STAGE9_MODEL_PATH = cnn_model_path",
             "if force_all_frames:",
             "    pp.MAX_FRAMES = None",
             "if force_start_from_0:",
@@ -214,6 +256,12 @@ def _night_pipeline_code(video_path: Path, *, output_root: Path | None, force_no
             "    ):",
             "        if hasattr(pp, _name):",
             "            setattr(pp, _name, 0)",
+            "if force_tests:",
+            "    for _name in (",
+            "        'RUN_STAGE9','RUN_STAGE10','RUN_STAGE11','RUN_STAGE12','RUN_STAGE14'",
+            "    ):",
+            "        if hasattr(pp, _name):",
+            "            setattr(pp, _name, True)",
             "if force_no_cleanup:",
             "    pp.RUN_PRE_RUN_CLEANUP = False",
             "import orchestrator",
@@ -235,9 +283,17 @@ def _run_day_pipeline(
     *,
     pipeline: PipelinePaths,
     output_root: Path | None,
+    patch_model_path: Path | None,
+    force_tests: bool,
     force_no_cleanup: bool,
 ) -> int:
-    code = _day_pipeline_code(video_path, output_root=output_root, force_no_cleanup=force_no_cleanup)
+    code = _day_pipeline_code(
+        video_path,
+        output_root=output_root,
+        patch_model_path=patch_model_path,
+        force_tests=force_tests,
+        force_no_cleanup=force_no_cleanup,
+    )
     return _run_subprocess_python(code, cwd=pipeline.day_dir)
 
 
@@ -246,9 +302,17 @@ def _run_night_pipeline(
     *,
     pipeline: PipelinePaths,
     output_root: Path | None,
+    cnn_model_path: Path | None,
+    force_tests: bool,
     force_no_cleanup: bool,
 ) -> int:
-    code = _night_pipeline_code(video_path, output_root=output_root, force_no_cleanup=force_no_cleanup)
+    code = _night_pipeline_code(
+        video_path,
+        output_root=output_root,
+        cnn_model_path=cnn_model_path,
+        force_tests=force_tests,
+        force_no_cleanup=force_no_cleanup,
+    )
     return _run_subprocess_python(code, cwd=pipeline.night_dir)
 
 
@@ -257,9 +321,17 @@ def _start_day_pipeline(
     *,
     pipeline: PipelinePaths,
     output_root: Path | None,
+    patch_model_path: Path | None,
+    force_tests: bool,
     force_no_cleanup: bool,
 ) -> subprocess.Popen:
-    code = _day_pipeline_code(video_path, output_root=output_root, force_no_cleanup=force_no_cleanup)
+    code = _day_pipeline_code(
+        video_path,
+        output_root=output_root,
+        patch_model_path=patch_model_path,
+        force_tests=force_tests,
+        force_no_cleanup=force_no_cleanup,
+    )
     return _start_subprocess_python(code, cwd=pipeline.day_dir)
 
 
@@ -268,9 +340,17 @@ def _start_night_pipeline(
     *,
     pipeline: PipelinePaths,
     output_root: Path | None,
+    cnn_model_path: Path | None,
+    force_tests: bool,
     force_no_cleanup: bool,
 ) -> subprocess.Popen:
-    code = _night_pipeline_code(video_path, output_root=output_root, force_no_cleanup=force_no_cleanup)
+    code = _night_pipeline_code(
+        video_path,
+        output_root=output_root,
+        cnn_model_path=cnn_model_path,
+        force_tests=force_tests,
+        force_no_cleanup=force_no_cleanup,
+    )
     return _start_subprocess_python(code, cwd=pipeline.night_dir)
 
 
@@ -285,6 +365,24 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--threshold", type=float, default=float(BRIGHTNESS_THRESHOLD), help="Brightness threshold (0–255).")
     p.add_argument("--frames", type=int, default=int(BRIGHTNESS_NUM_FRAMES), help="Frames to sample for brightness.")
+    p.add_argument(
+        "--day-patch-model",
+        type=str,
+        default=str(DAY_PATCH_MODEL_PATH) if DAY_PATCH_MODEL_PATH else "",
+        help="Override day pipeline patch model (.pt) path.",
+    )
+    p.add_argument(
+        "--night-cnn-model",
+        type=str,
+        default=str(NIGHT_CNN_MODEL_PATH) if NIGHT_CNN_MODEL_PATH else "",
+        help="Override night pipeline CNN model (.pt) path.",
+    )
+    p.add_argument(
+        "--force-tests",
+        action="store_true",
+        default=bool(FORCE_TESTS),
+        help="Force pipeline validation/test stages on.",
+    )
     p.add_argument(
         "--max-concurrent",
         type=int,
@@ -346,6 +444,20 @@ def main() -> int:
     if not bool(args.dry_run) and max_concurrent > 1:
         print(f"[gateway] Max concurrent videos: {max_concurrent}")
 
+    day_patch_model: Path | None = None
+    if getattr(args, "day_patch_model", ""):
+        day_patch_model = Path(str(args.day_patch_model)).expanduser().resolve()
+        if not day_patch_model.exists():
+            raise SystemExit(f"--day-patch-model not found: {day_patch_model}")
+
+    night_cnn_model: Path | None = None
+    if getattr(args, "night_cnn_model", ""):
+        night_cnn_model = Path(str(args.night_cnn_model)).expanduser().resolve()
+        if not night_cnn_model.exists():
+            raise SystemExit(f"--night-cnn-model not found: {night_cnn_model}")
+
+    force_tests = bool(getattr(args, "force_tests", False))
+
     try:
         for video in videos:
             try:
@@ -372,6 +484,8 @@ def main() -> int:
                         video,
                         pipeline=pipeline,
                         output_root=night_root,
+                        cnn_model_path=night_cnn_model,
+                        force_tests=force_tests,
                         force_no_cleanup=force_no_cleanup,
                     )
                     night_cleanup_done = True
@@ -382,6 +496,8 @@ def main() -> int:
                         video,
                         pipeline=pipeline,
                         output_root=day_root,
+                        patch_model_path=day_patch_model,
+                        force_tests=force_tests,
                         force_no_cleanup=force_no_cleanup,
                     )
                     day_cleanup_done = True

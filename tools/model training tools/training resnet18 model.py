@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 Firefly/background 10×10 CNN — now with a selectable ResNet backbone.
 Everything else (data handling, loss, sampler, live training chart, checkpoints)
@@ -15,11 +17,13 @@ NUM_WORKERS = 2
 RESNET_MODEL   = 'resnet18'
 # ────────────────────────────────────────────────────────────────
 
-import sys, os, time, math, random
+import argparse
+import json
+import os
+import random
+import sys
+import time
 from pathlib import Path
-import matplotlib; matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
-import tkinter as tk
 import torch, torch.nn as nn, torch.optim as optim
 import torch.multiprocessing as mp
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -51,13 +55,68 @@ def build_resnet(name: str, num_classes: int = 2) -> nn.Module:
     return net
 
 # ── main (spawn-safe for macOS) ────────────────────────────────
-def main():
-    global DATA_DIR
-    if DATA_DIR is None:
+def main(argv: list[str] | None = None):
+    ap = argparse.ArgumentParser(description="Train a firefly/background ResNet classifier.")
+    ap.add_argument("--data-dir", type=str, default=str(DATA_DIR) if DATA_DIR else "", help="Path to 'final dataset'.")
+    ap.add_argument(
+        "--best-model-path",
+        type=str,
+        default=str(BEST_MODEL_PATH) if BEST_MODEL_PATH else "",
+        help="Where to save the best checkpoint (.pt).",
+    )
+    ap.add_argument("--epochs", type=int, default=int(EPOCHS), help="Number of epochs.")
+    ap.add_argument("--batch-size", type=int, default=int(BATCH_SIZE), help="Batch size.")
+    ap.add_argument("--lr", type=float, default=float(LR), help="Learning rate.")
+    ap.add_argument("--num-workers", type=int, default=int(NUM_WORKERS), help="DataLoader workers.")
+    ap.add_argument(
+        "--resnet",
+        type=str,
+        default=str(RESNET_MODEL),
+        choices=["resnet18", "resnet34", "resnet50", "resnet101", "resnet152"],
+        help="ResNet backbone.",
+    )
+    ap.add_argument("--seed", type=int, default=1337, help="Random seed.")
+    ap.add_argument("--no-gui", action="store_true", help="Disable live plotting / GUI (headless mode).")
+    ap.add_argument("--metrics-out", type=str, default="", help="Optional JSON file to write summary metrics.")
+    args = ap.parse_args(argv)
+
+    data_dir = str(args.data_dir or "").strip()
+    if not data_dir:
+        if args.no_gui:
+            raise SystemExit("--data-dir is required when --no-gui is set")
+        import tkinter as tk  # local import
+        from tkinter import filedialog  # local import
+
         tk.Tk().withdraw()
-        DATA_DIR = tk.filedialog.askdirectory(title="Select dataset_split folder")
-        if not DATA_DIR: sys.exit("No dataset folder selected – exiting.")
-    print(f"Dataset root: {DATA_DIR}")
+        data_dir = filedialog.askdirectory(title="Select dataset_split folder")
+        if not data_dir:
+            raise SystemExit("No dataset folder selected – exiting.")
+
+    data_dir = str(Path(data_dir).expanduser().resolve())
+    best_model_path = str(Path(args.best_model_path).expanduser().resolve()) if args.best_model_path else ""
+    if not best_model_path:
+        raise SystemExit("--best-model-path is required")
+
+    epochs = int(args.epochs)
+    batch_size = int(args.batch_size)
+    lr = float(args.lr)
+    num_workers = int(args.num_workers)
+    resnet_model = str(args.resnet)
+    seed = int(args.seed)
+
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    plt = None
+    if not args.no_gui:
+        import matplotlib  # local import
+
+        matplotlib.use("TkAgg")
+        import matplotlib.pyplot as plt  # type: ignore[no-redef]
+
+    print(f"Dataset root: {data_dir}")
 
     DEVICE = ("mps" if torch.backends.mps.is_available()
               else "cuda" if torch.cuda.is_available() else "cpu")
@@ -77,9 +136,9 @@ def main():
     ])
 
     # ─ datasets
-    train_ds = datasets.ImageFolder(os.path.join(DATA_DIR, "train"), train_tfm)
-    val_ds   = datasets.ImageFolder(os.path.join(DATA_DIR, "val"),   plain_tfm)
-    test_ds  = datasets.ImageFolder(os.path.join(DATA_DIR, "test"),  plain_tfm)
+    train_ds = datasets.ImageFolder(os.path.join(data_dir, "train"), train_tfm)
+    val_ds   = datasets.ImageFolder(os.path.join(data_dir, "val"),   plain_tfm)
+    test_ds  = datasets.ImageFolder(os.path.join(data_dir, "test"),  plain_tfm)
 
     # ─ handle class imbalance
     counts = Counter(train_ds.targets)
@@ -93,30 +152,31 @@ def main():
                                     replacement=True)
 
     # ─ loaders
-    train_dl = DataLoader(train_ds, BATCH_SIZE, sampler=sampler,
-                          num_workers=NUM_WORKERS, pin_memory=True)
-    val_dl   = DataLoader(val_ds,   BATCH_SIZE, shuffle=False,
-                          num_workers=NUM_WORKERS, pin_memory=True)
-    test_dl  = DataLoader(test_ds,  BATCH_SIZE, shuffle=False,
-                          num_workers=NUM_WORKERS, pin_memory=True)
+    train_dl = DataLoader(train_ds, batch_size, sampler=sampler, num_workers=num_workers, pin_memory=True)
+    val_dl   = DataLoader(val_ds,   batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    test_dl  = DataLoader(test_ds,  batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
     # ─ model / loss / optimiser
-    model = build_resnet(RESNET_MODEL).to(DEVICE)
+    model = build_resnet(resnet_model).to(DEVICE)
     criterion = nn.CrossEntropyLoss(weight=class_weights.to(DEVICE))
-    optimizer = optim.AdamW(model.parameters(), lr=LR)
-    Path(BEST_MODEL_PATH).expanduser().parent.mkdir(parents=True, exist_ok=True)
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    Path(best_model_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
     best_val_acc = -1.0
+    best_epoch = -1
 
     # ─ live plot
-    plt.ion()
-    fig, ax = plt.subplots(figsize=(6,4))
-    ax.set_xlabel("Epoch"); ax.set_ylabel("Value")
-    ln_tr, = ax.plot([], [], label="train loss")
-    ln_val, = ax.plot([], [], label="val loss")
-    ln_acc, = ax.plot([], [], label="val acc")
-    ax.legend()
+    if plt is not None:
+        plt.ion()
+        fig, ax = plt.subplots(figsize=(6,4))
+        ax.set_xlabel("Epoch"); ax.set_ylabel("Value")
+        ln_tr, = ax.plot([], [], label="train loss")
+        ln_val, = ax.plot([], [], label="val loss")
+        ln_acc, = ax.plot([], [], label="val acc")
+        ax.legend()
 
     def update_plot(ep, tr, vl, acc, eta):
+        if plt is None:
+            return
         for ln, y in zip((ln_tr, ln_val, ln_acc), (tr, vl, acc)):
             ln.set_data(list(ln.get_xdata())+[ep], list(ln.get_ydata())+[y])
         ax.relim(); ax.autoscale_view()
@@ -141,30 +201,31 @@ def main():
 
     # ─ training loop
     start, ep_times = time.time(), []
-    for ep in range(1, EPOCHS+1):
+    for ep in range(1, epochs + 1):
         t0 = time.time()
         tr_loss, _        = run_epoch(train_dl, True,  f"train {ep:02d}")
         val_loss, val_acc = run_epoch(val_dl,   False, f"val   {ep:02d}")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
+            best_epoch = ep
             torch.save({'epoch': ep,
                         'model': model.state_dict(),
                         'optimizer': optimizer.state_dict(),
                         'val_acc': val_acc},
-                       BEST_MODEL_PATH)
-            print(f"  ✅ saved new best (val_acc={val_acc:.2%}) → {BEST_MODEL_PATH}")
+                       best_model_path)
+            print(f"  ✅ saved new best (val_acc={val_acc:.2%}) → {best_model_path}")
 
         ep_times.append(time.time()-t0)
-        eta = time.strftime("%H:%M:%S", time.gmtime(sum(ep_times)/len(ep_times)*(EPOCHS-ep)))
+        eta = time.strftime("%H:%M:%S", time.gmtime(sum(ep_times)/len(ep_times)*(epochs-ep)))
         print(f"Epoch {ep:02d} | train_loss {tr_loss:.4f} | "
               f"val_loss {val_loss:.4f} | val_acc {val_acc:.2%} | "
               f"epoch {time.strftime('%H:%M:%S', time.gmtime(ep_times[-1]))} | ETA {eta}")
         update_plot(ep, tr_loss, val_loss, val_acc, eta)
 
     # ─ reload best & evaluate on TEST ───────────────────────────
-    ckpt = torch.load(BEST_MODEL_PATH, map_location=DEVICE)
-    best_model = build_resnet(RESNET_MODEL).to(DEVICE); best_model.load_state_dict(ckpt['model'])
+    ckpt = torch.load(best_model_path, map_location=DEVICE)
+    best_model = build_resnet(resnet_model).to(DEVICE); best_model.load_state_dict(ckpt['model'])
     best_model.eval()
     test_loss = corr = tot = 0
     with torch.no_grad():
@@ -172,10 +233,39 @@ def main():
             x, y = x.to(DEVICE), y.to(DEVICE)
             out = best_model(x); test_loss += criterion(out, y).item()*x.size(0)
             corr += (out.argmax(1)==y).sum().item(); tot += x.size(0)
-    print(f"\nBest checkpoint epoch {ckpt['epoch']} (val_acc={ckpt['val_acc']:.2%})")
-    print(f"TEST | loss {test_loss/tot:.4f} | acc {corr/tot:.2%}")
+    test_loss = (test_loss / tot) if tot else float("nan")
+    test_acc = (corr / tot) if tot else float("nan")
+    print(f"\nBest checkpoint epoch {ckpt.get('epoch', best_epoch)} (val_acc={ckpt.get('val_acc', best_val_acc):.2%})")
+    print(f"TEST | loss {test_loss:.4f} | acc {test_acc:.2%}")
     print(f"Total time: {time.strftime('%H:%M:%S', time.gmtime(time.time()-start))}")
-    plt.ioff(); plt.show()
+
+    metrics = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "data_dir": data_dir,
+        "best_model_path": best_model_path,
+        "resnet_model": resnet_model,
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "lr": lr,
+        "num_workers": num_workers,
+        "seed": seed,
+        "best_epoch": int(ckpt.get("epoch", best_epoch)),
+        "best_val_acc": float(ckpt.get("val_acc", best_val_acc)),
+        "test_loss": float(test_loss),
+        "test_acc": float(test_acc),
+    }
+
+    if args.metrics_out:
+        outp = Path(args.metrics_out).expanduser().resolve()
+        outp.parent.mkdir(parents=True, exist_ok=True)
+        outp.write_text(json.dumps(metrics, indent=2))
+        print(f"[metrics] Wrote: {outp}")
+
+    if plt is not None:
+        plt.ioff()
+        plt.show()
+
+    return metrics
 
 # ── entry-point ────────────────────────────────────────────────
 if __name__ == "__main__":
