@@ -4,8 +4,9 @@ Species scaler
 ==============
 
 Ingest a new annotator CSV batch and automatically:
-  1) Split rows into a TRAIN portion and a FINAL-VALIDATION portion.
-  2) Extract TRAIN patches from the input video.
+  1) Split FIREFLY rows into TRAIN vs FINAL-VALIDATION (pipeline-heldout).
+     Background rows are TRAIN-only (no pipeline validation).
+  2) Extract TRAIN patches from the input video (firefly + background).
   3) Version + merge the TRAIN data into:
        - Integrated_prototype_datasets/single species datasets/<species>/vN_DATE/...
        - Integrated_prototype_datasets/integrated pipeline datasets/vN_DATE/...
@@ -16,8 +17,10 @@ Ingest a new annotator CSV batch and automatically:
 
 Annotator batch expectations
 ----------------------------
-- Filename encodes: <video_name>_<species_name>_(day_time|night_time).csv
-  (hyphen/underscore/parentheses around day_time|night_time are tolerated)
+- Filename encodes (preferred):
+    <video_name>_<species_name>_<day_time|night_time>_<firefly|background>.csv
+  Back-compat:
+    <video_name>_<species_name>_<day_time|night_time>.csv   (treated as firefly)
 - CSV columns: x,y,w,h,t  (or x,y,w,h,frame)
   where t/frame is a 0-based frame index into the input video.
 """
@@ -48,14 +51,21 @@ else:
 # USER CONFIG (edit these)
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Incoming annotator CSV + corresponding input video
-ANNOTATIONS_CSV_PATH: Path = Path("/Users/arnavps/Desktop/20240606_cam1_GS010064_pyrallisGoPro_day_time.csv")
+# Incoming annotator CSV + corresponding input video.
+# Preferred naming:
+#   <video_name>_<species_name>_<day_time|night_time>_<firefly|background>.csv
+ANNOTATIONS_CSV_PATH: Path = Path("/Users/arnavps/Desktop/20240606_cam1_GS010064_pyrallisGoPro_day_time_firefly.csv")
 VIDEO_PATH: Path = Path('/Users/arnavps/Desktop/RA inference data/v3 daytime pipeline inference data/20240606_cam1_GS010064/original videos/20240606_cam1_GS010064.mp4')
 
 # 0..1: fraction of rows from the incoming CSV to use for TRAIN data.
 # Remaining rows go to FINAL-VALIDATION (CSV-only; never used for training).
 TRAIN_FRACTION_OF_BATCH: float = 0.80
 TRAIN_VAL_SPLIT_SEED: int = 1337
+
+# If True, and you pass e.g. "..._firefly.csv", the script will also look for
+# "..._background.csv" in the same folder and ingest it in the same run (and
+# vice-versa). This avoids creating two dataset versions for one batch.
+AUTO_LOAD_SIBLING_CLASS_CSV: bool = True
 
 # Where to export this run’s intermediate artifacts (train patches + split CSVs)
 # Set this to the *single* root folder that contains:
@@ -92,6 +102,8 @@ SKIP_EXISTING_PATCHES: bool = True
 PATCH_IMAGE_EXT: str = ".png"
 PATCH_LOCATIONS_CSV_NAME: str = "patch_locations.csv"
 PATCH_LOCATIONS_SPLIT_PREFIX: str = "patch_locations_"  # e.g. patch_locations_train.csv
+PATCH_LOCATIONS_BACKGROUND_CSV_NAME: str = "patch_locations_background.csv"
+PATCH_LOCATIONS_BACKGROUND_SPLIT_PREFIX: str = "patch_locations_background_"  # e.g. patch_locations_background_train.csv
 VALIDATION_CSV_NAME: str = "annotations.csv"
 
 
@@ -150,33 +162,51 @@ def _count_images(d: Path) -> int:
     return sum(1 for _ in _iter_image_files(d))
 
 
-def _parse_batch_identity(csv_path: Path) -> Tuple[str, str, str]:
+def _parse_batch_identity(csv_path: Path) -> Tuple[str, str, str, str]:
     """
-    Return (video_name, species_name, time_of_day) from the CSV filename.
+    Return (video_name, species_name, time_of_day, class_label) from CSV filename.
 
-    Accepted endings:
-      - *_day_time(.csv), *_night_time(.csv)
-      - *-day_time, *-night_time
-      - *(day_time), *(night_time)
+    Preferred naming (recommended):
+      <video_name>_<species_name>_<day_time|night_time>_<firefly|background>.csv
+
+    Back-compat (treated as firefly):
+      <video_name>_<species_name>_<day_time|night_time>.csv
     """
-    stem = csv_path.stem
-    m = re.match(r"^(?P<base>.+?)[_-]?\(?(?P<tod>day_time|night_time)\)?$", stem)
-    if not m:
+    stem = csv_path.stem.strip()
+    # tolerate mild variations
+    stem = stem.replace("-", "_").replace("(", "_").replace(")", "_")
+    stem = re.sub(r"_+", "_", stem).strip("_")
+
+    parts = [p for p in stem.split("_") if p]
+    if len(parts) < 4:
+        raise ValueError(
+            f"Could not parse identity from CSV name {csv_path.name!r}. "
+            "Expected <video_name>_<species_name>_<day_time|night_time>_<firefly|background>."
+        )
+
+    label = parts[-1].lower()
+    if label in {CLASS_FIREFLY, CLASS_BACKGROUND}:
+        parts = parts[:-1]
+    else:
+        # old convention: no explicit label => assume firefly
+        label = CLASS_FIREFLY
+
+    if len(parts) < 3 or parts[-1].lower() != "time" or parts[-2].lower() not in {"day", "night"}:
         raise ValueError(
             f"Could not parse time_of_day from CSV name {csv_path.name!r}. "
-            "Expected suffix day_time|night_time."
+            "Expected ..._day_time_... or ..._night_time_...."
         )
-    base = m.group("base")
-    time_of_day = m.group("tod")
-    parts = [p for p in base.split("_") if p]
-    if len(parts) < 2:
+    time_of_day = f"{parts[-2].lower()}_time"
+
+    base = parts[:-2]  # everything before day_time|night_time tokens
+    if len(base) < 2:
         raise ValueError(
             f"Could not parse video/species from CSV name {csv_path.name!r}. "
-            "Expected <video_name>_<species_name>_<day_time|night_time>."
+            "Expected <video_name>_<species_name>_..."
         )
-    species_name = parts[-1]
-    video_name = "_".join(parts[:-1])
-    return _safe_name(video_name), _safe_name(species_name), time_of_day
+    species_name = base[-1]
+    video_name = "_".join(base[:-1])
+    return _safe_name(video_name), _safe_name(species_name), time_of_day, label
 
 
 def _read_annotator_csv(csv_path: Path) -> List[Annotation]:
@@ -542,30 +572,40 @@ def _collect_train_stats(train_root: Path) -> Dict[str, Dict[str, int]]:
     integrated_root = train_root / INTEGRATED_PIPELINE_DATASETS_DIRNAME
     single_root = train_root / SINGLE_SPECIES_DATASETS_DIRNAME
 
-    stats: Dict[str, Dict[str, int]] = {"single_species": {}, "integrated": {}}
+    stats: Dict[str, Dict[str, int]] = {
+        "single_species_firefly": {},
+        "single_species_background": {},
+        "integrated_firefly": {},
+        "integrated_background": {},
+    }
 
-    # single-species: count images in latest version initial/firefly per species
+    # single-species: count images in latest version initial/{firefly,background} per species
     if single_root.exists():
         for species_dir in sorted([p for p in single_root.iterdir() if p.is_dir()]):
             latest = _latest_version_dir(species_dir)
             if not latest:
                 continue
             firefly_dir = latest / INITIAL_DATASET_DIRNAME / CLASS_FIREFLY
-            stats["single_species"][species_dir.name] = _count_images(firefly_dir)
+            background_dir = latest / INITIAL_DATASET_DIRNAME / CLASS_BACKGROUND
+            stats["single_species_firefly"][species_dir.name] = _count_images(firefly_dir)
+            stats["single_species_background"][species_dir.name] = _count_images(background_dir)
 
-    # integrated: count images by parsing filenames in latest version initial/firefly across day+night
+    # integrated: count images by parsing filenames in latest version initial/{firefly,background} across day+night
     latest_int = _latest_version_dir(integrated_root)
     if latest_int:
-        counts: Dict[str, int] = {}
+        counts_ff: Dict[str, int] = {}
+        counts_bg: Dict[str, int] = {}
         for tod_dir in (DAY_DATASET_DIRNAME, NIGHT_DATASET_DIRNAME):
-            firefly_dir = latest_int / tod_dir / INITIAL_DATASET_DIRNAME / CLASS_FIREFLY
-            for img in _iter_image_files(firefly_dir):
-                meta = _parse_patch_filename(img)
-                if not meta:
-                    continue
-                _, _, _, _, _, _, species_name = meta
-                counts[species_name] = counts.get(species_name, 0) + 1
-        stats["integrated"] = dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+            for cls, counts in ((CLASS_FIREFLY, counts_ff), (CLASS_BACKGROUND, counts_bg)):
+                cls_dir = latest_int / tod_dir / INITIAL_DATASET_DIRNAME / cls
+                for img in _iter_image_files(cls_dir):
+                    meta = _parse_patch_filename(img)
+                    if not meta:
+                        continue
+                    _, _, _, _, _, _, sp = meta
+                    counts[sp] = counts.get(sp, 0) + 1
+        stats["integrated_firefly"] = dict(sorted(counts_ff.items(), key=lambda kv: (-kv[1], kv[0])))
+        stats["integrated_background"] = dict(sorted(counts_bg.items(), key=lambda kv: (-kv[1], kv[0])))
 
     return stats
 
@@ -609,8 +649,23 @@ def main() -> None:
     csv_path = Path(ANNOTATIONS_CSV_PATH).expanduser()
     video_path = Path(VIDEO_PATH).expanduser()
 
-    video_name, species_name, time_of_day = _parse_batch_identity(csv_path)
+    video_name, species_name, time_of_day, primary_label = _parse_batch_identity(csv_path)
     dataset_time_dirname = DAY_DATASET_DIRNAME if time_of_day == "day_time" else NIGHT_DATASET_DIRNAME
+
+    csv_paths: Dict[str, Path] = {primary_label: csv_path}
+    if AUTO_LOAD_SIBLING_CLASS_CSV:
+        other = CLASS_BACKGROUND if primary_label == CLASS_FIREFLY else CLASS_FIREFLY
+        cand = csv_path.with_name(f"{video_name}_{species_name}_{time_of_day}_{other}{csv_path.suffix}")
+        if cand.exists():
+            try:
+                v2, s2, t2, l2 = _parse_batch_identity(cand)
+            except Exception as e:
+                print(f"[warn] Skipping sibling CSV {cand.name!r}: {e}")
+            else:
+                if (v2, s2, t2, l2) == (video_name, species_name, time_of_day, other):
+                    csv_paths[other] = cand
+                else:
+                    print(f"[warn] Skipping sibling CSV {cand.name!r}: identity mismatch")
 
     integrated_root, single_root = _ensure_train_root_scaffold(TRAIN_DATASETS_ROOT)
 
@@ -620,52 +675,87 @@ def main() -> None:
     _print_stats("TRAIN stats (before)", train_before)
     _print_stats("VALIDATION stats (before)", val_before)
 
-    # ── read + split incoming annotations ──
-    anns = _read_annotator_csv(csv_path)
-    if not anns:
-        print(f"No valid rows found in {csv_path}; nothing to do.")
+    # ── read + split incoming annotations (firefly/background) ──
+    anns_by_label: Dict[str, List[Annotation]] = {}
+    for lbl, p in csv_paths.items():
+        anns = _read_annotator_csv(p)
+        anns_by_label[lbl] = anns
+
+    if not any(anns_by_label.values()):
+        print(f"No valid rows found in: {', '.join(str(p) for p in csv_paths.values())}; nothing to do.")
         return
 
-    train_anns, val_anns = _split_annotations(anns, TRAIN_FRACTION_OF_BATCH, TRAIN_VAL_SPLIT_SEED)
+    train_anns_by_label: Dict[str, List[Annotation]] = {}
+    final_validation_firefly: List[Annotation] = []
+
+    for lbl, anns in anns_by_label.items():
+        if lbl == CLASS_FIREFLY:
+            tr, fv = _split_annotations(anns, TRAIN_FRACTION_OF_BATCH, TRAIN_VAL_SPLIT_SEED)
+            train_anns_by_label[lbl] = tr
+            final_validation_firefly = fv
+        else:
+            # Background batches are training-only (no pipeline final validation)
+            train_anns_by_label[lbl] = list(anns)
 
     # ── export this run’s split CSVs + train patches ──
     run_tag = _today_tag() + "__" + datetime.now().strftime("%H%M%S")
-    export_dir = BATCH_EXPORT_ROOT / f"{_safe_name(csv_path.stem)}__{run_tag}"
-    export_train_csv = export_dir / "train_annotations.csv"
-    export_val_csv = export_dir / "final_validation_annotations.csv"
-    export_patches_dir = export_dir / "train_patches"
+    batch_tag = _safe_name(f"{video_name}_{species_name}_{time_of_day}")
+    export_dir = BATCH_EXPORT_ROOT / f"{batch_tag}__{run_tag}"
+    export_patches_root = export_dir / "train_patches"
 
     export_dir.mkdir(parents=True, exist_ok=True)
-    _write_csv_rows(
-        export_train_csv,
-        ["x", "y", "w", "h", "t"],
-        [{"x": a.x, "y": a.y, "w": a.w, "h": a.h, "t": a.t} for a in train_anns],
-    )
-    _write_csv_rows(
-        export_val_csv,
-        ["x", "y", "w", "h", "t"],
-        [{"x": a.x, "y": a.y, "w": a.w, "h": a.h, "t": a.t} for a in val_anns],
+
+    if CLASS_FIREFLY in anns_by_label:
+        _write_csv_rows(
+            export_dir / "train_annotations_firefly.csv",
+            ["x", "y", "w", "h", "t"],
+            [{"x": a.x, "y": a.y, "w": a.w, "h": a.h, "t": a.t} for a in train_anns_by_label.get(CLASS_FIREFLY, [])],
+        )
+        _write_csv_rows(
+            export_dir / "final_validation_annotations_firefly.csv",
+            ["x", "y", "w", "h", "t"],
+            [{"x": a.x, "y": a.y, "w": a.w, "h": a.h, "t": a.t} for a in final_validation_firefly],
+        )
+
+    if CLASS_BACKGROUND in anns_by_label:
+        _write_csv_rows(
+            export_dir / "train_annotations_background.csv",
+            ["x", "y", "w", "h", "t"],
+            [{"x": a.x, "y": a.y, "w": a.w, "h": a.h, "t": a.t} for a in train_anns_by_label.get(CLASS_BACKGROUND, [])],
+        )
+
+    n_in_firefly = len(anns_by_label.get(CLASS_FIREFLY, []))
+    n_in_bg = len(anns_by_label.get(CLASS_BACKGROUND, []))
+    print(
+        f"\nIncoming rows: firefly={n_in_firefly}, background={n_in_bg} | "
+        f"train_firefly={len(train_anns_by_label.get(CLASS_FIREFLY, []))}, "
+        f"train_background={len(train_anns_by_label.get(CLASS_BACKGROUND, []))}, "
+        f"final_validation_firefly={len(final_validation_firefly)}"
     )
 
-    print(f"\nIncoming rows: {len(anns)} (train={len(train_anns)}, final_validation={len(val_anns)})")
-    if train_anns:
-        print(f"Extracting {len(train_anns)} TRAIN patches → {export_patches_dir}")
-        saved = _extract_patches_from_video(
+    # Patch extraction
+    saved_by_label: Dict[str, int] = {}
+    for lbl, tr_anns in train_anns_by_label.items():
+        if not tr_anns:
+            continue
+        out_dir = export_patches_root / lbl
+        print(f"Extracting {len(tr_anns)} {lbl.upper()} TRAIN patches → {out_dir}")
+        saved_by_label[lbl] = _extract_patches_from_video(
             video_path=video_path,
-            anns=train_anns,
-            out_dir=export_patches_dir,
+            anns=tr_anns,
+            out_dir=out_dir,
             video_name=video_name,
             species_name=species_name,
         )
-        print(f"Saved {saved} patches.")
-    else:
-        print("No TRAIN rows after split; skipping patch extraction + TRAIN dataset updates.")
+        print(f"Saved {saved_by_label[lbl]} {lbl} patches.")
+
+    has_train_data = any(train_anns_by_label.get(lbl) for lbl in (CLASS_FIREFLY, CLASS_BACKGROUND))
 
     # ────────────────────────────────────────────────────────────────────
     # TRAIN DATASETS (patches + patch_locations.csv + final split)
     # ────────────────────────────────────────────────────────────────────
 
-    if train_anns:
+    if has_train_data:
         # ---- single-species dataset update ----
         species_root = single_root / species_name
         new_species_ver, prev_species_ver = _next_version_dir(species_root)
@@ -678,43 +768,51 @@ def main() -> None:
 
         _ensure_time_dataset_scaffold(new_species_ver)
 
-        # Add new patches into initial/firefly
-        dst_firefly = new_species_ver / INITIAL_DATASET_DIRNAME / CLASS_FIREFLY
-        dst_firefly.mkdir(parents=True, exist_ok=True)
-        copied = 0
-        for p in sorted(_iter_image_files(export_patches_dir)):
-            out = dst_firefly / p.name
-            if out.exists() and SKIP_EXISTING_PATCHES:
+        # Add new patches into initial/{firefly,background}
+        for lbl in (CLASS_FIREFLY, CLASS_BACKGROUND):
+            src_dir = export_patches_root / lbl
+            if not src_dir.exists():
                 continue
-            if out.exists() and not SKIP_EXISTING_PATCHES:
-                # keep both
-                stem = out.stem
-                suffix = out.suffix
-                k = 1
-                while (dst_firefly / f"{stem}__dup{k}{suffix}").exists():
-                    k += 1
-                out = dst_firefly / f"{stem}__dup{k}{suffix}"
-            shutil.copy2(p, out)
-            copied += 1
-        print(f"[single] Added {copied} firefly patches → {dst_firefly}")
+            dst_dir = new_species_ver / INITIAL_DATASET_DIRNAME / lbl
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            copied = 0
+            for p in sorted(_iter_image_files(src_dir)):
+                out = dst_dir / p.name
+                if out.exists() and SKIP_EXISTING_PATCHES:
+                    continue
+                if out.exists() and not SKIP_EXISTING_PATCHES:
+                    stem = out.stem
+                    suffix = out.suffix
+                    k = 1
+                    while (dst_dir / f"{stem}__dup{k}{suffix}").exists():
+                        k += 1
+                    out = dst_dir / f"{stem}__dup{k}{suffix}"
+                shutil.copy2(p, out)
+                copied += 1
+            print(f"[single] Added {copied} {lbl} patches → {dst_dir}")
 
-        # Update patch_locations.csv for this version
-        species_csv = new_species_ver / PATCH_LOCATIONS_CSV_NAME
-        existing_rows, _ = _read_csv_rows(species_csv)
-        new_rows = [
-            {
-                "x": str(a.x),
-                "y": str(a.y),
-                "w": str(a.w),
-                "h": str(a.h),
-                "t": str(a.t),
-                "video_name": video_name,
-            }
-            for a in train_anns
-        ]
-        merged = _merge_csv_rows(existing_rows, new_rows, key_fields=["x", "y", "w", "h", "t", "video_name"])
-        _write_csv_rows(species_csv, ["x", "y", "w", "h", "t", "video_name"], merged)
-        print(f"[single] patch_locations.csv rows: {len(merged)}")
+        # Update patch_locations CSVs for this version (train rows only)
+        for lbl in (CLASS_FIREFLY, CLASS_BACKGROUND):
+            tr_anns = train_anns_by_label.get(lbl, [])
+            if not tr_anns:
+                continue
+            out_name = PATCH_LOCATIONS_CSV_NAME if lbl == CLASS_FIREFLY else PATCH_LOCATIONS_BACKGROUND_CSV_NAME
+            out_csv = new_species_ver / out_name
+            existing_rows, _ = _read_csv_rows(out_csv)
+            new_rows = [
+                {
+                    "x": str(a.x),
+                    "y": str(a.y),
+                    "w": str(a.w),
+                    "h": str(a.h),
+                    "t": str(a.t),
+                    "video_name": video_name,
+                }
+                for a in tr_anns
+            ]
+            merged = _merge_csv_rows(existing_rows, new_rows, key_fields=["x", "y", "w", "h", "t", "video_name"])
+            _write_csv_rows(out_csv, ["x", "y", "w", "h", "t", "video_name"], merged)
+            print(f"[single] {out_csv.name} rows: {len(merged)}")
 
         # Rebuild final dataset split
         src_initial = new_species_ver / INITIAL_DATASET_DIRNAME
@@ -730,12 +828,14 @@ def main() -> None:
         )
         print(f"[single] Final split metrics: {metrics}")
 
-        # Write split CSVs (firefly only)
+        # Write split CSVs (firefly + background)
         for split in SPLIT_NAMES:
-            ff_dir = dst_final / split / CLASS_FIREFLY
-            out_csv = new_species_ver / f"{PATCH_LOCATIONS_SPLIT_PREFIX}{split}.csv"
-            nrows = _write_split_patch_locations_csv(ff_dir, out_csv, include_species=False)
-            print(f"[single] Wrote {out_csv.name} rows={nrows}")
+            for lbl in (CLASS_FIREFLY, CLASS_BACKGROUND):
+                cls_dir = dst_final / split / lbl
+                prefix = PATCH_LOCATIONS_SPLIT_PREFIX if lbl == CLASS_FIREFLY else PATCH_LOCATIONS_BACKGROUND_SPLIT_PREFIX
+                out_csv = new_species_ver / f"{prefix}{split}.csv"
+                nrows = _write_split_patch_locations_csv(cls_dir, out_csv, include_species=False)
+                print(f"[single] Wrote {out_csv.name} rows={nrows}")
 
         # ---- integrated dataset update ----
         new_int_ver, prev_int_ver = _next_version_dir(integrated_root)
@@ -753,49 +853,58 @@ def main() -> None:
         _ensure_time_dataset_scaffold(night_root)
 
         target_time_root = new_int_ver / dataset_time_dirname
-        target_ff = target_time_root / INITIAL_DATASET_DIRNAME / CLASS_FIREFLY
-        target_ff.mkdir(parents=True, exist_ok=True)
-
-        copied_int = 0
-        for p in sorted(_iter_image_files(export_patches_dir)):
-            out = target_ff / p.name
-            if out.exists() and SKIP_EXISTING_PATCHES:
+        # Add new patches into <time>/initial/{firefly,background}
+        for lbl in (CLASS_FIREFLY, CLASS_BACKGROUND):
+            src_dir = export_patches_root / lbl
+            if not src_dir.exists():
                 continue
-            if out.exists() and not SKIP_EXISTING_PATCHES:
-                stem = out.stem
-                suffix = out.suffix
-                k = 1
-                while (target_ff / f"{stem}__dup{k}{suffix}").exists():
-                    k += 1
-                out = target_ff / f"{stem}__dup{k}{suffix}"
-            shutil.copy2(p, out)
-            copied_int += 1
-        print(f"[integrated] Added {copied_int} firefly patches → {target_ff}")
+            dst_dir = target_time_root / INITIAL_DATASET_DIRNAME / lbl
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            copied = 0
+            for p in sorted(_iter_image_files(src_dir)):
+                out = dst_dir / p.name
+                if out.exists() and SKIP_EXISTING_PATCHES:
+                    continue
+                if out.exists() and not SKIP_EXISTING_PATCHES:
+                    stem = out.stem
+                    suffix = out.suffix
+                    k = 1
+                    while (dst_dir / f"{stem}__dup{k}{suffix}").exists():
+                        k += 1
+                    out = dst_dir / f"{stem}__dup{k}{suffix}"
+                shutil.copy2(p, out)
+                copied += 1
+            print(f"[integrated] Added {copied} {lbl} patches → {dst_dir}")
 
-        # Update integrated patch_locations.csv (at version root)
-        int_csv = new_int_ver / PATCH_LOCATIONS_CSV_NAME
-        existing_rows, _ = _read_csv_rows(int_csv)
-        new_rows = [
-            {
-                "x": str(a.x),
-                "y": str(a.y),
-                "w": str(a.w),
-                "h": str(a.h),
-                "t": str(a.t),
-                "video_name": video_name,
-                "species_name": species_name,
-            }
-            for a in train_anns
-        ]
-        merged = _merge_csv_rows(
-            existing_rows, new_rows, key_fields=["x", "y", "w", "h", "t", "video_name", "species_name"]
-        )
-        _write_csv_rows(
-            int_csv,
-            ["x", "y", "w", "h", "t", "video_name", "species_name"],
-            merged,
-        )
-        print(f"[integrated] patch_locations.csv rows: {len(merged)}")
+        # Update integrated patch_locations CSVs (at version root)
+        for lbl in (CLASS_FIREFLY, CLASS_BACKGROUND):
+            tr_anns = train_anns_by_label.get(lbl, [])
+            if not tr_anns:
+                continue
+            out_name = PATCH_LOCATIONS_CSV_NAME if lbl == CLASS_FIREFLY else PATCH_LOCATIONS_BACKGROUND_CSV_NAME
+            out_csv = new_int_ver / out_name
+            existing_rows, _ = _read_csv_rows(out_csv)
+            new_rows = [
+                {
+                    "x": str(a.x),
+                    "y": str(a.y),
+                    "w": str(a.w),
+                    "h": str(a.h),
+                    "t": str(a.t),
+                    "video_name": video_name,
+                    "species_name": species_name,
+                }
+                for a in tr_anns
+            ]
+            merged = _merge_csv_rows(
+                existing_rows, new_rows, key_fields=["x", "y", "w", "h", "t", "video_name", "species_name"]
+            )
+            _write_csv_rows(
+                out_csv,
+                ["x", "y", "w", "h", "t", "video_name", "species_name"],
+                merged,
+            )
+            print(f"[integrated] {out_csv.name} rows: {len(merged)}")
 
         # Rebuild final dataset split for the affected time-of-day dataset only
         src_initial = target_time_root / INITIAL_DATASET_DIRNAME
@@ -812,16 +921,21 @@ def main() -> None:
         print(f"[integrated] ({dataset_time_dirname}) Final split metrics: {metrics}")
 
         for split in SPLIT_NAMES:
-            ff_dir = dst_final / split / CLASS_FIREFLY
-            out_csv = target_time_root / f"{PATCH_LOCATIONS_SPLIT_PREFIX}{split}.csv"
-            nrows = _write_split_patch_locations_csv(ff_dir, out_csv, include_species=True)
-            print(f"[integrated] Wrote {out_csv} rows={nrows}")
+            for lbl in (CLASS_FIREFLY, CLASS_BACKGROUND):
+                cls_dir = dst_final / split / lbl
+                prefix = PATCH_LOCATIONS_SPLIT_PREFIX if lbl == CLASS_FIREFLY else PATCH_LOCATIONS_BACKGROUND_SPLIT_PREFIX
+                out_csv = target_time_root / f"{prefix}{split}.csv"
+                nrows = _write_split_patch_locations_csv(cls_dir, out_csv, include_species=True)
+                print(f"[integrated] Wrote {out_csv} rows={nrows}")
+    else:
+        print("\nNo TRAIN rows; skipping patch extraction + TRAIN dataset updates.")
 
     # ────────────────────────────────────────────────────────────────────
     # FINAL VALIDATION DATASETS (CSV-only)
     # ────────────────────────────────────────────────────────────────────
 
-    if val_anns:
+    # Validation datasets (firefly only)
+    if final_validation_firefly:
         combined_root = VALIDATION_DATASETS_ROOT / VALIDATION_COMBINED_DIRNAME
         individual_root = VALIDATION_DATASETS_ROOT / VALIDATION_INDIVIDUAL_DIRNAME / species_name
         combined_root.mkdir(parents=True, exist_ok=True)
@@ -845,7 +959,7 @@ def main() -> None:
                 "video_name": video_name,
                 "species_name": species_name,
             }
-            for a in val_anns
+            for a in final_validation_firefly
         ]
         merged = _merge_csv_rows(
             existing_rows, new_rows, key_fields=["x", "y", "w", "h", "t", "video_name", "species_name"]
