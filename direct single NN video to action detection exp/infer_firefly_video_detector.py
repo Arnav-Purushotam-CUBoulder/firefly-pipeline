@@ -3,10 +3,16 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
+
+# Allow running the script from repo root without installing as a package.
+_THIS_DIR = Path(__file__).resolve().parent
+if str(_THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR))
 
 from firefly_video_detector.decode import decode_centernet
 from firefly_video_detector.model import FireflyVideoCenterNet

@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import torch
 from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
+
+# Allow running the script from repo root without installing as a package.
+_THIS_DIR = Path(__file__).resolve().parent
+if str(_THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR))
 
 from firefly_video_detector.annotations import load_annotations_csv
 from firefly_video_detector.dataset import DatasetSplit, FireflyVideoCenternetDataset
@@ -25,6 +31,7 @@ from firefly_video_detector.video_io import get_video_info
 # The CSV filename should match the video name (supports either):
 #   - <video_stem>.csv        (e.g. my_video.mp4 -> my_video.csv)
 #   - <video_filename>.csv    (e.g. my_video.mp4 -> my_video.mp4.csv)
+#   - <video_stem>_*.csv      (e.g. GH010181.mp4 -> GH010181_detections_xywh.csv)
 
 # Folder of videos (X). Each video must have a matching CSV in `CSVS_DIR`.
 VIDEOS_DIR = ""  # e.g. "/path/to/videos"
@@ -64,21 +71,43 @@ def _collect_video_csv_pairs(videos_dir: Path, csvs_dir: Path) -> list[tuple[Pat
         if k in csv_by_name_lower:
             raise ValueError(f"Duplicate CSV names (case-insensitive): {p} and {csv_by_name_lower[k]}")
         csv_by_name_lower[k] = p
+    csvs_lower = [(p.name.lower(), p) for p in csvs]
 
     pairs: list[tuple[Path, Path]] = []
     missing: list[str] = []
     for v in videos:
         cand_names = [f"{v.stem}.csv", f"{v.name}.csv"]
-        found = [csv_by_name_lower.get(n.lower()) for n in cand_names]
-        found = [p for p in found if p is not None]
-        if not found:
-            missing.append(f"- {v.name} (expected {cand_names[0]} or {cand_names[1]})")
-            continue
-        if len({p.resolve() for p in found}) > 1:
+        found_exact = [csv_by_name_lower.get(n.lower()) for n in cand_names]
+        found_exact = [p for p in found_exact if p is not None]
+        if len({p.resolve() for p in found_exact}) > 1:
             raise ValueError(
-                f"Ambiguous CSV match for video {v.name}: {[str(p) for p in found]}"
+                f"Ambiguous CSV match for video {v.name}: {[str(p) for p in found_exact]}"
             )
-        pairs.append((v, found[0]))
+        if found_exact:
+            pairs.append((v, found_exact[0]))
+            continue
+
+        # Common pattern: "<video_stem>_something.csv" (e.g. "GH010181_detections_xywh.csv").
+        prefix1 = f"{v.stem.lower()}_"
+        prefix2 = f"{v.name.lower()}_"
+        found_prefix = [p for name_l, p in csvs_lower if name_l.startswith(prefix1) or name_l.startswith(prefix2)]
+        if not found_prefix:
+            missing.append(
+                f"- {v.name} (expected {cand_names[0]} or {cand_names[1]} or {v.stem}_*.csv)"
+            )
+            continue
+        if len({p.resolve() for p in found_prefix}) > 1:
+            raise ValueError(
+                "\n".join(
+                    [
+                        f"Ambiguous CSV match for video {v.name}.",
+                        "Matched multiple CSVs by prefix:",
+                        *[f"- {p.name}" for p in sorted(found_prefix, key=lambda x: x.name)],
+                        "Fix by renaming CSVs to be unique per video or use --video/--csv for single-video mode.",
+                    ]
+                )
+            )
+        pairs.append((v, found_prefix[0]))
 
     if missing:
         msg = "\n".join(

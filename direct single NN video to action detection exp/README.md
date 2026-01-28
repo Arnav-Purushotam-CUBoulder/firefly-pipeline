@@ -9,6 +9,7 @@ Instead of background subtraction + hand-tuned heuristics, this trains a single 
 Each CSV is associated with exactly one video by filename (supports either):
 - `<video_stem>.csv` (e.g. `my_video.mp4` → `my_video.csv`)
 - `<video_filename>.csv` (e.g. `my_video.mp4` → `my_video.mp4.csv`)
+- `<video_stem>_*.csv` (e.g. `GH010181.mp4` → `GH010181_detections_xywh.csv`)
 
 At inference time it runs the model in a sliding-window over the video and writes a CSV of detections:
 `x,y,w,h,frame` (where `frame` is your `t`).
