@@ -3,8 +3,12 @@
 This is an experimental prototype for *end-to-end* firefly detection that **learns temporal features directly from raw video**.
 
 Instead of background subtraction + hand-tuned heuristics, this trains a single spatiotemporal neural network on:
-- `video.mp4`
-- `labels.csv` with columns `x,y,w,h,frame[,traj_id]` (same base format as `test1/tools/firefly flash annotation tool v2.py`)
+- a folder of `*.mp4`/`*.mov`/... videos
+- a folder of `*.csv` labels with columns `x,y,w,h,frame[,traj_id]` (same base format as `test1/tools/firefly flash annotation tool v2.py`)
+
+Each CSV is associated with exactly one video by filename (supports either):
+- `<video_stem>.csv` (e.g. `my_video.mp4` → `my_video.csv`)
+- `<video_filename>.csv` (e.g. `my_video.mp4` → `my_video.mp4.csv`)
 
 At inference time it runs the model in a sliding-window over the video and writes a CSV of detections:
 `x,y,w,h,frame` (where `frame` is your `t`).
@@ -23,18 +27,26 @@ Create an environment with PyTorch + OpenCV:
 `pip install -r requirements.txt`
 
 ## Train
-Example:
+Folder mode (recommended):
+
+`python3 train_firefly_video_detector.py --videos_dir /path/to/videos --csvs_dir /path/to/csvs --out_dir runs/firefly_video_centernet`
+
+Single-video mode:
 
 `python3 train_firefly_video_detector.py --video /path/to/video.mp4 --csv /path/to/gt.csv --out_dir runs/firefly_video_centernet`
 
 ## Inference
-Example:
+Folder mode (recommended):
+
+`python3 infer_firefly_video_detector.py --videos_dir /path/to/videos --out_dir /path/to/output_csvs --ckpt runs/firefly_video_centernet/checkpoints/best.pt`
+
+Single-video mode:
 
 `python3 infer_firefly_video_detector.py --video /path/to/video.mp4 --ckpt runs/firefly_video_centernet/checkpoints/best.pt --out_csv pred.csv`
 
-To also output a linked trajectory id:
+To also output confidence and/or a linked trajectory id:
 
-`python3 infer_firefly_video_detector.py --video /path/to/video.mp4 --ckpt runs/firefly_video_centernet/checkpoints/best.pt --out_csv pred.csv --emit_traj_id`
+`python3 infer_firefly_video_detector.py --video /path/to/video.mp4 --ckpt runs/firefly_video_centernet/checkpoints/best.pt --out_csv pred.csv --include_score --emit_traj_id`
 
 ## Notes / limitations (prototype)
 - This is a **single-class** detector (firefly vs background).

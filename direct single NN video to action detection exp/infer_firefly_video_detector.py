@@ -13,22 +13,84 @@ from firefly_video_detector.model import FireflyVideoCenterNet
 from firefly_video_detector.video_io import VideoClipReader, get_video_info
 
 
+# =========================
+# User-editable config
+# =========================
+#
+# Inference input is:
+#   X: folder of videos
+# Output is:
+#   ŷ: folder of CSV files (one per video) with columns x,y,w,h,frame
+
+# Folder of videos to run inference on.
+VIDEOS_DIR = ""  # e.g. "/path/to/videos"
+
+# Output folder to write per-video CSVs to.
+OUT_CSV_DIR = ""  # e.g. "/path/to/output_csvs"
+
+# Model checkpoint to load.
+CKPT_PATH = ""  # e.g. "runs/firefly_video_centernet/checkpoints/best.pt"
+
+# Device: "cuda" | "mps" | "cpu" | None (auto = CUDA → MPS → CPU)
+DEVICE = None
+
+# Default CSV time column ("frame" matches your label format).
+TIME_COL = "frame"  # "frame" or "t"
+
+# Optional extra output columns.
+INCLUDE_SCORE = False
+EMIT_TRAJ_ID = False
+MAX_TRACK_DIST = 25.0
+
+# Naming: if True -> "<video>.mp4.csv", else -> "<video>.csv"
+OUTPUT_USE_VIDEO_FILENAME = False
+
+
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
+
+
+def _list_videos(videos_dir: Path) -> list[Path]:
+    videos_dir = Path(videos_dir).expanduser()
+    if not videos_dir.exists():
+        raise FileNotFoundError(f"Videos dir not found: {videos_dir}")
+    videos = sorted(
+        [p for p in videos_dir.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS],
+        key=lambda p: p.name,
+    )
+    if not videos:
+        raise FileNotFoundError(f"No videos found in: {videos_dir} (exts: {sorted(VIDEO_EXTS)})")
+    return videos
+
+
+def _range_len(start: int, end: int, step: int) -> int:
+    if end <= start:
+        return 0
+    return (end - start + step - 1) // step
+
+
+def _default_out_csv(video_path: Path, out_dir: Path, use_video_filename: bool) -> Path:
+    name = f"{video_path.name}.csv" if use_video_filename else f"{video_path.stem}.csv"
+    return out_dir / name
+
+
 def _device_from_args(device: str | None) -> str:
     if device:
         return device
-    if torch.backends.mps.is_available():
-        return "mps"
     if torch.cuda.is_available():
         return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
     return "cpu"
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--video", required=True)
-    ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--out_csv", required=True)
-    ap.add_argument("--device", default=None)
+    ap.add_argument("--videos_dir", default=VIDEOS_DIR, help="Folder of videos to run inference on")
+    ap.add_argument("--out_dir", default=OUT_CSV_DIR, help="Output folder for per-video CSVs")
+    ap.add_argument("--video", default=None, help="(Optional) single video path (overrides --videos_dir)")
+    ap.add_argument("--out_csv", default=None, help="(Optional) single output CSV path (overrides --out_dir)")
+    ap.add_argument("--ckpt", default=CKPT_PATH, help="Model checkpoint .pt")
+    ap.add_argument("--device", default=DEVICE)
     ap.add_argument(
         "--ignore_ckpt_config",
         action="store_true",
@@ -47,23 +109,60 @@ def main() -> None:
     ap.add_argument("--topk", type=int, default=50)
     ap.add_argument("--score_thresh", type=float, default=0.3)
     ap.add_argument("--nms_iou", type=float, default=0.5)
-    ap.add_argument("--time_col", default="frame", choices=["frame", "t"])
+    ap.add_argument("--time_col", default=TIME_COL, choices=["frame", "t"])
+    ap.add_argument(
+        "--include_score",
+        action="store_true",
+        default=bool(INCLUDE_SCORE),
+        help="Add a 'score' column to the output CSV.",
+    )
+    ap.add_argument(
+        "--no_score",
+        dest="include_score",
+        action="store_false",
+        help="Do not add a 'score' column (default).",
+    )
     ap.add_argument(
         "--emit_traj_id",
         action="store_true",
+        default=bool(EMIT_TRAJ_ID),
         help="Assign a trajectory id by linking detections using the model's tracking head.",
+    )
+    ap.add_argument(
+        "--no_traj_id",
+        dest="emit_traj_id",
+        action="store_false",
+        help="Do not add a 'traj_id' column (default).",
     )
     ap.add_argument(
         "--max_track_dist",
         type=float,
-        default=25.0,
+        default=float(MAX_TRACK_DIST),
         help="Max distance (in resized pixels) for linking to previous frame.",
+    )
+    ap.add_argument(
+        "--use_video_filename",
+        action="store_true",
+        default=bool(OUTPUT_USE_VIDEO_FILENAME),
+        help="Name CSVs like '<video>.mp4.csv' instead of '<video>.csv'.",
+    )
+    ap.add_argument(
+        "--use_video_stem",
+        dest="use_video_filename",
+        action="store_false",
+        help="Name CSVs like '<video>.csv' (default).",
     )
     args = ap.parse_args()
 
     device = _device_from_args(args.device)
 
-    ckpt = torch.load(Path(args.ckpt).expanduser(), map_location="cpu")
+    if not str(args.ckpt).strip():
+        raise ValueError("Provide --ckpt (or set CKPT_PATH at the top of the script).")
+    ckpt_path = Path(args.ckpt).expanduser()
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
     if not args.ignore_ckpt_config and isinstance(ckpt.get("config"), dict):
         cfg = ckpt["config"]
         if isinstance(cfg.get("resize_hw"), (list, tuple)) and len(cfg["resize_hw"]) == 2:
@@ -91,117 +190,177 @@ def main() -> None:
     model.to(device)
     model.eval()
 
-    video_info = get_video_info(args.video)
-    reader = VideoClipReader(video_info.path, frame_count=video_info.frame_count)
-
-    end = int(args.end) if int(args.end) >= 0 else video_info.frame_count
-    start = max(0, int(args.start))
-    end = min(video_info.frame_count, end)
-    step = max(1, int(args.step))
-
-    sx = video_info.width / float(args.resize_w)
-    sy = video_info.height / float(args.resize_h)
-
-    out_csv = Path(args.out_csv).expanduser()
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-
-    fieldnames = ["x", "y", "w", "h", args.time_col, "score"]
-    if args.emit_traj_id:
-        fieldnames.append("traj_id")
-    with out_csv.open("w", newline="") as fh:
-        wr = csv.DictWriter(fh, fieldnames=fieldnames)
-        wr.writeheader()
-
-        import cv2
-
-        # Track state at the previous processed frame: {traj_id: (cx, cy)} in resized coords.
-        prev_tracks: dict[int, tuple[float, float]] = {}
-        next_traj_id = 0
-
-        for frame_index in range(start, end, step):
-            frames = reader.read_rgb_clip(
-                center_frame=frame_index,
-                clip_len=args.clip_len,
-                frame_stride=args.frame_stride,
-                pad_mode="edge",
+    if args.video is not None or args.out_csv is not None:
+        if not args.video or not args.out_csv:
+            raise ValueError("--video and --out_csv must be provided together (single-video mode).")
+        tasks = [(Path(args.video).expanduser(), Path(args.out_csv).expanduser())]
+    else:
+        if not str(args.videos_dir).strip() or not str(args.out_dir).strip():
+            raise ValueError(
+                "Provide --videos_dir and --out_dir (or set VIDEOS_DIR/OUT_CSV_DIR at the top of the script)."
             )
+        out_dir = Path(args.out_dir).expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        videos = _list_videos(Path(args.videos_dir))
+        tasks = [(v, _default_out_csv(v, out_dir, bool(args.use_video_filename))) for v in videos]
 
-            resized = [
-                cv2.resize(f, (args.resize_w, args.resize_h), interpolation=cv2.INTER_AREA)
-                for f in frames
-            ]
-            clip_thwc = np.stack(resized, axis=0).astype(np.float32) / 255.0  # [T,H,W,3]
-            clip = torch.from_numpy(clip_thwc).permute(3, 0, 1, 2).unsqueeze(0).to(device)  # [1,3,T,H,W]
+    try:
+        from tqdm import tqdm
+    except Exception:  # pragma: no cover
+        tqdm = None
 
-            with torch.no_grad():
-                pred = model(clip)
-                dets = decode_centernet(
-                    pred,
-                    downsample=args.downsample,
-                    input_hw=(args.resize_h, args.resize_w),
-                    topk=args.topk,
-                    score_thresh=args.score_thresh,
-                    nms_iou=args.nms_iou,
+    step = max(1, int(args.step))
+    start_req = max(0, int(args.start))
+    end_req = int(args.end)
+
+    # Pre-scan to compute total work for a single overall progress bar.
+    task_infos = []
+    total_iters = 0
+    for video_path, out_csv in tasks:
+        video_info = get_video_info(video_path)
+        end = int(end_req) if int(end_req) >= 0 else video_info.frame_count
+        start = start_req
+        end = min(video_info.frame_count, end)
+        total_iters += _range_len(start, end, step)
+        task_infos.append((video_info, out_csv, start, end))
+
+    pbar = None
+    if tqdm is not None and total_iters > 0:
+        pbar = tqdm(total=total_iters, desc="inference", unit="frame", ncols=100)
+
+    processed = 0
+
+    import cv2
+
+    for video_info, out_csv, start, end in task_infos:
+        if pbar is not None:
+            pbar.set_postfix_str(video_info.path.name)
+
+        reader = VideoClipReader(video_info.path, frame_count=video_info.frame_count)
+
+        sx = video_info.width / float(args.resize_w)
+        sy = video_info.height / float(args.resize_h)
+
+        out_csv = Path(out_csv).expanduser()
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+        fieldnames = ["x", "y", "w", "h", args.time_col]
+        if args.include_score:
+            fieldnames.append("score")
+        if args.emit_traj_id:
+            fieldnames.append("traj_id")
+
+        with out_csv.open("w", newline="") as fh:
+            wr = csv.DictWriter(fh, fieldnames=fieldnames)
+            wr.writeheader()
+
+            # Track state at the previous processed frame: {traj_id: (cx, cy)} in resized coords.
+            prev_tracks: dict[int, tuple[float, float]] = {}
+            next_traj_id = 0
+
+            for frame_index in range(start, end, step):
+                frames = reader.read_rgb_clip(
+                    center_frame=frame_index,
+                    clip_len=args.clip_len,
+                    frame_stride=args.frame_stride,
+                    pad_mode="edge",
                 )
 
-            det_traj_ids: list[int] = []
-            if args.emit_traj_id:
-                assigned = [-1] * len(dets)
-                used_prev: set[int] = set()
-                used_det: set[int] = set()
+                resized = [
+                    cv2.resize(f, (args.resize_w, args.resize_h), interpolation=cv2.INTER_AREA)
+                    for f in frames
+                ]
+                clip_thwc = np.stack(resized, axis=0).astype(np.float32) / 255.0  # [T,H,W,3]
+                clip = (
+                    torch.from_numpy(clip_thwc).permute(3, 0, 1, 2).unsqueeze(0).to(device)
+                )  # [1,3,T,H,W]
 
-                # Greedy matching using predicted prev-center (CenterTrack-style).
-                candidates: list[tuple[float, int, int]] = []
-                for prev_id, (pcx, pcy) in prev_tracks.items():
+                with torch.no_grad():
+                    pred = model(clip)
+                    dets = decode_centernet(
+                        pred,
+                        downsample=args.downsample,
+                        input_hw=(args.resize_h, args.resize_w),
+                        topk=args.topk,
+                        score_thresh=args.score_thresh,
+                        nms_iou=args.nms_iou,
+                    )
+
+                det_traj_ids: list[int] = []
+                if args.emit_traj_id:
+                    assigned = [-1] * len(dets)
+                    used_prev: set[int] = set()
+                    used_det: set[int] = set()
+
+                    # Greedy matching using predicted prev-center (CenterTrack-style).
+                    candidates: list[tuple[float, int, int]] = []
+                    for prev_id, (pcx, pcy) in prev_tracks.items():
+                        for i, d in enumerate(dets):
+                            cx = float(d.x + d.w * 0.5)
+                            cy = float(d.y + d.h * 0.5)
+                            if d.track_dx is not None and d.track_dy is not None:
+                                prev_cx = cx + float(d.track_dx)
+                                prev_cy = cy + float(d.track_dy)
+                            else:
+                                prev_cx, prev_cy = cx, cy
+                            dist = math.hypot(prev_cx - pcx, prev_cy - pcy)
+                            candidates.append((dist, i, prev_id))
+
+                    candidates.sort(key=lambda x: x[0])
+                    max_d = float(args.max_track_dist)
+                    for dist, i, prev_id in candidates:
+                        if dist > max_d:
+                            break
+                        if i in used_det or prev_id in used_prev:
+                            continue
+                        assigned[i] = prev_id
+                        used_det.add(i)
+                        used_prev.add(prev_id)
+
+                    for i in range(len(dets)):
+                        if assigned[i] == -1:
+                            assigned[i] = next_traj_id
+                            next_traj_id += 1
+
+                    det_traj_ids = assigned
+                    # Build tracks for next iteration (only current-frame tracks are needed).
+                    prev_tracks = {}
                     for i, d in enumerate(dets):
                         cx = float(d.x + d.w * 0.5)
                         cy = float(d.y + d.h * 0.5)
-                        if d.track_dx is not None and d.track_dy is not None:
-                            prev_cx = cx + float(d.track_dx)
-                            prev_cy = cy + float(d.track_dy)
-                        else:
-                            prev_cx, prev_cy = cx, cy
-                        dist = math.hypot(prev_cx - pcx, prev_cy - pcy)
-                        candidates.append((dist, i, prev_id))
+                        prev_tracks[int(det_traj_ids[i])] = (cx, cy)
 
-                candidates.sort(key=lambda x: x[0])
-                max_d = float(args.max_track_dist)
-                for dist, i, prev_id in candidates:
-                    if dist > max_d:
-                        break
-                    if i in used_det or prev_id in used_prev:
-                        continue
-                    assigned[i] = prev_id
-                    used_det.add(i)
-                    used_prev.add(prev_id)
-
-                for i in range(len(dets)):
-                    if assigned[i] == -1:
-                        assigned[i] = next_traj_id
-                        next_traj_id += 1
-
-                det_traj_ids = assigned
-                # Build tracks for next iteration (only current-frame tracks are needed).
-                prev_tracks = {}
                 for i, d in enumerate(dets):
-                    cx = float(d.x + d.w * 0.5)
-                    cy = float(d.y + d.h * 0.5)
-                    prev_tracks[int(det_traj_ids[i])] = (cx, cy)
+                    traj_id = int(det_traj_ids[i]) if args.emit_traj_id else None
+                    row = {
+                        "x": d.x * sx,
+                        "y": d.y * sy,
+                        "w": d.w * sx,
+                        "h": d.h * sy,
+                        args.time_col: frame_index,
+                    }
+                    if args.include_score:
+                        row["score"] = d.score
+                    if traj_id is not None:
+                        row["traj_id"] = traj_id
+                    wr.writerow(row)
 
-            for i, d in enumerate(dets):
-                traj_id = int(det_traj_ids[i]) if args.emit_traj_id else None
-                # Convert resized coords -> original video coords
-                row = {
-                    "x": d.x * sx,
-                    "y": d.y * sy,
-                    "w": d.w * sx,
-                    "h": d.h * sy,
-                    args.time_col: frame_index,
-                    "score": d.score,
-                }
-                if traj_id is not None:
-                    row["traj_id"] = traj_id
-                wr.writerow(row)
+                if pbar is not None:
+                    pbar.update(1)
+                elif total_iters > 0:
+                    processed += 1
+                    if processed % 100 == 0 or processed == total_iters:
+                        pct = 100.0 * processed / float(total_iters)
+                        print(
+                            f"\rProgress: {processed}/{total_iters} ({pct:.1f}%)",
+                            end="" if processed < total_iters else "\n",
+                            flush=True,
+                        )
+
+        reader.close()
+
+    if pbar is not None:
+        pbar.close()
 
 
 if __name__ == "__main__":

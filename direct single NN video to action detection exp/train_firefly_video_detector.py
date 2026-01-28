@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 
 from firefly_video_detector.annotations import load_annotations_csv
 from firefly_video_detector.dataset import DatasetSplit, FireflyVideoCenternetDataset
@@ -14,25 +14,104 @@ from firefly_video_detector.model import FireflyVideoCenterNet
 from firefly_video_detector.video_io import get_video_info
 
 
+# =========================
+# User-editable config
+# =========================
+#
+# Training input is:
+#   X: folder of videos
+#   y: folder of CSV files (one per video)
+#
+# The CSV filename should match the video name (supports either):
+#   - <video_stem>.csv        (e.g. my_video.mp4 -> my_video.csv)
+#   - <video_filename>.csv    (e.g. my_video.mp4 -> my_video.mp4.csv)
+
+# Folder of videos (X). Each video must have a matching CSV in `CSVS_DIR`.
+VIDEOS_DIR = ""  # e.g. "/path/to/videos"
+
+# Folder of CSVs (y). Expected columns: x,y,w,h,frame (optional: traj_id/track_id)
+CSVS_DIR = ""  # e.g. "/path/to/csvs"
+
+# Training outputs (checkpoints/config.json)
+OUT_DIR = "runs/firefly_video_centernet"
+
+# Device: "cuda" | "mps" | "cpu" | None (auto = CUDA → MPS → CPU)
+DEVICE = None
+
+
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
+
+
+def _collect_video_csv_pairs(videos_dir: Path, csvs_dir: Path) -> list[tuple[Path, Path]]:
+    videos_dir = Path(videos_dir).expanduser()
+    csvs_dir = Path(csvs_dir).expanduser()
+    if not videos_dir.exists():
+        raise FileNotFoundError(f"Videos dir not found: {videos_dir}")
+    if not csvs_dir.exists():
+        raise FileNotFoundError(f"CSVs dir not found: {csvs_dir}")
+
+    videos = sorted(
+        [p for p in videos_dir.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS],
+        key=lambda p: p.name,
+    )
+    if not videos:
+        raise FileNotFoundError(f"No videos found in: {videos_dir} (exts: {sorted(VIDEO_EXTS)})")
+
+    csvs = [p for p in csvs_dir.iterdir() if p.is_file() and p.suffix.lower() == ".csv"]
+    csv_by_name_lower: dict[str, Path] = {}
+    for p in csvs:
+        k = p.name.lower()
+        if k in csv_by_name_lower:
+            raise ValueError(f"Duplicate CSV names (case-insensitive): {p} and {csv_by_name_lower[k]}")
+        csv_by_name_lower[k] = p
+
+    pairs: list[tuple[Path, Path]] = []
+    missing: list[str] = []
+    for v in videos:
+        cand_names = [f"{v.stem}.csv", f"{v.name}.csv"]
+        found = [csv_by_name_lower.get(n.lower()) for n in cand_names]
+        found = [p for p in found if p is not None]
+        if not found:
+            missing.append(f"- {v.name} (expected {cand_names[0]} or {cand_names[1]})")
+            continue
+        if len({p.resolve() for p in found}) > 1:
+            raise ValueError(
+                f"Ambiguous CSV match for video {v.name}: {[str(p) for p in found]}"
+            )
+        pairs.append((v, found[0]))
+
+    if missing:
+        msg = "\n".join(
+            [
+                "Some videos do not have a matching CSV in CSVS_DIR.",
+                f"Videos dir: {videos_dir}",
+                f"CSVs dir:  {csvs_dir}",
+                "Missing:",
+                *missing,
+            ]
+        )
+        raise FileNotFoundError(msg)
+
+    return pairs
+
+
 def _device_from_args(device: str | None) -> str:
     if device:
         return device
-    if torch.backends.mps.is_available():
-        return "mps"
     if torch.cuda.is_available():
         return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
     return "cpu"
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--video", required=True, help="Path to MP4 video")
-    ap.add_argument(
-        "--csv",
-        required=True,
-        help="Path to CSV (x,y,w,h,frame[,traj_id]) where traj_id enables motion/trajectory supervision",
-    )
-    ap.add_argument("--out_dir", default="runs/firefly_video_centernet")
+    ap.add_argument("--videos_dir", default=VIDEOS_DIR, help="Folder of videos (X)")
+    ap.add_argument("--csvs_dir", default=CSVS_DIR, help="Folder of CSVs (y), one per video")
+    ap.add_argument("--video", default=None, help="(Optional) single video path (overrides --videos_dir)")
+    ap.add_argument("--csv", default=None, help="(Optional) single CSV path (overrides --csvs_dir)")
+    ap.add_argument("--out_dir", default=OUT_DIR)
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -49,7 +128,7 @@ def main() -> None:
     ap.add_argument("--off_weight", type=float, default=1.0)
     ap.add_argument("--track_weight", type=float, default=1.0)
     ap.add_argument("--augment", action="store_true")
-    ap.add_argument("--device", default=None, help="cpu|cuda|mps (auto if omitted)")
+    ap.add_argument("--device", default=DEVICE, help="cpu|cuda|mps (auto if omitted)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--samples_per_epoch", type=int, default=0, help="0 = use len(dataset)")
     args = ap.parse_args()
@@ -65,44 +144,80 @@ def main() -> None:
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    video_info = get_video_info(args.video)
-    annotations = load_annotations_csv(args.csv)
+    if args.video is not None or args.csv is not None:
+        if not args.video or not args.csv:
+            raise ValueError("--video and --csv must be provided together (single-video mode).")
+        pairs = [(Path(args.video).expanduser(), Path(args.csv).expanduser())]
+    else:
+        if not str(args.videos_dir).strip() or not str(args.csvs_dir).strip():
+            raise ValueError(
+                "Provide --videos_dir and --csvs_dir (or set VIDEOS_DIR/CSVS_DIR at the top of the script)."
+            )
+        pairs = _collect_video_csv_pairs(Path(args.videos_dir), Path(args.csvs_dir))
 
-    total_frames = video_info.frame_count
+    train_datasets: list[FireflyVideoCenternetDataset] = []
+    val_datasets: list[FireflyVideoCenternetDataset] = []
+    train_weights: list[float] = []
+    video_infos: list[dict[str, object]] = []
+
     val_fraction = max(0.0, min(0.9, float(args.val_fraction)))
-    split_at = int(total_frames * (1.0 - val_fraction))
-    split_at = max(1, min(total_frames - 1, split_at))
+    for video_path, csv_path in pairs:
+        info = get_video_info(video_path)
+        annotations = load_annotations_csv(csv_path)
 
-    train_split = DatasetSplit(0, split_at)
-    val_split = DatasetSplit(split_at, total_frames)
+        total_frames = info.frame_count
+        split_at = int(total_frames * (1.0 - val_fraction))
+        split_at = max(1, min(total_frames - 1, split_at))
 
-    train_ds = FireflyVideoCenternetDataset(
-        video_path=video_info.path,
-        annotations=annotations,
-        total_frames=total_frames,
-        orig_size=(video_info.width, video_info.height),
-        split=train_split,
-        resize_hw=(args.resize_h, args.resize_w),
-        clip_len=args.clip_len,
-        frame_stride=args.frame_stride,
-        downsample=args.downsample,
-        augment=args.augment,
-    )
-    val_ds = FireflyVideoCenternetDataset(
-        video_path=video_info.path,
-        annotations=annotations,
-        total_frames=total_frames,
-        orig_size=(video_info.width, video_info.height),
-        split=val_split,
-        resize_hw=(args.resize_h, args.resize_w),
-        clip_len=args.clip_len,
-        frame_stride=args.frame_stride,
-        downsample=args.downsample,
-        augment=False,
-    )
+        train_split = DatasetSplit(0, split_at)
+        val_split = DatasetSplit(split_at, total_frames)
+
+        train_ds_i = FireflyVideoCenternetDataset(
+            video_path=info.path,
+            annotations=annotations,
+            total_frames=total_frames,
+            orig_size=(info.width, info.height),
+            split=train_split,
+            resize_hw=(args.resize_h, args.resize_w),
+            clip_len=args.clip_len,
+            frame_stride=args.frame_stride,
+            downsample=args.downsample,
+            augment=args.augment,
+        )
+        val_ds_i = FireflyVideoCenternetDataset(
+            video_path=info.path,
+            annotations=annotations,
+            total_frames=total_frames,
+            orig_size=(info.width, info.height),
+            split=val_split,
+            resize_hw=(args.resize_h, args.resize_w),
+            clip_len=args.clip_len,
+            frame_stride=args.frame_stride,
+            downsample=args.downsample,
+            augment=False,
+        )
+        train_datasets.append(train_ds_i)
+        val_datasets.append(val_ds_i)
+        train_weights.extend([float(w) for w in train_ds_i.sample_weights])
+
+        video_infos.append(
+            {
+                "path": str(info.path),
+                "csv": str(csv_path),
+                "frame_count": info.frame_count,
+                "fps": info.fps,
+                "width": info.width,
+                "height": info.height,
+                "train_frames": [train_split.start_frame, train_split.end_frame_exclusive],
+                "val_frames": [val_split.start_frame, val_split.end_frame_exclusive],
+            }
+        )
+
+    train_ds = train_datasets[0] if len(train_datasets) == 1 else ConcatDataset(train_datasets)
+    val_ds = val_datasets[0] if len(val_datasets) == 1 else ConcatDataset(val_datasets)
 
     num_samples = int(args.samples_per_epoch) if int(args.samples_per_epoch) > 0 else len(train_ds)
-    sampler = WeightedRandomSampler(train_ds.sample_weights, num_samples=num_samples, replacement=True)
+    sampler = WeightedRandomSampler(train_weights, num_samples=num_samples, replacement=True)
     train_dl = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -125,8 +240,12 @@ def main() -> None:
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     config = {
-        "video": str(video_info.path),
-        "csv": str(Path(args.csv).expanduser()),
+        "data": {
+            "videos_dir": str(Path(args.videos_dir).expanduser()) if args.video is None else None,
+            "csvs_dir": str(Path(args.csvs_dir).expanduser()) if args.csv is None else None,
+            "pairs": [{"video": str(v), "csv": str(c)} for v, c in pairs],
+        },
+        "video_infos": video_infos,
         "resize_hw": [args.resize_h, args.resize_w],
         "clip_len": args.clip_len,
         "frame_stride": args.frame_stride,
@@ -210,12 +329,7 @@ def main() -> None:
             "model": model.state_dict(),
             "optimizer": opt.state_dict(),
             "config": config,
-            "video_info": {
-                "frame_count": video_info.frame_count,
-                "fps": video_info.fps,
-                "width": video_info.width,
-                "height": video_info.height,
-            },
+            "video_infos": video_infos,
         }
         torch.save(ckpt, ckpt_dir / "last.pt")
         if val_avg < best_val:
