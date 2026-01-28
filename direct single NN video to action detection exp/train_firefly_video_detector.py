@@ -34,16 +34,19 @@ from firefly_video_detector.video_io import get_video_info
 #   - <video_stem>_*.csv      (e.g. GH010181.mp4 -> GH010181_detections_xywh.csv)
 
 # Folder of videos (X). Each video must have a matching CSV in `CSVS_DIR`.
-VIDEOS_DIR = ""  # e.g. "/path/to/videos"
+VIDEOS_DIR = "~/Desktop/arnav's files/testing data for e2e NN prototye/training/videos"  # e.g. "/path/to/videos"
 
 # Folder of CSVs (y). Expected columns: x,y,w,h,frame (optional: traj_id/track_id)
-CSVS_DIR = ""  # e.g. "/path/to/csvs"
+CSVS_DIR = "~/Desktop/arnav's files/testing data for e2e NN prototye/training/csvs"  # e.g. "/path/to/csvs"
 
 # Training outputs (checkpoints/config.json)
-OUT_DIR = "runs/firefly_video_centernet"
+OUT_DIR = "~/Desktop/arnav's files/testing data for e2e NN prototye/training/training outputs"
 
 # Device: "cuda" | "mps" | "cpu" | None (auto = CUDA → MPS → CPU)
 DEVICE = None
+
+# Training epochs (used as the default for --epochs).
+EPOCHS = 30
 
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
@@ -141,7 +144,7 @@ def main() -> None:
     ap.add_argument("--video", default=None, help="(Optional) single video path (overrides --videos_dir)")
     ap.add_argument("--csv", default=None, help="(Optional) single CSV path (overrides --csvs_dir)")
     ap.add_argument("--out_dir", default=OUT_DIR)
-    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--epochs", type=int, default=EPOCHS)
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--num_workers", type=int, default=0)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 
@@ -13,6 +14,20 @@ class VideoInfo:
     height: int
 
 
+def _ensure_opencv_ffmpeg_attempts() -> None:
+    """
+    OpenCV/FFmpeg sometimes fails to read frames for videos with multiple streams
+    (e.g. GoPro MP4s with audio), emitting:
+      "packet read max attempts exceeded ... OPENCV_FFMPEG_READ_ATTEMPTS"
+    Default is 4096; bumping this often fixes random-access reads.
+
+    We set a higher default only if the user hasn't configured it.
+    """
+
+    if not os.environ.get("OPENCV_FFMPEG_READ_ATTEMPTS"):
+        os.environ["OPENCV_FFMPEG_READ_ATTEMPTS"] = "1000000"
+
+
 def get_video_info(video_path: str | Path) -> VideoInfo:
     """
     Read basic metadata from a video file using OpenCV.
@@ -21,9 +36,13 @@ def get_video_info(video_path: str | Path) -> VideoInfo:
     if not video_path.exists():
         raise FileNotFoundError(f"Video not found: {video_path}")
 
+    _ensure_opencv_ffmpeg_attempts()
     import cv2  # local import so py_compile works without cv2 installed
 
-    cap = cv2.VideoCapture(str(video_path))
+    # Prefer FFmpeg backend when available; fall back to default backend.
+    cap = cv2.VideoCapture(str(video_path), cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
 
@@ -67,9 +86,12 @@ class VideoClipReader:
 
     def _get_cap(self):
         if self._cap is None:
+            _ensure_opencv_ffmpeg_attempts()
             import cv2
 
-            cap = cv2.VideoCapture(self.video_path)
+            cap = cv2.VideoCapture(self.video_path, cv2.CAP_FFMPEG)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
                 raise RuntimeError(f"Could not open video: {self.video_path}")
             self._cap = cap
@@ -84,15 +106,18 @@ class VideoClipReader:
             self._cap = None
 
     def read_rgb_frame(self, frame_index: int):
+        _ensure_opencv_ffmpeg_attempts()
         import cv2
 
-        cap = self._get_cap()
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
-        ok, bgr = cap.read()
-        if not ok or bgr is None:
-            raise IndexError(f"Could not read frame {frame_index}")
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        return rgb
+        # VideoCapture can enter a bad state after a failed read; retry with a fresh handle.
+        for attempt in range(3):
+            cap = self._get_cap()
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+            ok, bgr = cap.read()
+            if ok and bgr is not None:
+                return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            self.close()
+        raise IndexError(f"Could not read frame {frame_index}")
 
     def read_rgb_clip(
         self,
@@ -120,4 +145,3 @@ class VideoClipReader:
 
         frames = [self.read_rgb_frame(idx) for idx in indices]
         return frames
-
