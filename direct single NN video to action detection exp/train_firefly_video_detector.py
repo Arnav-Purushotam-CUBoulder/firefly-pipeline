@@ -309,7 +309,8 @@ def main() -> None:
         train_n = 0
         it = train_dl
         if tqdm is not None:
-            it = tqdm(train_dl, desc=f"train {epoch:03d}", ncols=100)
+            # Avoid multi-line spam in narrow terminals by letting tqdm size itself.
+            it = tqdm(train_dl, desc=f"train {epoch:03d}", dynamic_ncols=True, file=sys.stdout)
         for clip, target in it:
             clip = clip.to(device)
             target = {k: v.to(device) for k, v in target.items() if torch.is_tensor(v)}
@@ -338,7 +339,7 @@ def main() -> None:
         with torch.no_grad():
             it2 = val_dl
             if tqdm is not None:
-                it2 = tqdm(val_dl, desc=f"val   {epoch:03d}", ncols=100)
+                it2 = tqdm(val_dl, desc=f"val   {epoch:03d}", dynamic_ncols=True, file=sys.stdout)
             for clip, target in it2:
                 clip = clip.to(device)
                 target = {k: v.to(device) for k, v in target.items() if torch.is_tensor(v)}
