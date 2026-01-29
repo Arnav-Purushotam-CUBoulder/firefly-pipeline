@@ -16,7 +16,7 @@ if str(_THIS_DIR) not in sys.path:
 
 from firefly_video_detector.decode import decode_centernet
 from firefly_video_detector.model import FireflyVideoCenterNet
-from firefly_video_detector.video_io import VideoClipReader, get_video_info
+from firefly_video_detector.video_io import VideoClipReader, VideoInfo, get_video_info
 
 
 # =========================
@@ -27,15 +27,16 @@ from firefly_video_detector.video_io import VideoClipReader, get_video_info
 #   X: folder of videos
 # Output is:
 #   ŷ: folder of CSV files (one per video) with columns x,y,w,h,frame
+#   (optional) rendered MP4s with predicted boxes drawn
 
 # Folder of videos to run inference on.
-VIDEOS_DIR = ""  # e.g. "/path/to/videos"
+VIDEOS_DIR = "~/Desktop/arnav's files/testing data for e2e NN prototye/training/videos"  # e.g. "/path/to/videos"
 
 # Output folder to write per-video CSVs to.
-OUT_CSV_DIR = ""  # e.g. "/path/to/output_csvs"
+OUT_CSV_DIR = "~/Desktop/arnav's files/testing data for e2e NN prototye/inference"  # e.g. "/path/to/output_csvs"
 
 # Model checkpoint to load.
-CKPT_PATH = ""  # e.g. "runs/firefly_video_centernet/checkpoints/best.pt"
+CKPT_PATH = "~/Desktop/arnav's files/testing data for e2e NN prototye/training/training outputs/checkpoints/best.pt"  # e.g. "runs/firefly_video_centernet/checkpoints/best.pt"
 
 # Device: "cuda" | "mps" | "cpu" | None (auto = CUDA → MPS → CPU)
 DEVICE = None
@@ -50,6 +51,13 @@ MAX_TRACK_DIST = 25.0
 
 # Naming: if True -> "<video>.mp4.csv", else -> "<video>.csv"
 OUTPUT_USE_VIDEO_FILENAME = False
+
+# Render annotated videos after writing CSVs.
+RENDER_VIDEOS = True
+OUT_VIDEO_DIR = ""  # default: same folder as the CSV outputs
+OUT_VIDEO_SUFFIX = "_annotated"  # output name: "<stem><suffix>.mp4"
+OUT_VIDEO_CODEC = "mp4v"
+BBOX_THICKNESS_PX = 1
 
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
@@ -77,6 +85,132 @@ def _range_len(start: int, end: int, step: int) -> int:
 def _default_out_csv(video_path: Path, out_dir: Path, use_video_filename: bool) -> Path:
     name = f"{video_path.name}.csv" if use_video_filename else f"{video_path.stem}.csv"
     return out_dir / name
+
+
+def _default_out_video(video_path: Path, out_dir: Path, suffix: str) -> Path:
+    suffix = str(suffix or "")
+    return out_dir / f"{video_path.stem}{suffix}.mp4"
+
+
+def _open_video_capture(video_path: Path):
+    import cv2
+
+    cap = cv2.VideoCapture(str(video_path), cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+    return cap
+
+
+def _open_video_writer(path: Path, fps: float, width: int, height: int, codec: str):
+    import cv2
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fps = float(fps) if float(fps) > 0 else 30.0
+    width = int(width)
+    height = int(height)
+
+    def _try(codec_name: str):
+        fourcc = cv2.VideoWriter_fourcc(*codec_name)
+        writer = cv2.VideoWriter(str(path), fourcc, fps, (width, height), isColor=True)
+        return writer if writer.isOpened() else None
+
+    tried = []
+    codec = str(codec or "mp4v")
+    writer = _try(codec)
+    tried.append(codec)
+    if writer is None:
+        for fallback in ("mp4v", "avc1", "XVID", "MJPG"):
+            if fallback in tried:
+                continue
+            writer = _try(fallback)
+            tried.append(fallback)
+            if writer is not None:
+                break
+
+    if writer is None:
+        raise RuntimeError(f"Could not open VideoWriter for {path} (tried codecs: {tried})")
+    return writer
+
+
+def _render_annotated_video(
+    video_info: VideoInfo,
+    out_path: Path,
+    boxes_by_frame: dict[int, list[tuple[float, float, float, float]]],
+    start: int,
+    end: int,
+    bbox_thickness_px: int = 1,
+    codec: str = "mp4v",
+    tqdm=None,
+) -> None:
+    import cv2
+
+    start = max(0, int(start))
+    end = min(int(end), int(video_info.frame_count))
+    if end <= start:
+        return
+
+    out_path = Path(out_path).expanduser()
+    cap = _open_video_capture(video_info.path)
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+
+        fps = (
+            float(video_info.fps)
+            if float(video_info.fps) > 0
+            else float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        )
+        writer = _open_video_writer(
+            out_path,
+            fps=fps,
+            width=int(video_info.width),
+            height=int(video_info.height),
+            codec=str(codec),
+        )
+        thickness = max(1, int(bbox_thickness_px))
+
+        try:
+            frame_iter = range(start, end)
+            if tqdm is not None:
+                frame_iter = tqdm(
+                    frame_iter,
+                    desc=f"render {video_info.path.name}",
+                    unit="frame",
+                    ncols=100,
+                )
+
+            for frame_idx in frame_iter:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+
+                boxes = boxes_by_frame.get(int(frame_idx))
+                if boxes:
+                    H, W = frame.shape[:2]
+                    for x, y, w, h in boxes:
+                        x0 = int(round(float(x)))
+                        y0 = int(round(float(y)))
+                        x1 = int(round(float(x) + float(w)))
+                        y1 = int(round(float(y) + float(h)))
+
+                        if x1 <= x0 or y1 <= y0:
+                            continue
+
+                        x0 = max(0, min(x0, W - 1))
+                        y0 = max(0, min(y0, H - 1))
+                        x1 = max(0, min(x1, W - 1))
+                        y1 = max(0, min(y1, H - 1))
+                        if x1 <= x0 or y1 <= y0:
+                            continue
+
+                        cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 255, 0), thickness, cv2.LINE_8)
+
+                writer.write(frame)
+        finally:
+            writer.release()
+    finally:
+        cap.release()
 
 
 def _device_from_args(device: str | None) -> str:
@@ -158,6 +292,44 @@ def main() -> None:
         action="store_false",
         help="Name CSVs like '<video>.csv' (default).",
     )
+    ap.add_argument(
+        "--render_videos",
+        action="store_true",
+        default=bool(RENDER_VIDEOS),
+        help="After writing CSV(s), write an annotated .mp4 for each input video.",
+    )
+    ap.add_argument(
+        "--no_render_videos",
+        dest="render_videos",
+        action="store_false",
+        help="Disable annotated video rendering.",
+    )
+    ap.add_argument(
+        "--out_video_dir",
+        default=OUT_VIDEO_DIR,
+        help="Output folder for rendered videos (default: same as CSV output folder).",
+    )
+    ap.add_argument(
+        "--out_video",
+        default=None,
+        help="(Optional) single output video path (overrides --out_video_dir).",
+    )
+    ap.add_argument(
+        "--out_video_suffix",
+        default=OUT_VIDEO_SUFFIX,
+        help="Rendered video filename suffix (default: '_annotated').",
+    )
+    ap.add_argument(
+        "--out_video_codec",
+        default=OUT_VIDEO_CODEC,
+        help="FourCC codec for rendered video (default: mp4v).",
+    )
+    ap.add_argument(
+        "--bbox_thickness_px",
+        type=int,
+        default=int(BBOX_THICKNESS_PX),
+        help="Bounding box thickness in pixels (default: 1).",
+    )
     args = ap.parse_args()
 
     device = _device_from_args(args.device)
@@ -210,6 +382,9 @@ def main() -> None:
         videos = _list_videos(Path(args.videos_dir))
         tasks = [(v, _default_out_csv(v, out_dir, bool(args.use_video_filename))) for v in videos]
 
+    if args.out_video is not None and len(tasks) != 1:
+        raise ValueError("--out_video can only be used in single-video mode (use --out_video_dir).")
+
     try:
         from tqdm import tqdm
     except Exception:  # pragma: no cover
@@ -255,6 +430,8 @@ def main() -> None:
             fieldnames.append("score")
         if args.emit_traj_id:
             fieldnames.append("traj_id")
+
+        boxes_by_frame: dict[int, list[tuple[float, float, float, float]]] = {}
 
         with out_csv.open("w", newline="") as fh:
             wr = csv.DictWriter(fh, fieldnames=fieldnames)
@@ -351,6 +528,11 @@ def main() -> None:
                         row["traj_id"] = traj_id
                     wr.writerow(row)
 
+                    if args.render_videos:
+                        boxes_by_frame.setdefault(int(frame_index), []).append(
+                            (float(row["x"]), float(row["y"]), float(row["w"]), float(row["h"]))
+                        )
+
                 if pbar is not None:
                     pbar.update(1)
                 elif total_iters > 0:
@@ -364,6 +546,33 @@ def main() -> None:
                         )
 
         reader.close()
+
+        if args.render_videos:
+            if args.out_video is not None:
+                out_video = Path(args.out_video).expanduser()
+            else:
+                out_video_dir = (
+                    Path(args.out_video_dir).expanduser()
+                    if str(args.out_video_dir).strip()
+                    else out_csv.parent
+                )
+                out_video = _default_out_video(video_info.path, out_video_dir, str(args.out_video_suffix))
+
+            _render_annotated_video(
+                video_info=video_info,
+                out_path=out_video,
+                boxes_by_frame=boxes_by_frame,
+                start=int(start),
+                end=int(end),
+                bbox_thickness_px=int(args.bbox_thickness_px),
+                codec=str(args.out_video_codec),
+                tqdm=(tqdm if (tqdm is not None and pbar is None) else None),
+            )
+            msg = f"Wrote annotated video -> {out_video}"
+            if tqdm is not None and pbar is not None:
+                tqdm.write(msg)
+            else:
+                print(msg, flush=True)
 
     if pbar is not None:
         pbar.close()
