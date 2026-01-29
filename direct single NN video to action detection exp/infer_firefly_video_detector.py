@@ -52,6 +52,9 @@ MAX_TRACK_DIST = 25.0
 # Naming: if True -> "<video>.mp4.csv", else -> "<video>.csv"
 OUTPUT_USE_VIDEO_FILENAME = False
 
+# Optional: process only the first N frames (after --start) for each video.
+MAX_FRAMES = 2000  # e.g. 500
+
 # Render annotated videos after writing CSVs.
 RENDER_VIDEOS = True
 OUT_VIDEO_DIR = ""  # default: same folder as the CSV outputs
@@ -245,6 +248,12 @@ def main() -> None:
     ap.add_argument("--feat_channels", type=int, default=128)
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--end", type=int, default=-1)
+    ap.add_argument(
+        "--max_frames",
+        type=int,
+        default=MAX_FRAMES,
+        help="Process at most this many frames per video (after --start). Default: no limit.",
+    )
     ap.add_argument("--step", type=int, default=1)
     ap.add_argument("--topk", type=int, default=50)
     ap.add_argument("--score_thresh", type=float, default=0.3)
@@ -393,6 +402,11 @@ def main() -> None:
     step = max(1, int(args.step))
     start_req = max(0, int(args.start))
     end_req = int(args.end)
+    max_frames_req = args.max_frames
+    if max_frames_req is not None:
+        max_frames_req = int(max_frames_req)
+        if max_frames_req <= 0:
+            max_frames_req = None
 
     # Pre-scan to compute total work for a single overall progress bar.
     task_infos = []
@@ -402,6 +416,8 @@ def main() -> None:
         end = int(end_req) if int(end_req) >= 0 else video_info.frame_count
         start = start_req
         end = min(video_info.frame_count, end)
+        if max_frames_req is not None:
+            end = min(end, start + max_frames_req)
         total_iters += _range_len(start, end, step)
         task_infos.append((video_info, out_csv, start, end))
 
