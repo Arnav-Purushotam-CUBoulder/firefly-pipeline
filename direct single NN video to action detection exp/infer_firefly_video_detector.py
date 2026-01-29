@@ -53,7 +53,7 @@ MAX_TRACK_DIST = 25.0
 OUTPUT_USE_VIDEO_FILENAME = False
 
 # Optional: process only the first N frames (after --start) for each video.
-MAX_FRAMES = 2000  # e.g. 500
+MAX_FRAMES = 4000  # e.g. 500
 
 # Render annotated videos after writing CSVs.
 RENDER_VIDEOS = True
