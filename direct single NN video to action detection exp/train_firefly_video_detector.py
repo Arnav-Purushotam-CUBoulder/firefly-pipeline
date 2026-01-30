@@ -52,6 +52,37 @@ EPOCHS = 30
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
 
 
+def _contains_token(haystack: str, needle: str) -> bool:
+    """
+    Return True if `needle` occurs in `haystack` at token boundaries.
+
+    Token boundary means the character before/after the match is either:
+      - start/end of string, or
+      - a non-alphanumeric character (e.g. '_', '-', '.', space)
+
+    This makes CSV/video pairing tolerant to small naming variations.
+    """
+
+    haystack = str(haystack)
+    needle = str(needle)
+    if not needle:
+        return False
+
+    start = 0
+    while True:
+        idx = haystack.find(needle, start)
+        if idx == -1:
+            return False
+
+        before_ok = idx == 0 or (not haystack[idx - 1].isalnum())
+        after_idx = idx + len(needle)
+        after_ok = after_idx >= len(haystack) or (not haystack[after_idx].isalnum())
+        if before_ok and after_ok:
+            return True
+
+        start = idx + 1
+
+
 def _collect_video_csv_pairs(videos_dir: Path, csvs_dir: Path) -> list[tuple[Path, Path]]:
     videos_dir = Path(videos_dir).expanduser()
     csvs_dir = Path(csvs_dir).expanduser()
@@ -90,13 +121,22 @@ def _collect_video_csv_pairs(videos_dir: Path, csvs_dir: Path) -> list[tuple[Pat
             pairs.append((v, found_exact[0]))
             continue
 
-        # Common pattern: "<video_stem>_something.csv" (e.g. "GH010181_detections_xywh.csv").
-        prefix1 = f"{v.stem.lower()}_"
-        prefix2 = f"{v.name.lower()}_"
-        found_prefix = [p for name_l, p in csvs_lower if name_l.startswith(prefix1) or name_l.startswith(prefix2)]
+        # Common patterns:
+        #   - "<video_stem>_<something>.csv"
+        #   - "<video_stem>-<something>.csv"
+        #   - "<something>_<video_stem>_<something>.csv"
+        # This stays strict enough to avoid matching similar IDs (e.g. GH010181 vs GH0101812)
+        # because it enforces token boundaries around the video name.
+        key1 = v.stem.lower()
+        key2 = v.name.lower()
+        found_prefix = [
+            p
+            for name_l, p in csvs_lower
+            if _contains_token(name_l, key1) or _contains_token(name_l, key2)
+        ]
         if not found_prefix:
             missing.append(
-                f"- {v.name} (expected {cand_names[0]} or {cand_names[1]} or {v.stem}_*.csv)"
+                f"- {v.name} (expected {cand_names[0]} or {cand_names[1]} or a CSV containing '{v.stem}' in its name)"
             )
             continue
         if len({p.resolve() for p in found_prefix}) > 1:
