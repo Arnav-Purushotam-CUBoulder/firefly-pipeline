@@ -15,13 +15,36 @@ class Box:
     traj_id: int | None = None
 
 
+def _norm_col_name(name: str) -> str:
+    name = str(name).strip()
+    # Handle UTF-8 BOM that sometimes appears in the first header cell.
+    if name.startswith("\ufeff"):
+        name = name.lstrip("\ufeff")
+    return name.lower()
+
+
+def _pick_unique_col(
+    cols_norm_to_orig: dict[str, list[str]], candidates_norm: Iterable[str], label: str
+) -> str | None:
+    for cand in candidates_norm:
+        key = _norm_col_name(cand)
+        origs = cols_norm_to_orig.get(key)
+        if not origs:
+            continue
+        if len(origs) > 1:
+            raise ValueError(f"CSV has multiple columns matching {label}: {sorted(origs)}")
+        return origs[0]
+    return None
+
+
 def load_annotations_csv(csv_path: str | Path) -> dict[int, list[Box]]:
     """
     Load annotations from a CSV file.
 
-    Expected columns:
+    Expected columns (extra columns are ignored):
       - x, y, w, h
-      - frame (preferred) OR t
+      - frame/time column: frame | frame_idx | t
+      - optional: traj_id | track_id
 
     Coordinates are expected to be in ORIGINAL pixel coordinates (top-left + width/height),
     matching `test1/tools/firefly flash annotation tool v2.py`.
@@ -36,26 +59,38 @@ def load_annotations_csv(csv_path: str | Path) -> dict[int, list[Box]]:
         if reader.fieldnames is None:
             return by_frame
 
-        fieldnames = {c.strip().lower() for c in reader.fieldnames}
-        time_key = "frame" if "frame" in fieldnames else "t" if "t" in fieldnames else None
+        cols_norm_to_orig: dict[str, list[str]] = {}
+        for c in reader.fieldnames:
+            cols_norm_to_orig.setdefault(_norm_col_name(c), []).append(c)
+
+        time_key = _pick_unique_col(
+            cols_norm_to_orig,
+            ("frame", "frame_idx", "frame_index", "frame_id", "t"),
+            label="frame/time column",
+        )
         if time_key is None:
             raise ValueError(
-                f"CSV must contain a 'frame' or 't' column, got: {sorted(fieldnames)}"
+                "CSV must contain a frame/time column (frame | frame_idx | t). "
+                f"Got: {sorted(cols_norm_to_orig)}"
             )
 
-        traj_key = None
-        for cand in ("traj_id", "track_id"):
-            if cand in fieldnames:
-                traj_key = cand
-                break
+        x_key = _pick_unique_col(cols_norm_to_orig, ("x",), label="x")
+        y_key = _pick_unique_col(cols_norm_to_orig, ("y",), label="y")
+        w_key = _pick_unique_col(cols_norm_to_orig, ("w",), label="w")
+        h_key = _pick_unique_col(cols_norm_to_orig, ("h",), label="h")
+        missing = [k for k, v in (("x", x_key), ("y", y_key), ("w", w_key), ("h", h_key)) if v is None]
+        if missing:
+            raise ValueError(f"CSV missing required columns: {missing}. Got: {sorted(cols_norm_to_orig)}")
+
+        traj_key = _pick_unique_col(cols_norm_to_orig, ("traj_id", "track_id"), label="traj/track id")
 
         for row in reader:
             try:
                 frame_index = int(float(row[time_key]))
-                x = float(row["x"])
-                y = float(row["y"])
-                w = float(row["w"])
-                h = float(row["h"])
+                x = float(row[x_key])
+                y = float(row[y_key])
+                w = float(row[w_key])
+                h = float(row[h_key])
             except Exception:
                 continue
 

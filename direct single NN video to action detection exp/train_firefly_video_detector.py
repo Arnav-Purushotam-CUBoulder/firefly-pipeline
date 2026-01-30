@@ -36,7 +36,7 @@ from firefly_video_detector.video_io import get_video_info
 # Folder of videos (X). Each video must have a matching CSV in `CSVS_DIR`.
 VIDEOS_DIR = "~/Desktop/arnav's files/testing data for e2e NN prototye/training/videos"  # e.g. "/path/to/videos"
 
-# Folder of CSVs (y). Expected columns: x,y,w,h,frame (optional: traj_id/track_id)
+# Folder of CSVs (y). Expected columns: x,y,w,h + frame/time column (frame|frame_idx|t) (optional: traj_id/track_id)
 CSVS_DIR = "~/Desktop/arnav's files/testing data for e2e NN prototye/training/csvs"  # e.g. "/path/to/csvs"
 
 # Training outputs (checkpoints/config.json)
