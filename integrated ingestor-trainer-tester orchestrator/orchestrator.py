@@ -24,7 +24,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 #   <ROOT>/patch training datasets and pipeline validation data
 #   <ROOT>/model zoo
 #   <ROOT>/inference outputs
-ROOT_PATH: str | Path = ""
+ROOT_PATH: str | Path = "/Volumes/DL Project SSD/integrated prototype data"
 
 # Folder containing *many* observed videos + their annotator CSVs (and potentially other files).
 # The orchestrator will:
