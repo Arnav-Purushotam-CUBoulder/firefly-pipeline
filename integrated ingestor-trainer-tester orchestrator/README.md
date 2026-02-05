@@ -32,18 +32,21 @@ You also pass an `--observed-dir` folder that contains **multiple** videos and a
 CSV naming expectation (flexible):
 
 - Firefly CSV (required per video):
-  - `<video_stem>_<species>.csv` (defaults to firefly), or
-  - `<video_stem>_<species>_firefly.csv`
+  - `<video_stem>.csv` (defaults to firefly), or
+  - `<video_stem>_firefly.csv`
 - Background CSV (optional, used only for training videos):
-  - `<video_stem>_<species>_background.csv`
+  - `<video_stem>_background.csv`
 
 Any trailing `*_day_time` / `*_night_time` tokens in CSV filenames are ignored (the run uses `--type-of-video`).
+
+Any species tokens in CSV filenames are ignored — pass the species name explicitly via `--species-name` (or set `SPECIES_NAME` at the top of the orchestrator file).
 
 Example:
 
 ```bash
 python3 "test1/integrated ingestor-trainer-tester orchestrator/orchestrator.py" \
   --root "/Volumes/DL Project SSD/integrated prototype data" \
+  --species-name "Photinus_pyralis" \
   --observed-dir "/path/to/observed folder" \
   --type-of-video night
 ```

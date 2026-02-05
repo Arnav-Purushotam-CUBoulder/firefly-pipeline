@@ -32,6 +32,10 @@ ROOT_PATH: str | Path = ""
 # - split matched video/csv pairs: half → training ingestion, half → validation/testing
 OBSERVED_DATA_DIR: str | Path = ""
 
+# Species name for this run. This is the source of truth; the orchestrator does not
+# infer species from CSV filenames.
+SPECIES_NAME: str = ""
+
 # Global video type for this run (used for dataset routing + model-zoo selection).
 # Allowed values: "day" | "night"
 TYPE_OF_VIDEO: str = "day"
@@ -141,7 +145,6 @@ class RunIdentity:
 @dataclass(frozen=True)
 class ObservedPair:
     video_name: str
-    species_name: str
     video_path: Path
     firefly_csv: Path
     background_csv: Path | None
@@ -260,38 +263,39 @@ def _is_annotator_csv(csv_path: Path) -> bool:
     return bool({"t", "frame", "time"} & cols)
 
 
-def _parse_species_and_label_from_csv_name(csv_path: Path, *, video_stem: str) -> Tuple[str, str]:
+def _parse_label_from_csv_name(csv_path: Path, *, video_key: str) -> str:
     """
-    Parse (species_name, label) from an annotator CSV filename.
+    Parse label from an annotator CSV filename.
 
-    Expected: <video_stem>_<species_name>_[day_time|night_time]_[firefly|background].csv
-    - time-of-day tokens, if present, are ignored (TYPE_OF_VIDEO controls this run)
+    Expected: <video_stem>_..._[firefly|background].csv
     - label defaults to "firefly" if omitted
+    - species is intentionally NOT parsed here (SPECIES_NAME controls this run)
     """
-    stem = csv_path.stem.strip()
-    stem = stem.replace("-", "_").replace("(", "_").replace(")", "_")
-    stem = re.sub(r"_+", "_", stem).strip("_")
+    vk = (video_key or "").strip().lower()
 
-    if len(stem) <= len(video_stem):
-        raise ValueError(f"CSV name must include species after video stem: {csv_path.name!r}")
+    remainder = ""
+    raw_key = csv_path.stem.strip().lower()
+    if vk and (raw_key == vk or raw_key.startswith(vk + "_")):
+        remainder = raw_key[len(vk) :].lstrip("_")
+    else:
+        stem = csv_path.stem.strip()
+        stem = stem.replace("-", "_").replace("(", "_").replace(")", "_")
+        stem = re.sub(r"_+", "_", stem).strip("_")
+        key = stem.lower()
 
-    remainder = stem[len(video_stem) :].lstrip("_")
+        vk_norm = vk.replace("-", "_").replace("(", "_").replace(")", "_")
+        vk_norm = re.sub(r"_+", "_", vk_norm).strip("_")
+
+        if vk_norm and (key == vk_norm or key.startswith(vk_norm + "_")):
+            remainder = key[len(vk_norm) :].lstrip("_")
+        else:
+            # Fall back to parsing by suffix only.
+            remainder = key
+
     parts = [p for p in remainder.split("_") if p]
-    if not parts:
-        raise ValueError(f"CSV name must include species after video stem: {csv_path.name!r}")
-
-    label = "firefly"
     if parts and parts[-1].lower() in {"firefly", "background"}:
-        label = parts.pop(-1).lower()
-
-    # Ignore any *_day_time or *_night_time tokens in the filename (global TYPE_OF_VIDEO controls run routing).
-    if len(parts) >= 2 and parts[-1].lower() == "time" and parts[-2].lower() in {"day", "night"}:
-        parts = parts[:-2]
-
-    species_name = _safe_name("_".join(parts))
-    if not species_name:
-        raise ValueError(f"Could not parse species_name from CSV name: {csv_path.name!r}")
-    return species_name, label
+        return parts[-1].lower()
+    return "firefly"
 
 
 def _discover_observed_pairs(observed_dir: Path) -> List[ObservedPair]:
@@ -337,7 +341,7 @@ def _discover_observed_pairs(observed_dir: Path) -> List[ObservedPair]:
         vp = videos_by_stem[match]
         video_name = _safe_name(vp.stem)
         try:
-            species_name, label = _parse_species_and_label_from_csv_name(c, video_stem=vp.stem)
+            label = _parse_label_from_csv_name(c, video_key=match)
         except Exception as e:
             raise SystemExit(f"Failed parsing CSV identity for {c}: {e}") from e
 
@@ -346,20 +350,10 @@ def _discover_observed_pairs(observed_dir: Path) -> List[ObservedPair]:
             {
                 "video_path": vp,
                 "video_name": video_name,
-                "species_name": None,
                 "firefly_csv": None,
                 "background_csv": None,
             },
         )
-
-        prev_species = g.get("species_name")
-        if prev_species is None:
-            g["species_name"] = species_name
-        elif prev_species != species_name:
-            raise SystemExit(
-                f"Conflicting species names for video {vp.name}: {prev_species!r} vs {species_name!r} "
-                f"(from CSV {c.name})"
-            )
 
         if label == "firefly":
             if g["firefly_csv"] is not None and str(Path(g["firefly_csv"]).resolve()) != str(c.resolve()):
@@ -387,7 +381,6 @@ def _discover_observed_pairs(observed_dir: Path) -> List[ObservedPair]:
         pairs.append(
             ObservedPair(
                 video_name=str(g["video_name"]),
-                species_name=str(g["species_name"] or ""),
                 video_path=Path(g["video_path"]),
                 firefly_csv=Path(g["firefly_csv"]),
                 background_csv=Path(g["background_csv"]) if g.get("background_csv") else None,
@@ -417,6 +410,7 @@ def _split_pairs_train_vs_val(pairs: Sequence[ObservedPair]) -> Tuple[List[Obser
 def _stage_pairs_for_species_scaler(
     pairs: Sequence[ObservedPair],
     *,
+    species_name: str,
     staging_dir: Path,
     time_of_day: str,
     dry_run: bool,
@@ -432,8 +426,11 @@ def _stage_pairs_for_species_scaler(
 
     staged: List[StagedPair] = []
     seen: set[str] = set()
+    safe_species = _safe_name(species_name)
+    if not safe_species:
+        raise SystemExit(f"Invalid species_name for staging: {species_name!r}")
     for p in pairs:
-        base = f"{_safe_name(p.video_name)}_{_safe_name(p.species_name)}_{_safe_name(time_of_day)}"
+        base = f"{_safe_name(p.video_name)}_{safe_species}_{_safe_name(time_of_day)}"
         dst_firefly = staging_dir / f"{base}_firefly.csv"
         if str(dst_firefly) in seen:
             raise SystemExit(f"Staging name collision (firefly): {dst_firefly}")
@@ -1025,6 +1022,12 @@ def _run_stage5_validator(
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Integrated ingest → train → validate orchestrator.")
     p.add_argument(
+        "--species-name",
+        type=str,
+        default=str(SPECIES_NAME) if SPECIES_NAME else "",
+        help="Species name for this run (source of truth; used for staging + dataset/model selection).",
+    )
+    p.add_argument(
         "--observed-dir",
         type=str,
         default=str(OBSERVED_DATA_DIR) if OBSERVED_DATA_DIR else "",
@@ -1055,6 +1058,13 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    species_arg = str(args.species_name or "").strip() or str(SPECIES_NAME or "").strip()
+    if not species_arg:
+        raise SystemExit("Pass --species-name (or set SPECIES_NAME at top of file).")
+    species_name = _safe_name(species_arg)
+    if not species_name:
+        raise SystemExit(f"Invalid species name: {species_arg!r}")
+
     observed_dir_arg = str(args.observed_dir or "").strip() or str(OBSERVED_DATA_DIR or "").strip()
     if not observed_dir_arg:
         raise SystemExit("Pass --observed-dir (or set OBSERVED_DATA_DIR at top of file).")
@@ -1094,13 +1104,6 @@ def main() -> int:
 
     # Discover and split observed (video,csv) pairs.
     pairs = _discover_observed_pairs(observed_dir)
-    species_set = {p.species_name for p in pairs if str(p.species_name).strip()}
-    if len(species_set) != 1:
-        raise SystemExit(
-            f"Expected exactly 1 species in observed-dir, found: {sorted(species_set)}. "
-            "Run separate orchestrator runs per species."
-        )
-    species_name = sorted(species_set)[0]
 
     train_pairs, val_pairs = _split_pairs_train_vs_val(pairs)
     train_video_names = {p.video_name for p in train_pairs}
@@ -1124,6 +1127,7 @@ def main() -> int:
     )
     staged_pairs = _stage_pairs_for_species_scaler(
         pairs,
+        species_name=species_name,
         staging_dir=staging_dir,
         time_of_day=time_of_day,
         dry_run=bool(args.dry_run),
