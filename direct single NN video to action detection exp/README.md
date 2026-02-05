@@ -36,6 +36,21 @@ Single-video mode:
 
 `python3 train_firefly_video_detector.py --video /path/to/video.mp4 --csv /path/to/gt.csv --out_dir runs/firefly_video_centernet`
 
+### Checkpoints + resume
+Training writes checkpoints to:
+- `OUT_DIR/checkpoints/last.pt` (latest)
+- `OUT_DIR/checkpoints/best.pt` (best val loss)
+
+By default (`--resume auto`), re-running the training script with the same `--out_dir` will automatically resume if training was not finished yet.
+
+To start fresh even if checkpoints exist:
+
+`python3 train_firefly_video_detector.py --out_dir runs/firefly_video_centernet --resume never`
+
+To enable mid-epoch resume, either:
+- Stop with Ctrl+C / SIGTERM (it will save a resume checkpoint), or
+- Set periodic saves: `--save_every_n_steps 200` (example).
+
 ## Inference
 Folder mode (recommended):
 

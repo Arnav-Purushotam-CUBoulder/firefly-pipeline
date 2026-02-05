@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import random
+import signal
 import sys
+import time
 from pathlib import Path
 
+import numpy as np
 import torch
-from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import ConcatDataset, DataLoader, Sampler, WeightedRandomSampler
 
 # Allow running the script from repo root without installing as a package.
 _THIS_DIR = Path(__file__).resolve().parent
@@ -50,6 +55,85 @@ EPOCHS = 30
 
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
+
+
+class _ResumableWeightedRandomSampler(Sampler[int]):
+    """
+    WeightedRandomSampler that can resume part-way through a pre-sampled epoch.
+
+    This is used only for mid-epoch resume: we deterministically re-sample the same
+    indices for the epoch (via a stored generator state) and start yielding from
+    `start_index` (in *sample* units, not batches).
+    """
+
+    def __init__(
+        self,
+        weights: list[float],
+        *,
+        num_samples: int,
+        replacement: bool = True,
+        generator: torch.Generator | None = None,
+        start_index: int = 0,
+    ) -> None:
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        self.num_samples = int(num_samples)
+        self.replacement = bool(replacement)
+        self.generator = generator
+        self.start_index = max(0, int(start_index))
+
+    def __iter__(self):
+        indices = torch.multinomial(
+            self.weights,
+            self.num_samples,
+            self.replacement,
+            generator=self.generator,
+        )
+        if self.start_index:
+            indices = indices[self.start_index :]
+        return iter(indices.tolist())
+
+    def __len__(self) -> int:
+        return max(0, int(self.num_samples) - int(self.start_index))
+
+
+def _atomic_torch_save(obj: object, path: Path) -> None:
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp)
+    tmp.replace(path)
+
+
+def _get_rng_state(device: str) -> dict[str, object]:
+    state: dict[str, object] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if device == "cuda" and torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _set_rng_state(state: dict[str, object] | None, device: str) -> None:
+    if not state:
+        return
+    if "python" in state:
+        random.setstate(state["python"])  # type: ignore[arg-type]
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])  # type: ignore[arg-type]
+    if "torch" in state:
+        torch.set_rng_state(state["torch"])  # type: ignore[arg-type]
+    if device == "cuda" and torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])  # type: ignore[arg-type]
+
+
+def _optimizer_state_to_device(opt: torch.optim.Optimizer, device: str) -> None:
+    if device not in {"cuda", "mps"}:
+        return
+    for state in opt.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.to(device)
 
 
 def _contains_token(haystack: str, needle: str) -> bool:
@@ -203,9 +287,37 @@ def main() -> None:
     ap.add_argument("--device", default=DEVICE, help="cpu|cuda|mps (auto if omitted)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--samples_per_epoch", type=int, default=0, help="0 = use len(dataset)")
+    ap.add_argument(
+        "--resume",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help=(
+            "Resume from out_dir/checkpoints/last.pt. "
+            "auto=resumes if present and training isn't finished; "
+            "always=requires it; never=starts fresh even if it exists."
+        ),
+    )
+    ap.add_argument(
+        "--save_every_n_steps",
+        type=int,
+        default=0,
+        help="0 = only save at epoch end; otherwise also save every N optimizer steps (enables mid-epoch resume).",
+    )
     args = ap.parse_args()
 
+    random.seed(args.seed)
+    np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    def _handle_termination(_signum, _frame):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _handle_termination)
+    except Exception:
+        pass
 
     if int(args.downsample) != 4:
         raise ValueError("This prototype currently uses a fixed output stride of 4 (downsample=4).")
@@ -216,7 +328,124 @@ def main() -> None:
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.video is not None or args.csv is not None:
+    ckpt_path = ckpt_dir / "last.pt"
+    resume_ckpt: dict[str, object] | None = None
+    pairs_from_ckpt: list[tuple[Path, Path]] | None = None
+    start_epoch = 1
+    resume_step_in_epoch = 0
+    resume_start_index_samples = 0
+    resume_mid_epoch = False
+
+    if str(args.resume) != "never":
+        if ckpt_path.exists():
+            try:
+                loaded = torch.load(ckpt_path, map_location="cpu")
+                if not isinstance(loaded, dict):
+                    raise TypeError(f"Expected a dict checkpoint, got: {type(loaded)}")
+                resume_ckpt = loaded
+            except Exception as e:
+                raise RuntimeError(
+                    "\n".join(
+                        [
+                            f"Found checkpoint but failed to load: {ckpt_path}",
+                            f"Error: {e}",
+                            "Fix: delete/rename the checkpoint, use --resume=never, or change --out_dir.",
+                        ]
+                    )
+                ) from e
+        elif str(args.resume) == "always":
+            raise FileNotFoundError(f"--resume=always but checkpoint not found: {ckpt_path}")
+
+    if resume_ckpt is not None:
+        last_completed_epoch = int(resume_ckpt.get("epoch", 0) or 0)
+        epoch_in_progress: int | None = None
+        try:
+            if resume_ckpt.get("epoch_in_progress") is not None:
+                epoch_in_progress = int(resume_ckpt["epoch_in_progress"])  # type: ignore[arg-type]
+        except Exception:
+            epoch_in_progress = None
+
+        step_in_epoch = 0
+        try:
+            if resume_ckpt.get("step_in_epoch") is not None:
+                step_in_epoch = int(resume_ckpt["step_in_epoch"])  # type: ignore[arg-type]
+        except Exception:
+            step_in_epoch = 0
+
+        ckpt_config = resume_ckpt.get("config")
+        ckpt_batch_size: int | None = None
+        if isinstance(ckpt_config, dict):
+            try:
+                if ckpt_config.get("batch_size") is not None:
+                    ckpt_batch_size = int(ckpt_config["batch_size"])  # type: ignore[arg-type]
+            except Exception:
+                ckpt_batch_size = None
+
+        has_mid_epoch = (
+            epoch_in_progress is not None
+            and step_in_epoch > 0
+            and torch.is_tensor(resume_ckpt.get("sampler_gen_state_epoch_start"))
+        )
+        if has_mid_epoch and ckpt_batch_size is not None and int(args.batch_size) != int(ckpt_batch_size):
+            print(
+                "\n".join(
+                    [
+                        "⚠️ Checkpoint is mid-epoch, but --batch_size changed.",
+                        f"Checkpoint batch_size={ckpt_batch_size}, current batch_size={int(args.batch_size)}.",
+                        "Falling back to epoch-boundary resume (no mid-epoch resume).",
+                    ]
+                )
+            )
+            has_mid_epoch = False
+            step_in_epoch = 0
+
+        if has_mid_epoch:
+            start_epoch = int(epoch_in_progress)
+            resume_step_in_epoch = int(step_in_epoch)
+            resume_start_index_samples = resume_step_in_epoch * int(args.batch_size)
+            resume_mid_epoch = True
+        else:
+            start_epoch = int(last_completed_epoch) + 1
+
+        if start_epoch > int(args.epochs):
+            print(
+                "\n".join(
+                    [
+                        f"✅ Training already completed (checkpoint epoch={last_completed_epoch}, target epochs={int(args.epochs)}).",
+                        "Nothing to do. Increase --epochs to keep training, or use a new --out_dir to start fresh.",
+                    ]
+                )
+            )
+            return
+
+        if isinstance(ckpt_config, dict):
+            ckpt_data = ckpt_config.get("data")
+            ckpt_pairs = ckpt_data.get("pairs") if isinstance(ckpt_data, dict) else None
+            if isinstance(ckpt_pairs, list) and ckpt_pairs:
+                tmp: list[tuple[Path, Path]] = []
+                for item in ckpt_pairs:
+                    if not isinstance(item, dict):
+                        tmp = []
+                        break
+                    v = item.get("video")
+                    c = item.get("csv")
+                    if not v or not c:
+                        tmp = []
+                        break
+                    tmp.append((Path(str(v)).expanduser(), Path(str(c)).expanduser()))
+                if tmp:
+                    pairs_from_ckpt = tmp
+
+        if resume_mid_epoch:
+            print(
+                f"🔄 Resuming from {ckpt_path} (mid-epoch): epoch {start_epoch}, step {resume_step_in_epoch}"
+            )
+        elif last_completed_epoch > 0:
+            print(f"🔄 Resuming from {ckpt_path}: starting epoch {start_epoch} (last={last_completed_epoch})")
+
+    if pairs_from_ckpt is not None:
+        pairs = pairs_from_ckpt
+    elif args.video is not None or args.csv is not None:
         if not args.video or not args.csv:
             raise ValueError("--video and --csv must be provided together (single-video mode).")
         pairs = [(Path(args.video).expanduser(), Path(args.csv).expanduser())]
@@ -289,14 +518,50 @@ def main() -> None:
     val_ds = val_datasets[0] if len(val_datasets) == 1 else ConcatDataset(val_datasets)
 
     num_samples = int(args.samples_per_epoch) if int(args.samples_per_epoch) > 0 else len(train_ds)
-    sampler = WeightedRandomSampler(train_weights, num_samples=num_samples, replacement=True)
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=(device == "cuda"),
-    )
+    sampler_gen = torch.Generator()
+    sampler_gen.manual_seed(int(args.seed))
+    if resume_ckpt is not None:
+        key = "sampler_gen_state"
+        try:
+            eip = resume_ckpt.get("epoch_in_progress")
+            if (
+                eip is not None
+                and int(eip) == int(start_epoch)
+                and torch.is_tensor(resume_ckpt.get("sampler_gen_state_epoch_start"))
+            ):
+                key = "sampler_gen_state_epoch_start"
+        except Exception:
+            pass
+        state = resume_ckpt.get(key)
+        if torch.is_tensor(state):
+            sampler_gen.set_state(state)
+        elif state is not None:
+            print(f"⚠️ Checkpoint had '{key}' but it wasn't a torch Tensor; ignoring.")
+
+    def make_train_dl(*, start_index_samples: int = 0) -> DataLoader:
+        if start_index_samples > 0:
+            sampler: Sampler[int] = _ResumableWeightedRandomSampler(
+                train_weights,
+                num_samples=num_samples,
+                replacement=True,
+                generator=sampler_gen,
+                start_index=start_index_samples,
+            )
+        else:
+            sampler = WeightedRandomSampler(
+                train_weights,
+                num_samples=num_samples,
+                replacement=True,
+                generator=sampler_gen,
+            )
+        return DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=(device == "cuda"),
+        )
+
     val_dl = DataLoader(
         val_ds,
         batch_size=args.batch_size,
@@ -308,8 +573,26 @@ def main() -> None:
     model = FireflyVideoCenterNet(
         base_channels=int(args.base_channels),
         feat_channels=int(args.feat_channels),
-    ).to(device)
+    )
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    if resume_ckpt is not None:
+        try:
+            model.load_state_dict(resume_ckpt["model"])  # type: ignore[arg-type]
+            opt.load_state_dict(resume_ckpt["optimizer"])  # type: ignore[arg-type]
+        except Exception as e:
+            raise RuntimeError(
+                "\n".join(
+                    [
+                        f"Failed to load checkpoint state from: {ckpt_path}",
+                        "If you intended to start a fresh training run, use --resume=never or a new --out_dir.",
+                    ]
+                )
+            ) from e
+
+    model = model.to(device)
+    _optimizer_state_to_device(opt, device)
+    if resume_ckpt is not None:
+        _set_rng_state(resume_ckpt.get("rng_state"), device)
 
     config = {
         "data": {
@@ -333,6 +616,10 @@ def main() -> None:
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "lr": args.lr,
+        "seed": args.seed,
+        "samples_per_epoch": args.samples_per_epoch,
+        "num_samples_per_epoch": int(num_samples),
+        "save_every_n_steps": int(args.save_every_n_steps),
         "device": device,
     }
     (out_dir / "config.json").write_text(json.dumps(config, indent=2))
@@ -343,33 +630,158 @@ def main() -> None:
         tqdm = None
 
     best_val = float("inf")
-    for epoch in range(1, int(args.epochs) + 1):
+    global_step = 0
+    if resume_ckpt is not None:
+        try:
+            if resume_ckpt.get("best_val") is not None:
+                best_val = float(resume_ckpt["best_val"])  # type: ignore[arg-type]
+        except Exception:
+            pass
+        try:
+            if resume_ckpt.get("global_step") is not None:
+                global_step = int(resume_ckpt["global_step"])  # type: ignore[arg-type]
+        except Exception:
+            pass
+
+    # Back-compat: older checkpoints didn't store `best_val`. If we can't recover it,
+    # avoid accidentally overwriting an existing best.pt by estimating its val loss once.
+    best_ckpt_path = ckpt_dir / "best.pt"
+    if resume_ckpt is not None and (not math.isfinite(best_val)) and best_ckpt_path.exists():
+        try:
+            loaded_best = torch.load(best_ckpt_path, map_location="cpu")
+            best_ckpt = loaded_best if isinstance(loaded_best, dict) else None
+            if best_ckpt is not None and best_ckpt.get("val_loss") is not None:
+                best_val = float(best_ckpt["val_loss"])  # type: ignore[arg-type]
+            elif best_ckpt is not None and best_ckpt.get("model") is not None:
+                best_model = FireflyVideoCenterNet(
+                    base_channels=int(args.base_channels),
+                    feat_channels=int(args.feat_channels),
+                )
+                best_model.load_state_dict(best_ckpt["model"])  # type: ignore[arg-type]
+                best_model.eval()
+
+                val_tot = 0.0
+                val_n = 0
+                with torch.no_grad():
+                    for clip, target in val_dl:
+                        target = {k: v for k, v in target.items() if torch.is_tensor(v)}
+                        pred = best_model(clip)
+                        losses = compute_losses(
+                            pred,
+                            target,
+                            wh_weight=float(args.wh_weight),
+                            off_weight=float(args.off_weight),
+                            track_weight=float(args.track_weight),
+                        )
+                        val_tot += float(losses["total"].detach().cpu())
+                        val_n += 1
+                best_val = val_tot / max(1, val_n)
+                print(f"ℹ️ Inferred best_val={best_val:.4f} from existing {best_ckpt_path}")
+        except Exception as e:
+            print(f"⚠️ Could not infer best_val from {best_ckpt_path}: {e}")
+
+    def save_ckpt(
+        *,
+        path: Path,
+        last_completed_epoch: int,
+        epoch_in_progress: int | None = None,
+        step_in_epoch: int = 0,
+        global_step: int = 0,
+        train_loss: float | None = None,
+        val_loss: float | None = None,
+        sampler_gen_state_epoch_start: torch.ByteTensor | None = None,
+        reason: str = "checkpoint",
+    ) -> None:
+        ckpt: dict[str, object] = {
+            "epoch": int(last_completed_epoch),
+            "model": model.state_dict(),
+            "optimizer": opt.state_dict(),
+            "config": config,
+            "video_infos": video_infos,
+            "best_val": float(best_val),
+            "global_step": int(global_step),
+            "rng_state": _get_rng_state(device),
+            "sampler_gen_state": sampler_gen.get_state(),
+            "saved_at_unix": float(time.time()),
+            "reason": str(reason),
+        }
+        if epoch_in_progress is not None:
+            ckpt["epoch_in_progress"] = int(epoch_in_progress)
+            ckpt["step_in_epoch"] = int(step_in_epoch)
+        if train_loss is not None:
+            ckpt["train_loss"] = float(train_loss)
+        if val_loss is not None:
+            ckpt["val_loss"] = float(val_loss)
+        if sampler_gen_state_epoch_start is not None:
+            ckpt["sampler_gen_state_epoch_start"] = sampler_gen_state_epoch_start
+
+        _atomic_torch_save(ckpt, path)
+
+    for epoch in range(int(start_epoch), int(args.epochs) + 1):
+        start_index_samples = 0
+        if resume_mid_epoch and epoch == int(start_epoch):
+            start_index_samples = min(int(resume_start_index_samples), int(num_samples))
+
+        train_dl = make_train_dl(start_index_samples=start_index_samples)
+        sampler_gen_state_epoch_start = sampler_gen.get_state()
+
         model.train()
         train_tot = 0.0
         train_n = 0
-        it = train_dl
-        if tqdm is not None:
-            # Avoid multi-line spam in narrow terminals by letting tqdm size itself.
-            it = tqdm(train_dl, desc=f"train {epoch:03d}", dynamic_ncols=True, file=sys.stdout)
-        for clip, target in it:
-            clip = clip.to(device)
-            target = {k: v.to(device) for k, v in target.items() if torch.is_tensor(v)}
+        step_in_epoch = int(resume_step_in_epoch) if (resume_mid_epoch and epoch == int(start_epoch)) else 0
 
-            pred = model(clip)
-            losses = compute_losses(
-                pred,
-                target,
-                wh_weight=float(args.wh_weight),
-                off_weight=float(args.off_weight),
-                track_weight=float(args.track_weight),
+        try:
+            it = train_dl
+            if tqdm is not None:
+                # Avoid multi-line spam in narrow terminals by letting tqdm size itself.
+                it = tqdm(train_dl, desc=f"train {epoch:03d}", dynamic_ncols=True, file=sys.stdout)
+            for clip, target in it:
+                clip = clip.to(device)
+                target = {k: v.to(device) for k, v in target.items() if torch.is_tensor(v)}
+
+                pred = model(clip)
+                losses = compute_losses(
+                    pred,
+                    target,
+                    wh_weight=float(args.wh_weight),
+                    off_weight=float(args.off_weight),
+                    track_weight=float(args.track_weight),
+                )
+
+                opt.zero_grad(set_to_none=True)
+                losses["total"].backward()
+                opt.step()
+
+                train_tot += float(losses["total"].detach().cpu())
+                train_n += 1
+                step_in_epoch += 1
+                global_step += 1
+
+                if int(args.save_every_n_steps) > 0 and (global_step % int(args.save_every_n_steps) == 0):
+                    save_ckpt(
+                        path=ckpt_dir / "last.pt",
+                        last_completed_epoch=epoch - 1,
+                        epoch_in_progress=epoch,
+                        step_in_epoch=step_in_epoch,
+                        global_step=global_step,
+                        train_loss=(train_tot / max(1, train_n)),
+                        sampler_gen_state_epoch_start=sampler_gen_state_epoch_start,
+                        reason=f"step_{global_step}",
+                    )
+        except KeyboardInterrupt:
+            print("\n⚠️ Interrupted. Saving checkpoint so you can resume…")
+            save_ckpt(
+                path=ckpt_dir / "last.pt",
+                last_completed_epoch=epoch - 1,
+                epoch_in_progress=epoch,
+                step_in_epoch=step_in_epoch,
+                global_step=global_step,
+                train_loss=(train_tot / max(1, train_n)),
+                sampler_gen_state_epoch_start=sampler_gen_state_epoch_start,
+                reason="interrupt",
             )
-
-            opt.zero_grad(set_to_none=True)
-            losses["total"].backward()
-            opt.step()
-
-            train_tot += float(losses["total"].detach().cpu())
-            train_n += 1
+            print(f"  💾 saved → {ckpt_dir / 'last.pt'}")
+            return
 
         train_avg = train_tot / max(1, train_n)
 
@@ -395,19 +807,33 @@ def main() -> None:
                 val_n += 1
 
         val_avg = val_tot / max(1, val_n)
+        best_path = ckpt_dir / "best.pt"
+        if math.isfinite(best_val):
+            is_best = val_avg < best_val
+        else:
+            is_best = not best_path.exists()
+        if is_best:
+            best_val = val_avg
+
         print(f"Epoch {epoch:03d} | train_loss {train_avg:.4f} | val_loss {val_avg:.4f}")
 
-        ckpt = {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": opt.state_dict(),
-            "config": config,
-            "video_infos": video_infos,
-        }
-        torch.save(ckpt, ckpt_dir / "last.pt")
-        if val_avg < best_val:
-            best_val = val_avg
-            torch.save(ckpt, ckpt_dir / "best.pt")
+        save_ckpt(
+            path=ckpt_dir / "last.pt",
+            last_completed_epoch=epoch,
+            global_step=global_step,
+            train_loss=train_avg,
+            val_loss=val_avg,
+            reason="epoch_end",
+        )
+        if is_best:
+            save_ckpt(
+                path=ckpt_dir / "best.pt",
+                last_completed_epoch=epoch,
+                global_step=global_step,
+                train_loss=train_avg,
+                val_loss=val_avg,
+                reason="best",
+            )
             print(f"  ✅ saved best → {ckpt_dir / 'best.pt'}")
 
 
