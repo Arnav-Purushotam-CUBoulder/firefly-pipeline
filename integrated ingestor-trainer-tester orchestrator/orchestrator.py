@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -17,6 +18,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # User-configurable globals (defaults; CLI args can override)
 # -----------------------------------------------------------------------------
+
+# Optional single root folder. If set (or passed via --root), and any of
+# DATA_ROOT / MODEL_ZOO_ROOT / INFERENCE_OUTPUT_ROOT are unset, they default to:
+#   <ROOT>/patch training datasets and pipeline validation data
+#   <ROOT>/model zoo
+#   <ROOT>/inference outputs
+ROOT_PATH: str | Path = ""
 
 # New annotator batch to ingest (firefly or background). Recommended naming:
 #   <video_name>_<species_name>_<day_time|night_time>_<firefly|background>.csv
@@ -71,10 +79,49 @@ TRAIN_MODELS_IF_TRAIN_ROWS_PRESENT: bool = True
 # Set True to do everything except actually call species scaler / training / gateway.
 DRY_RUN: bool = False
 
+# -----------------------------------------------------------------------------
+# Legacy baseline evaluation (optional)
+# -----------------------------------------------------------------------------
+
+# If True, also run legacy/lab baseline detectors on the same eval videos and score
+# them using the same point-distance validation logic (Stage5 validator).
+RUN_BASELINE_EVAL: bool = True
+
+# If True, only run baselines on videos routed to the night pipeline.
+BASELINES_ONLY_FOR_NIGHT: bool = True
+
+# Baseline validator settings (match day pipeline defaults)
+BASELINE_DIST_THRESHOLDS_PX: List[float] = [1.0, 2.0, 3.0, 4.0, 5.0]
+BASELINE_VALIDATE_CROP_W: int = 10
+BASELINE_VALIDATE_CROP_H: int = 10
+BASELINE_MAX_FRAMES: int | None = None
+
+# Baseline 1: Nolan-style rolling-mean background detector
+RUN_BASELINE_LAB_METHOD: bool = True
+LAB_BASELINE_THRESHOLD: float = 0.12
+LAB_BASELINE_BLUR_SIGMA: float = 1.0
+LAB_BASELINE_BKGR_WINDOW_SEC: float = 2.0
+
+# Baseline 2: Raphael OOrb tracking detector (ffnet) + gaussian centroids
+RUN_BASELINE_RAPHAEL_METHOD: bool = True
+RAPHAEL_MODEL_SOURCE_PATH: str | Path = "/Users/arnavps/Desktop/RA info/New Deep Learning project/firefl-eye-net/ffnet_best.pth"
+RAPHAEL_BW_THR: float = 0.2
+RAPHAEL_CLASSIFY_THR: float = 0.98
+RAPHAEL_BKGR_WINDOW_SEC: float = 2.0
+RAPHAEL_BLUR_SIGMA: float = 0.0
+RAPHAEL_PATCH_SIZE_PX: int = 33
+RAPHAEL_BATCH_SIZE: int = 1000
+RAPHAEL_GAUSS_CROP_SIZE: int = 10
+RAPHAEL_DEVICE: str = "auto"
+
 
 # -----------------------------------------------------------------------------
 # Internal constants
 # -----------------------------------------------------------------------------
+
+DEFAULT_DATA_SUBDIR = "patch training datasets and pipeline validation data"
+DEFAULT_MODEL_ZOO_SUBDIR = "model zoo"
+DEFAULT_INFERENCE_OUTPUT_SUBDIR = "inference outputs"
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
 
@@ -84,6 +131,12 @@ TRAINING_SCRIPT_REL_PATH = Path("test1/tools/model training tools/training resne
 
 DAY_OUTPUT_SUBDIR = "day_pipeline_v3"
 NIGHT_OUTPUT_SUBDIR = "night_time_pipeline"
+
+DAY_PIPELINE_DIR_REL_PATH = Path("test1/day time pipeline v3 (yolo + patch classifier ensemble)")
+LAB_BASELINE_SCRIPT_REL_PATH = Path("test1/tools/legacy_baselines/nolan_mp4_to_predcsv.py")
+RAPHAEL_BASELINE_SCRIPT_REL_PATH = Path("test1/tools/legacy_baselines/raphael_oorb_detect_and_gauss.py")
+BASELINE_OUTPUT_SUBDIR = "baselines"
+BASELINE_MODELS_SUBDIR = "baseline models"
 
 
 @dataclass(frozen=True)
@@ -100,6 +153,32 @@ def _today_tag() -> str:
 
 def _run_tag() -> str:
     return datetime.now().strftime("%Y%m%d__%H%M%S")
+
+
+def _run_dir_name(
+    ident: BatchIdentity,
+    *,
+    train_fraction: float,
+    train_rows_firefly: int,
+    train_rows_background: int,
+    heldout_rows_firefly: int,
+    did_train: bool,
+) -> str:
+    tf_pct = int(round(float(train_fraction) * 100))
+    mode = "trained" if did_train else "reused"
+    parts = [
+        _run_tag(),
+        ident.video_name,
+        ident.species_name,
+        ident.time_of_day,
+        f"tf{tf_pct:02d}",
+        f"trF{int(train_rows_firefly)}",
+        f"trB{int(train_rows_background)}",
+        f"hoF{int(heldout_rows_firefly)}",
+        mode,
+    ]
+    safe_parts = [_safe_name(str(p)) for p in parts if str(p).strip()]
+    return "__".join(safe_parts)
 
 
 def _safe_name(s: str) -> str:
@@ -578,13 +657,220 @@ def _run_gateway(
     subprocess.run(cmd, cwd=str(repo_root), check=True)
 
 
+def _copy_file_if_needed(src: Path, dst: Path, *, dry_run: bool) -> None:
+    src = Path(src)
+    dst = Path(dst)
+    try:
+        if src.resolve() == dst.resolve():
+            return
+    except Exception:
+        pass
+
+    if dry_run:
+        print(f"[dry-run] Would copy baseline asset: {src} -> {dst}")
+        return
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        try:
+            if dst.stat().st_size == src.stat().st_size:
+                return
+        except Exception:
+            pass
+    shutil.copy2(src, dst)
+
+
+def _ensure_raphael_model_copy(*, model_root: Path, dry_run: bool) -> Dict[str, Any]:
+    src_str = str(RAPHAEL_MODEL_SOURCE_PATH).strip() if RAPHAEL_MODEL_SOURCE_PATH else ""
+    if not src_str:
+        return {"source": None, "copied": None, "error": "no_source_path"}
+
+    src = Path(src_str).expanduser().resolve()
+    if not src.exists():
+        return {"source": str(src), "copied": None, "error": "source_not_found"}
+
+    dst_dir = model_root / BASELINE_MODELS_SUBDIR / "raphael_ffnet"
+    dst = dst_dir / src.name
+    try:
+        _copy_file_if_needed(src, dst, dry_run=dry_run)
+        return {"source": str(src), "copied": str(dst), "error": None}
+    except Exception as e:
+        return {"source": str(src), "copied": None, "error": f"copy_failed: {e}"}
+
+
+def _run_baseline_lab_detector(
+    *,
+    repo_root: Path,
+    video_path: Path,
+    out_pred_csv: Path,
+    threshold: float,
+    blur_sigma: float,
+    bkgr_window_sec: float,
+    max_frames: int | None,
+    dry_run: bool,
+) -> None:
+    script = (repo_root / LAB_BASELINE_SCRIPT_REL_PATH).resolve()
+    if not script.exists():
+        raise FileNotFoundError(script)
+
+    cmd = [
+        sys.executable,
+        str(script),
+        "--video",
+        str(video_path),
+        "--out-csv",
+        str(out_pred_csv),
+        "--threshold",
+        str(float(threshold)),
+        "--blur-sigma",
+        str(float(blur_sigma)),
+        "--bkgr-window-sec",
+        str(float(bkgr_window_sec)),
+    ]
+    if max_frames is not None:
+        cmd += ["--max-frames", str(int(max_frames))]
+
+    if dry_run:
+        print("[dry-run] Would run lab baseline detector:", " ".join(cmd))
+        return
+    subprocess.run(cmd, cwd=str(repo_root), check=True)
+
+
+def _run_baseline_raphael_detector(
+    *,
+    repo_root: Path,
+    video_path: Path,
+    model_path: Path,
+    out_pred_csv: Path,
+    out_raw_csv: Path,
+    out_gauss_csv: Path,
+    bw_thr: float,
+    classify_thr: float,
+    bkgr_window_sec: float,
+    blur_sigma: float,
+    patch_size_px: int,
+    batch_size: int,
+    gauss_crop_size: int,
+    max_frames: int | None,
+    device: str,
+    dry_run: bool,
+) -> None:
+    script = (repo_root / RAPHAEL_BASELINE_SCRIPT_REL_PATH).resolve()
+    if not script.exists():
+        raise FileNotFoundError(script)
+
+    cmd = [
+        sys.executable,
+        str(script),
+        "--video",
+        str(video_path),
+        "--model",
+        str(model_path),
+        "--out-csv",
+        str(out_pred_csv),
+        "--raw-csv",
+        str(out_raw_csv),
+        "--gauss-csv",
+        str(out_gauss_csv),
+        "--bw-thr",
+        str(float(bw_thr)),
+        "--classify-thr",
+        str(float(classify_thr)),
+        "--bkgr-window-sec",
+        str(float(bkgr_window_sec)),
+        "--blur-sigma",
+        str(float(blur_sigma)),
+        "--patch-size",
+        str(int(patch_size_px)),
+        "--batch-size",
+        str(int(batch_size)),
+        "--gauss-crop-size",
+        str(int(gauss_crop_size)),
+        "--device",
+        str(device),
+    ]
+    if max_frames is not None:
+        cmd += ["--max-frames", str(int(max_frames))]
+
+    if dry_run:
+        print("[dry-run] Would run Raphael baseline detector:", " ".join(cmd))
+        return
+    subprocess.run(cmd, cwd=str(repo_root), check=True)
+
+
+def _run_stage5_validator(
+    *,
+    repo_root: Path,
+    orig_video_path: Path,
+    pred_csv_path: Path,
+    gt_csv_path: Path,
+    out_dir: Path,
+    dist_thresholds: Sequence[float],
+    crop_w: int,
+    crop_h: int,
+    gt_t_offset: int,
+    max_frames: int | None,
+    dry_run: bool,
+) -> None:
+    day_dir = (repo_root / DAY_PIPELINE_DIR_REL_PATH).resolve()
+    stage5_py = day_dir / "stage5_validate.py"
+    if not stage5_py.exists():
+        raise FileNotFoundError(stage5_py)
+
+    # Prevent stage5 validator from auto-searching for weights for FN scoring.
+    # Passing a non-existent path avoids environment scanning / auto-discovery.
+    no_weights = out_dir / "__no_fn_scoring_weights__.pt"
+    max_frames_code = str(int(max_frames)) if max_frames is not None else "None"
+
+    code = "\n".join(
+        [
+            "from pathlib import Path",
+            "from stage5_validate import stage5_validate_against_gt",
+            "stage5_validate_against_gt(",
+            f"    orig_video_path=Path({repr(str(orig_video_path))}),",
+            f"    pred_csv_path=Path({repr(str(pred_csv_path))}),",
+            f"    gt_csv_path=Path({repr(str(gt_csv_path))}),",
+            f"    out_dir=Path({repr(str(out_dir))}),",
+            f"    dist_thresholds={list(float(x) for x in dist_thresholds)!r},",
+            f"    crop_w={int(crop_w)},",
+            f"    crop_h={int(crop_h)},",
+            f"    gt_t_offset={int(gt_t_offset)},",
+            f"    max_frames={max_frames_code},",
+            "    only_firefly_rows=True,",
+            "    show_per_frame=False,",
+            f"    model_path=Path({repr(str(no_weights))}),",
+            "    print_load_status=False,",
+            ")",
+        ]
+    )
+
+    if dry_run:
+        print(f"[dry-run] Would run Stage5 validator in {day_dir} on {pred_csv_path.name}")
+        return
+    subprocess.run([sys.executable, "-c", code], cwd=str(day_dir), check=True)
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Integrated ingest → train → validate orchestrator.")
     p.add_argument("--annotations-csv", type=str, default=str(ANNOTATIONS_CSV_PATH) if ANNOTATIONS_CSV_PATH else "")
     p.add_argument("--video", type=str, default=str(ANNOTATIONS_VIDEO_PATH) if ANNOTATIONS_VIDEO_PATH else "")
-    p.add_argument("--data-root", type=str, default=str(DATA_ROOT) if DATA_ROOT else "")
-    p.add_argument("--model-zoo-root", type=str, default=str(MODEL_ZOO_ROOT) if MODEL_ZOO_ROOT else "")
-    p.add_argument("--inference-output-root", type=str, default=str(INFERENCE_OUTPUT_ROOT) if INFERENCE_OUTPUT_ROOT else "")
+
+    p.add_argument(
+        "--root",
+        type=str,
+        default=None,
+        help=(
+            "Single root folder under which data/models/inference outputs will be stored. "
+            "If provided, defaults to: "
+            f"data=<root>/{DEFAULT_DATA_SUBDIR!r}, "
+            f"model_zoo=<root>/{DEFAULT_MODEL_ZOO_SUBDIR!r}, "
+            f"inference=<root>/{DEFAULT_INFERENCE_OUTPUT_SUBDIR!r}."
+        ),
+    )
+    p.add_argument("--data-root", type=str, default=None, help="Override dataset root used by species scaler.")
+    p.add_argument("--model-zoo-root", type=str, default=None, help="Override model zoo root (models + history).")
+    p.add_argument("--inference-output-root", type=str, default=None, help="Override inference output root.")
+
     p.add_argument("--train-fraction", type=float, default=float(TRAIN_FRACTION_OF_BATCH))
     p.add_argument("--dry-run", action="store_true", default=bool(DRY_RUN))
     return p.parse_args()
@@ -594,8 +880,6 @@ def main() -> int:
     args = _parse_args()
     if not args.annotations_csv or not args.video:
         raise SystemExit("Pass --annotations-csv and --video (or set globals at top of file).")
-    if not args.data_root or not args.model_zoo_root or not args.inference_output_root:
-        raise SystemExit("Pass --data-root, --model-zoo-root, and --inference-output-root (or set globals).")
 
     repo_root = Path(__file__).resolve().parents[2]
     gateway_path = (repo_root / GATEWAY_REL_PATH).resolve()
@@ -604,9 +888,57 @@ def main() -> int:
 
     annotations_csv = Path(args.annotations_csv).expanduser().resolve()
     video_path = Path(args.video).expanduser().resolve()
-    data_root = Path(args.data_root).expanduser().resolve()
-    model_root = Path(args.model_zoo_root).expanduser().resolve()
-    inference_root = Path(args.inference_output_root).expanduser().resolve()
+    root_arg = (str(args.root).strip() if args.root else "") or (str(ROOT_PATH).strip() if ROOT_PATH else "")
+    root = Path(root_arg).expanduser().resolve() if root_arg else None
+
+    data_root_arg = (
+        str(args.data_root).strip()
+        if args.data_root is not None
+        else (str(DATA_ROOT).strip() if DATA_ROOT else "")
+    )
+    model_root_arg = (
+        str(args.model_zoo_root).strip()
+        if args.model_zoo_root is not None
+        else (str(MODEL_ZOO_ROOT).strip() if MODEL_ZOO_ROOT else "")
+    )
+    inference_root_arg = (
+        str(args.inference_output_root).strip()
+        if args.inference_output_root is not None
+        else (str(INFERENCE_OUTPUT_ROOT).strip() if INFERENCE_OUTPUT_ROOT else "")
+    )
+
+    if root is None and (not data_root_arg or not model_root_arg or not inference_root_arg):
+        raise SystemExit(
+            "Pass --root (recommended) or pass --data-root, --model-zoo-root, and --inference-output-root."
+        )
+
+    if root is not None:
+        root.mkdir(parents=True, exist_ok=True)
+
+    data_root = (
+        Path(data_root_arg).expanduser().resolve()
+        if data_root_arg
+        else (root / DEFAULT_DATA_SUBDIR).expanduser().resolve()  # type: ignore[operator]
+    )
+    model_root = (
+        Path(model_root_arg).expanduser().resolve()
+        if model_root_arg
+        else (root / DEFAULT_MODEL_ZOO_SUBDIR).expanduser().resolve()  # type: ignore[operator]
+    )
+    inference_root = (
+        Path(inference_root_arg).expanduser().resolve()
+        if inference_root_arg
+        else (root / DEFAULT_INFERENCE_OUTPUT_SUBDIR).expanduser().resolve()  # type: ignore[operator]
+    )
+
+    # Ensure required folder scaffolds exist under the chosen roots.
+    data_root.mkdir(parents=True, exist_ok=True)
+    (data_root / "batch_exports").mkdir(parents=True, exist_ok=True)
+    (data_root / "Integrated_prototype_datasets" / "integrated pipeline datasets").mkdir(parents=True, exist_ok=True)
+    (data_root / "Integrated_prototype_datasets" / "single species datasets").mkdir(parents=True, exist_ok=True)
+    (data_root / "Integrated_prototype_validation_datasets" / "combined species folder").mkdir(parents=True, exist_ok=True)
+    (data_root / "Integrated_prototype_validation_datasets" / "individual species folder").mkdir(parents=True, exist_ok=True)
+
     inference_root.mkdir(parents=True, exist_ok=True)
 
     ident = _parse_batch_identity(annotations_csv)
@@ -876,7 +1208,14 @@ def main() -> int:
             eval_error = "no_eval_videos_selected"
         print(f"[orchestrator] WARNING: {eval_error}")
 
-    run_id = _run_tag()
+    run_id = _run_dir_name(
+        ident,
+        train_fraction=float(args.train_fraction),
+        train_rows_firefly=len(train_firefly),
+        train_rows_background=len(background_rows),
+        heldout_rows_firefly=len(heldout_firefly),
+        did_train=bool(do_train),
+    )
     results: List[Dict[str, Any]] = []
 
     def _eval_one_model(model_key: str, *, day_patch_model: Path | None, night_cnn_model: Path | None) -> None:
@@ -977,6 +1316,183 @@ def main() -> int:
 
     results_summary = _summarize_results(results)
 
+    # ───────────────────────────────── baseline evaluation ─────────────────────────────────
+    baseline_assets: Dict[str, Any] = {
+        "enabled": bool(RUN_BASELINE_EVAL),
+        "only_for_night": bool(BASELINES_ONLY_FOR_NIGHT),
+        "validator": {
+            "dist_thresholds_px": list(BASELINE_DIST_THRESHOLDS_PX),
+            "crop_w": int(BASELINE_VALIDATE_CROP_W),
+            "crop_h": int(BASELINE_VALIDATE_CROP_H),
+            "max_frames": int(BASELINE_MAX_FRAMES) if BASELINE_MAX_FRAMES is not None else None,
+        },
+        "lab_method": {
+            "enabled": bool(RUN_BASELINE_LAB_METHOD),
+            "threshold": float(LAB_BASELINE_THRESHOLD),
+            "blur_sigma": float(LAB_BASELINE_BLUR_SIGMA),
+            "bkgr_window_sec": float(LAB_BASELINE_BKGR_WINDOW_SEC),
+        },
+        "raphael_method": {
+            "enabled": bool(RUN_BASELINE_RAPHAEL_METHOD),
+            "bw_thr": float(RAPHAEL_BW_THR),
+            "classify_thr": float(RAPHAEL_CLASSIFY_THR),
+            "bkgr_window_sec": float(RAPHAEL_BKGR_WINDOW_SEC),
+            "blur_sigma": float(RAPHAEL_BLUR_SIGMA),
+            "patch_size_px": int(RAPHAEL_PATCH_SIZE_PX),
+            "batch_size": int(RAPHAEL_BATCH_SIZE),
+            "gauss_crop_size": int(RAPHAEL_GAUSS_CROP_SIZE),
+            "device": str(RAPHAEL_DEVICE),
+            "model": {},
+        },
+    }
+
+    baseline_results: List[Dict[str, Any]] = []
+    if RUN_BASELINE_EVAL and eval_items:
+        raphael_model_info = _ensure_raphael_model_copy(model_root=model_root, dry_run=bool(args.dry_run))
+        baseline_assets["raphael_method"]["model"] = raphael_model_info
+
+        raphael_model_path: Path | None = (
+            Path(raphael_model_info["copied"]).expanduser().resolve()
+            if raphael_model_info.get("copied")
+            else None
+        )
+
+        warned_no_raphael_model = False
+
+        for video_name, vp, gt_rows in eval_items:
+            try:
+                route = _route_for_video(
+                    vp, thr=float(GATEWAY_BRIGHTNESS_THRESHOLD), frames=int(GATEWAY_BRIGHTNESS_NUM_FRAMES)
+                )
+            except Exception:
+                continue
+
+            if BASELINES_ONLY_FOR_NIGHT and route != "night":
+                continue
+
+            # Baseline: lab method
+            if RUN_BASELINE_LAB_METHOD:
+                out_root = inference_root / run_id / BASELINE_OUTPUT_SUBDIR / "lab_method" / video_name
+                out_root.mkdir(parents=True, exist_ok=True)
+                gt_dir = out_root / "ground truth"
+                gt_csv = gt_dir / "gt.csv"
+                _write_gt_csv(gt_csv, gt_rows)
+
+                pred_csv = out_root / "predictions.csv"
+                stage5_dir = out_root / "stage5 validation" / vp.stem
+
+                t0 = time.time()
+                try:
+                    _run_baseline_lab_detector(
+                        repo_root=repo_root,
+                        video_path=vp,
+                        out_pred_csv=pred_csv,
+                        threshold=float(LAB_BASELINE_THRESHOLD),
+                        blur_sigma=float(LAB_BASELINE_BLUR_SIGMA),
+                        bkgr_window_sec=float(LAB_BASELINE_BKGR_WINDOW_SEC),
+                        max_frames=int(BASELINE_MAX_FRAMES) if BASELINE_MAX_FRAMES is not None else None,
+                        dry_run=bool(args.dry_run),
+                    )
+                    _run_stage5_validator(
+                        repo_root=repo_root,
+                        orig_video_path=vp,
+                        pred_csv_path=pred_csv,
+                        gt_csv_path=gt_csv,
+                        out_dir=stage5_dir,
+                        dist_thresholds=BASELINE_DIST_THRESHOLDS_PX,
+                        crop_w=int(BASELINE_VALIDATE_CROP_W),
+                        crop_h=int(BASELINE_VALIDATE_CROP_H),
+                        gt_t_offset=0,
+                        max_frames=int(BASELINE_MAX_FRAMES) if BASELINE_MAX_FRAMES is not None else None,
+                        dry_run=bool(args.dry_run),
+                    )
+                    metrics = _parse_validation_metrics(stage5_dir)
+                except Exception as e:
+                    metrics = {"error": str(e)}
+                baseline_results.append(
+                    {
+                        "model_key": "baseline_lab_method",
+                        "video_name": video_name,
+                        "video_path": str(vp),
+                        "route": route,
+                        "output_root": str(out_root),
+                        "duration_s": float(time.time() - t0),
+                        "validation_metrics": metrics,
+                    }
+                )
+
+            # Baseline: Raphael method
+            if RUN_BASELINE_RAPHAEL_METHOD:
+                if raphael_model_path is None or not raphael_model_path.exists():
+                    if not warned_no_raphael_model:
+                        print(
+                            "[orchestrator] WARNING: Raphael baseline enabled but model not found. "
+                            f"Set RAPHAEL_MODEL_SOURCE_PATH; got: {RAPHAEL_MODEL_SOURCE_PATH!r}"
+                        )
+                        warned_no_raphael_model = True
+                    continue
+
+                out_root = inference_root / run_id / BASELINE_OUTPUT_SUBDIR / "raphael_method" / video_name
+                out_root.mkdir(parents=True, exist_ok=True)
+                gt_dir = out_root / "ground truth"
+                gt_csv = gt_dir / "gt.csv"
+                _write_gt_csv(gt_csv, gt_rows)
+
+                pred_csv = out_root / "predictions.csv"
+                raw_csv = out_root / "raw_detections.csv"
+                gauss_csv = out_root / "gauss_centroids.csv"
+                stage5_dir = out_root / "stage5 validation" / vp.stem
+
+                t0 = time.time()
+                try:
+                    _run_baseline_raphael_detector(
+                        repo_root=repo_root,
+                        video_path=vp,
+                        model_path=raphael_model_path,
+                        out_pred_csv=pred_csv,
+                        out_raw_csv=raw_csv,
+                        out_gauss_csv=gauss_csv,
+                        bw_thr=float(RAPHAEL_BW_THR),
+                        classify_thr=float(RAPHAEL_CLASSIFY_THR),
+                        bkgr_window_sec=float(RAPHAEL_BKGR_WINDOW_SEC),
+                        blur_sigma=float(RAPHAEL_BLUR_SIGMA),
+                        patch_size_px=int(RAPHAEL_PATCH_SIZE_PX),
+                        batch_size=int(RAPHAEL_BATCH_SIZE),
+                        gauss_crop_size=int(RAPHAEL_GAUSS_CROP_SIZE),
+                        max_frames=int(BASELINE_MAX_FRAMES) if BASELINE_MAX_FRAMES is not None else None,
+                        device=str(RAPHAEL_DEVICE),
+                        dry_run=bool(args.dry_run),
+                    )
+                    _run_stage5_validator(
+                        repo_root=repo_root,
+                        orig_video_path=vp,
+                        pred_csv_path=pred_csv,
+                        gt_csv_path=gt_csv,
+                        out_dir=stage5_dir,
+                        dist_thresholds=BASELINE_DIST_THRESHOLDS_PX,
+                        crop_w=int(BASELINE_VALIDATE_CROP_W),
+                        crop_h=int(BASELINE_VALIDATE_CROP_H),
+                        gt_t_offset=0,
+                        max_frames=int(BASELINE_MAX_FRAMES) if BASELINE_MAX_FRAMES is not None else None,
+                        dry_run=bool(args.dry_run),
+                    )
+                    metrics = _parse_validation_metrics(stage5_dir)
+                except Exception as e:
+                    metrics = {"error": str(e)}
+                baseline_results.append(
+                    {
+                        "model_key": "baseline_raphael_method",
+                        "video_name": video_name,
+                        "video_path": str(vp),
+                        "route": route,
+                        "output_root": str(out_root),
+                        "duration_s": float(time.time() - t0),
+                        "validation_metrics": metrics,
+                    }
+                )
+
+    baseline_summary = _summarize_results(baseline_results) if baseline_results else {}
+
     record = {
         "run_id": run_id,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -1022,15 +1538,37 @@ def main() -> int:
             "n_eval_videos": len(eval_items),
             "eval_error": eval_error,
         },
+        "baselines": {
+            "assets": baseline_assets,
+            "results": baseline_results,
+            "results_summary": baseline_summary,
+        },
         "results": results,
         "results_summary": results_summary,
     }
+    # Save a full run record alongside inference outputs for easy inspection.
+    run_dir = inference_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    record_path = run_dir / "run_record.json"
+    if bool(args.dry_run):
+        print(f"[dry-run] Would write run record → {record_path}")
+    else:
+        record_path.write_text(json.dumps(record, indent=2))
+        print(f"[orchestrator] Run record → {record_path}")
     _append_jsonl(history_path, record)
     print(f"[orchestrator] Appended results → {history_path}")
     print(f"[orchestrator] Run outputs → {inference_root / run_id}")
     if results_summary:
         print("[orchestrator] Results summary (best-F1 per video):")
         for mk, s in results_summary.items():
+            mean_f1 = s.get("mean_best_f1")
+            mean_str = f"{float(mean_f1):.4f}" if isinstance(mean_f1, (int, float)) else "n/a"
+            print(
+                f"  - {mk}: mean_best_f1={mean_str}  n_videos={s.get('n_with_metrics', 0)}/{s.get('n_videos', 0)}"
+            )
+    if baseline_summary:
+        print("[orchestrator] Baselines summary (best-F1 per video):")
+        for mk, s in baseline_summary.items():
             mean_f1 = s.get("mean_best_f1")
             mean_str = f"{float(mean_f1):.4f}" if isinstance(mean_f1, (int, float)) else "n/a"
             print(

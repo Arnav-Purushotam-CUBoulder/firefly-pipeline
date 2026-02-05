@@ -606,8 +606,9 @@ def _write_crops_and_csvs_for_threshold(
         w_fn = csv.writer(f_fn); w_fn.writerow(['x','y','t','filepath','confidence'])
 
         cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"[stage5] Could not open video: {video_path}")
+        if not cap.isOpened():
+            raise RuntimeError(f"[stage5] Could not open video: {video_path}")
+
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
         limit = min(max_frames, total_frames) if max_frames is not None else total_frames
 
