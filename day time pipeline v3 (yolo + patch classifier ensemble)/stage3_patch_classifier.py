@@ -77,20 +77,38 @@ def _device():
         raise RuntimeError("PyTorch is required for Stage 3. Install torch/torchvision.") from e
 
 
+def _configure_torch_runtime(dev) -> None:
+    """Enable fast CUDA backend settings when configured."""
+    if getattr(dev, "type", "") != "cuda":
+        return
+    import torch
+
+    if bool(getattr(params, "STAGE3_ENABLE_CUDNN_BENCHMARK", True)):
+        torch.backends.cudnn.benchmark = True
+    allow_tf32 = bool(getattr(params, "STAGE3_ALLOW_TF32", True))
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+
+
 def _to_tensor_batch(np_list: List[np.ndarray], img_size: int):
     """Convert list of RGB uint8 HxWx3 arrays to a torch batch."""
     import torch
 
     out = []
     do_norm = bool(getattr(params, "IMAGENET_NORMALIZE", False))
+    mean_t = None
+    std_t = None
+    if do_norm:
+        mean_t = torch.tensor(params.IMAGENET_MEAN, dtype=torch.float32).view(3, 1, 1)
+        std_t = torch.tensor(params.IMAGENET_STD, dtype=torch.float32).view(3, 1, 1)
     for arr in np_list:
         if arr.shape[0] != img_size or arr.shape[1] != img_size:
             arr = cv2.resize(arr, (int(img_size), int(img_size)), interpolation=cv2.INTER_LINEAR)
         ten = torch.from_numpy(arr).permute(2, 0, 1).contiguous().float().div_(255.0)
         if do_norm:
-            mean = torch.tensor(params.IMAGENET_MEAN).view(3, 1, 1)
-            std = torch.tensor(params.IMAGENET_STD).view(3, 1, 1)
-            ten = (ten - mean) / std
+            ten = (ten - mean_t) / std_t
         out.append(ten)
     return torch.stack(out, dim=0)
 
@@ -107,6 +125,7 @@ def _load_model(model_path: Path):
         return _MODEL_CACHE["model"], _MODEL_CACHE["device"]
 
     dev = _device()
+    _configure_torch_runtime(dev)
     m = resnet18(weights=None)
     m.fc = nn.Linear(m.fc.in_features, 2)
 
@@ -132,6 +151,7 @@ def _load_model(model_path: Path):
 
     # Warm-up once to reduce first-batch latency
     if not _MODEL_CACHE["warmed"]:
+        use_amp = bool(getattr(params, "STAGE3_USE_AMP", True)) and getattr(dev, "type", "") == "cuda"
         with torch.inference_mode():
             dummy = torch.zeros(
                 1,
@@ -140,7 +160,11 @@ def _load_model(model_path: Path):
                 int(getattr(params, "STAGE3_INPUT_SIZE", 10)),
                 device=dev,
             )
-            _ = m(dummy)
+            if use_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    _ = m(dummy)
+            else:
+                _ = m(dummy)
         _MODEL_CACHE["warmed"] = True
 
     _MODEL_CACHE["model"] = m
@@ -280,6 +304,10 @@ def run_for_video(video_path: Path) -> Path:
     batch_gpu = int(getattr(params, "STAGE3_BATCH_SIZE_GPU", 4096))
     batch_cpu = int(getattr(params, "STAGE3_BATCH_SIZE_CPU", 512))
     batch_size = batch_gpu if dev.type in {"cuda", "mps"} else batch_cpu
+    use_amp = bool(getattr(params, "STAGE3_USE_AMP", True)) and dev.type == "cuda"
+    input_size = int(getattr(params, "STAGE3_INPUT_SIZE", 10))
+    pos_idx = int(getattr(params, "STAGE3_POSITIVE_CLASS_INDEX", 1))
+    pos_thr = float(getattr(params, "STAGE3_POSITIVE_THRESHOLD", 0.5))
 
     cur_batch: List[Tuple[int, int, int, int, int, np.ndarray, int]] = []  # (t,x,y,w,h,RGB,det_id)
     processed = 0
@@ -299,15 +327,16 @@ def run_for_video(video_path: Path) -> Path:
             if not cur_batch:
                 return
             imgs = [b[5] for b in cur_batch]
-            x_t = _to_tensor_batch(imgs, int(getattr(params, "STAGE3_INPUT_SIZE", 10))).to(dev)
+            x_t = _to_tensor_batch(imgs, input_size).to(dev, non_blocking=(dev.type == "cuda"))
             with torch.inference_mode():
-                logits = model(x_t)
-                prob = torch.softmax(
-                    logits, dim=1
-                )[:, int(getattr(params, "STAGE3_POSITIVE_CLASS_INDEX", 1))]
-            thr = float(getattr(params, "STAGE3_POSITIVE_THRESHOLD", 0.5))
-            preds = (prob >= thr).cpu().numpy().astype(bool)
-            probs_np = prob.detach().cpu().numpy()
+                if use_amp:
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        logits = model(x_t)
+                else:
+                    logits = model(x_t)
+                prob = torch.softmax(logits.float(), dim=1)[:, pos_idx]
+            preds = (prob >= pos_thr).cpu().numpy().astype(bool)
+            probs_np = prob.cpu().numpy()
             pos_probs_all.extend(probs_np.tolist())
 
             for (t, x0, y0, w, h, patch_rgb, det_id), is_pos, p_conf in zip(
@@ -391,6 +420,7 @@ def run_for_video(video_path: Path) -> Path:
         f"normalize={getattr(params,'IMAGENET_NORMALIZE',None)} "
         f"pos_idx={getattr(params,'STAGE3_POSITIVE_CLASS_INDEX',None)} "
         f"thr={getattr(params,'STAGE3_POSITIVE_THRESHOLD',None)} "
+        f"use_amp={use_amp} "
         f"batch_gpu={getattr(params,'STAGE3_BATCH_SIZE_GPU',None)} "
         f"batch_cpu={getattr(params,'STAGE3_BATCH_SIZE_CPU',None)}"
     )

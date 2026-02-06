@@ -461,9 +461,11 @@ def _device():
     if torch is None:
         return None
     try:
+        if torch.cuda.is_available():
+            return torch.device('cuda')
         if torch.backends.mps.is_available():
             return torch.device('mps')
-        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        return torch.device('cpu')
     except Exception:
         return torch.device('cpu')
 
@@ -539,6 +541,12 @@ def _build_infer_fn(model_path: Optional[Path], backbone: str, imagenet_normaliz
 
     try:
         model = _build_backbone(backbone)
+        if device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True
+            if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'matmul'):
+                torch.backends.cuda.matmul.allow_tf32 = True
+            if hasattr(torch.backends, 'cudnn'):
+                torch.backends.cudnn.allow_tf32 = True
         model = model.to(device)
         sd = torch.load(str(model_path), map_location=device)
         for key in ('state_dict','model','net','weights'):
@@ -558,13 +566,19 @@ def _build_infer_fn(model_path: Optional[Path], backbone: str, imagenet_normaliz
     if imagenet_normalize:
         tfms.append(T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]))
     transform = T.Compose(tfms)
+    use_amp = device.type == 'cuda'
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def infer_on_frame(frame_bgr: np.ndarray, cx: float, cy: float, w: int, h: int) -> float:
         try:
             pil = _center_crop_clamped_bgr_to_pil(frame_bgr, cx, cy, w, h)
-            ten = transform(pil).unsqueeze(0).to(device)
-            logits = model(ten)[0].detach().cpu().numpy().tolist()
+            ten = transform(pil).unsqueeze(0).to(device, non_blocking=(device.type == 'cuda'))
+            if use_amp:
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    logits_t = model(ten)[0]
+            else:
+                logits_t = model(ten)[0]
+            logits = logits_t.float().detach().cpu().numpy().tolist()
             bg, ff = float(logits[0]), float(logits[1])
             m = max(bg, ff)
             eb = math.exp(bg - m); ef = math.exp(ff - m)

@@ -46,14 +46,21 @@ def _select_device(user_choice: str | int | None):
         return user_choice
     if isinstance(user_choice, str) and user_choice.lower() not in {"auto", "", "none"}:
         return user_choice
+    if torch.cuda.is_available():
+        return 0
     try:
         if torch.backends.mps.is_available() and torch.backends.mps.is_built():
             return "mps"
     except Exception:
         pass
-    if torch.cuda.is_available():
-        return 0
     return "cpu"
+
+
+def _is_cuda_device(device: str | int) -> bool:
+    if isinstance(device, int):
+        return device >= 0
+    s = str(device).lower().strip()
+    return s.startswith("cuda") or s.isdigit()
 
 
 def _parse_meta_from_image_path(img_path: Path) -> dict:
@@ -133,57 +140,73 @@ def run_for_video(video_path: Path) -> Path:
         imgsz = int(img_size_cfg)
 
     rows: list[dict] = []
-    device = _select_device(getattr(params, "YOLO_DEVICE", "cpu"))
+    device = _select_device(getattr(params, "YOLO_DEVICE", "auto"))
+    batch_size = max(1, int(getattr(params, "YOLO_BATCH_SIZE", 8)))
+    use_half = bool(getattr(params, "YOLO_HALF_ON_CUDA", True)) and _is_cuda_device(device)
     conf_thres = float(getattr(params, "YOLO_CONF_THRES", 0.1))
     iou_thres = float(getattr(params, "YOLO_IOU_THRES", 0.15))
+    print(
+        f"[stage2_yolo_detect] Device={device} batch={batch_size} "
+        f"half={'on' if use_half else 'off'}"
+    )
 
     annotated_dir = out_root / "annotated"
     annotated_dir.mkdir(parents=True, exist_ok=True)
 
-    for img_path in images:
-        meta = _parse_meta_from_image_path(img_path)
-        frame_range = f"{meta['start']}-{meta['end']}"
-
-        results = model.predict(
-            source=str(img_path),
+    for b0 in range(0, len(images), batch_size):
+        batch_paths = images[b0 : b0 + batch_size]
+        batch_results = model.predict(
+            source=[str(p) for p in batch_paths],
             imgsz=imgsz,
             conf=conf_thres,
             iou=iou_thres,
             device=device,
+            half=use_half,
             verbose=False,
             stream=False,
         )
-        if not results:
-            continue
-        r = results[0]
-
-        boxes_xyxy = (
-            r.boxes.xyxy.cpu().numpy()
-            if hasattr(r, "boxes") and getattr(r, "boxes", None) is not None
-            else np.zeros((0, 4), dtype=np.float32)
-        )
-
-        # Save annotated long-exposure image with boxes drawn
-        img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
-        if img is not None:
-            annotated = _draw_boxes(img, boxes_xyxy)
-            out_img = annotated_dir / f"{img_path.stem}_pred.png"
-            cv2.imwrite(str(out_img), annotated)
-
-        for i in range(boxes_xyxy.shape[0]):
-            x1, y1, x2, y2 = boxes_xyxy[i]
-            w = max(0.0, float(x2 - x1))
-            h = max(0.0, float(y2 - y1))
-            rows.append(
-                {
-                    "x": int(round(x1)),
-                    "y": int(round(y1)),
-                    "w": int(round(w)),
-                    "h": int(round(h)),
-                    "frame_range": frame_range,
-                    "video_name": video_path.name,
-                }
+        if batch_results is None:
+            batch_results = []
+        if not isinstance(batch_results, list):
+            batch_results = list(batch_results)
+        if len(batch_results) != len(batch_paths):
+            print(
+                f"[stage2_yolo_detect] Warning: got {len(batch_results)} result(s) "
+                f"for {len(batch_paths)} image(s)."
             )
+
+        for i, img_path in enumerate(batch_paths):
+            meta = _parse_meta_from_image_path(img_path)
+            frame_range = f"{meta['start']}-{meta['end']}"
+            r = batch_results[i] if i < len(batch_results) else None
+
+            boxes_xyxy = (
+                r.boxes.xyxy.cpu().numpy()
+                if (r is not None and hasattr(r, "boxes") and getattr(r, "boxes", None) is not None)
+                else np.zeros((0, 4), dtype=np.float32)
+            )
+
+            # Save annotated long-exposure image with boxes drawn
+            img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+            if img is not None:
+                annotated = _draw_boxes(img, boxes_xyxy)
+                out_img = annotated_dir / f"{img_path.stem}_pred.png"
+                cv2.imwrite(str(out_img), annotated)
+
+            for j in range(boxes_xyxy.shape[0]):
+                x1, y1, x2, y2 = boxes_xyxy[j]
+                w = max(0.0, float(x2 - x1))
+                h = max(0.0, float(y2 - y1))
+                rows.append(
+                    {
+                        "x": int(round(x1)),
+                        "y": int(round(y1)),
+                        "w": int(round(w)),
+                        "h": int(round(h)),
+                        "frame_range": frame_range,
+                        "video_name": video_path.name,
+                    }
+                )
 
     csv_path = out_root / f"{video_stem}.csv"
 

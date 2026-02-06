@@ -15,7 +15,7 @@ from typing import List
 # Root folder for this pipeline (EDIT THIS)
 # - All stage outputs are saved here.
 # - Must contain a subfolder named "original videos" with input videos.
-ROOT: str | Path = '/Users/arnavps/Desktop/RA inference data/v3 daytime pipeline inference data/20240606_cam1_GS010064'
+ROOT: str | Path = "~/Desktop/arnav's files/day time pipeline inference output data"
 
 # Normalize ROOT to a Path object even if provided as a string
 if not isinstance(ROOT, Path):
@@ -69,33 +69,28 @@ TRAILS_OVERLAY: bool = False             # overlay trails on first frame
 TRAILS_OVERLAY_ALPHA: float = 0.70
 
 # Stage 2 — YOLO detection on long-exposure images
+# Local model directory for this v3 pipeline.
+MODEL_DIR: Path = Path(__file__).resolve().parent / "v3 day time pipeline models"
 # Path to trained YOLO weights (.pt)
-YOLO_MODEL_WEIGHTS: Path = Path(
-    "/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/"
-    "background subtraction detection method/actual background subtraction code/"
-    "forresti, fixing FPs and box overlap/Proof of concept code/"
-    "test1/pyrallis_exp/raw long exposure exp/yolo train output data/"
-    "runs_firefly/train_20251030_2129592/weights/best.pt"
-)
+YOLO_MODEL_WEIGHTS: Path = MODEL_DIR / "yolo_best.pt"
 
 # Inference params
 # - YOLO_IMG_SIZE: None → auto from input image size (max(H,W))
 # - YOLO_CONF_THRES: confidence threshold
 # - YOLO_IOU_THRES: IoU threshold for NMS
 # - YOLO_DEVICE: 'auto' | 'cpu' | 'cuda' | 'mps' | CUDA index
+# - YOLO_BATCH_SIZE: number of long-exposure images per model.predict call.
+# - YOLO_HALF_ON_CUDA: use FP16 inference on CUDA devices.
 YOLO_IMG_SIZE: int | None = None
 YOLO_CONF_THRES: float = 0.01
 YOLO_IOU_THRES: float = 0.15
-YOLO_DEVICE: str | int | None = "cpu"
+YOLO_DEVICE: str | int | None = "auto"
+YOLO_BATCH_SIZE: int = 8
+YOLO_HALF_ON_CUDA: bool = True
 
 # Stage 3 — patch classifier on per-frame crops
 # Patch model (ResNet18 binary classifier). Provide a direct path.
-PATCH_MODEL_PATH: Path = Path(
-    "/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/"
-    "background subtraction detection method/actual background subtraction code/"
-    "forresti, fixing FPs and box overlap/Proof of concept code/models and other data/"
-    "pyrallis gopro models resnet18/resnet18_pyrallis_gopro_best_model v3.pt"
-)
+PATCH_MODEL_PATH: Path = MODEL_DIR / "resnet18_pyrallis_gopro_best_model_v3.pt"
 
 # Torch / transforms
 IMAGENET_NORMALIZE: bool = False
@@ -108,12 +103,18 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 # - *_POSITIVE_CLASS_INDEX: index of positive class in logits.
 # - *_POSITIVE_THRESHOLD: probability threshold to mark positive.
 # - STAGE3_DEVICE: 'auto' | 'cpu' | 'cuda' | 'mps'
+# - STAGE3_USE_AMP: enable mixed-precision inference on CUDA.
+# - STAGE3_ENABLE_CUDNN_BENCHMARK: tune cuDNN kernels for fixed-size inference.
+# - STAGE3_ALLOW_TF32: allow TF32 matmul/cuDNN on Ampere+ GPUs.
 STAGE3_INPUT_SIZE: int = 10
 STAGE3_BATCH_SIZE_GPU: int = 4096
 STAGE3_BATCH_SIZE_CPU: int = 512
 STAGE3_POSITIVE_CLASS_INDEX: int = 1
 STAGE3_POSITIVE_THRESHOLD: float = 0.80
 STAGE3_DEVICE: str = "auto"
+STAGE3_USE_AMP: bool = True
+STAGE3_ENABLE_CUDNN_BENCHMARK: bool = True
+STAGE3_ALLOW_TF32: bool = True
 
 # Stage 3 — crop size used to extract patches from frames
 PATCH_SIZE_PX: int = 10
@@ -264,11 +265,14 @@ __all__ = [
     "TRAILS_OVERLAY",
     "TRAILS_OVERLAY_ALPHA",
     # YOLO params
+    "MODEL_DIR",
     "YOLO_MODEL_WEIGHTS",
     "YOLO_IMG_SIZE",
     "YOLO_CONF_THRES",
     "YOLO_IOU_THRES",
     "YOLO_DEVICE",
+    "YOLO_BATCH_SIZE",
+    "YOLO_HALF_ON_CUDA",
     # patch classifier + render
     "PATCH_MODEL_PATH",
     "IMAGENET_NORMALIZE",
@@ -280,6 +284,9 @@ __all__ = [
     "STAGE3_POSITIVE_CLASS_INDEX",
     "STAGE3_POSITIVE_THRESHOLD",
     "STAGE3_DEVICE",
+    "STAGE3_USE_AMP",
+    "STAGE3_ENABLE_CUDNN_BENCHMARK",
+    "STAGE3_ALLOW_TF32",
     "PATCH_SIZE_PX",
     "RENDER_CODEC",
     "RENDER_FPS_HINT",
