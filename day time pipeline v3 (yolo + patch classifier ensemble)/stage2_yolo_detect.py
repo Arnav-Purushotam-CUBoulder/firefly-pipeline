@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import csv
+import shutil
 
 import cv2
 import numpy as np
@@ -61,6 +62,33 @@ def _is_cuda_device(device: str | int) -> bool:
         return device >= 0
     s = str(device).lower().strip()
     return s.startswith("cuda") or s.isdigit()
+
+
+def _safe_ultralytics_weights_path(weights: Path) -> Path:
+    """Return a YOLO weights path that avoids apostrophes (Ultralytics path parsing bug)."""
+    s = str(weights)
+    if "'" not in s:
+        return weights
+    cache_root = Path.home() / ".cache" / "firefly_pipeline" / "ultralytics_weights"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    safe_path = cache_root / weights.name
+    try:
+        src_stat = weights.stat()
+    except Exception:
+        return weights
+    needs_copy = True
+    if safe_path.exists():
+        try:
+            dst_stat = safe_path.stat()
+            needs_copy = (
+                int(dst_stat.st_size) != int(src_stat.st_size)
+                or int(dst_stat.st_mtime) < int(src_stat.st_mtime)
+            )
+        except Exception:
+            needs_copy = True
+    if needs_copy:
+        shutil.copy2(weights, safe_path)
+    return safe_path
 
 
 def _parse_meta_from_image_path(img_path: Path) -> dict:
@@ -125,7 +153,10 @@ def run_for_video(video_path: Path) -> Path:
     if not weights.exists():
         raise FileNotFoundError(f"YOLO_MODEL_WEIGHTS not found: {weights}")
 
-    model = YOLO(str(weights))
+    safe_weights = _safe_ultralytics_weights_path(weights)
+    if safe_weights != weights:
+        print(f"[stage2_yolo_detect] Using apostrophe-safe YOLO weights path: {safe_weights}")
+    model = YOLO(str(safe_weights))
 
     # Decide image size once based on the first image if not provided
     img_size_cfg = getattr(params, "YOLO_IMG_SIZE", None)
