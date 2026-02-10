@@ -17,6 +17,9 @@ Outputs (under STAGE3_DIR/<stem>/<STAGE3_2_DIRNAME>/):
       x,y,t,firefly_logit,background_logit
     where x,y are the refined Gaussian centroid (full-frame coords), and
     logits are log-probabilities derived from Stage3 confidence.
+  - params.STAGE3_2_XYT_EXPORT_DIR/<stem>.csv with columns:
+      x,y,t
+    exported for downstream 3D reconstruction.
   - (optional) annotated crops with a red pixel at the computed centroid.
 """
 
@@ -119,6 +122,9 @@ def run_for_video(video_path: Path) -> Path:
     out_root = s3_dir / str(getattr(params, "STAGE3_2_DIRNAME", "stage3_2"))
     out_root.mkdir(parents=True, exist_ok=True)
     out_csv = out_root / f"{stem}_stage3_2_firefly_background_logits.csv"
+    out_xyt_dir = Path(getattr(params, "STAGE3_2_XYT_EXPORT_DIR", params.ROOT / "stage3_2 xyt for 3d reconstruction"))
+    out_xyt_dir.mkdir(parents=True, exist_ok=True)
+    out_xyt_csv = out_xyt_dir / f"{stem}.csv"
 
     pos_dir = s3_dir / "crops" / "positives"
     crop_index = _index_stage3_crops(pos_dir)
@@ -134,10 +140,16 @@ def run_for_video(video_path: Path) -> Path:
     missing_crops = 0
     bad_images = 0
 
-    with in_csv.open("r", newline="") as f_in, out_csv.open("w", newline="") as f_out:
+    with (
+        in_csv.open("r", newline="") as f_in,
+        out_csv.open("w", newline="") as f_out,
+        out_xyt_csv.open("w", newline="") as f_xyt,
+    ):
         r = csv.DictReader(f_in)
         w = csv.writer(f_out)
+        w_xyt = csv.writer(f_xyt)
         w.writerow(["x", "y", "t", "firefly_logit", "background_logit"])
+        w_xyt.writerow(["x", "y", "t"])
 
         for row in r:
             if filter_selected:
@@ -173,6 +185,7 @@ def run_for_video(video_path: Path) -> Path:
             firefly_logit = _log_prob(conf)
             background_logit = _log_prob(1.0 - conf)
             w.writerow([gx, gy, int(t), firefly_logit, background_logit])
+            w_xyt.writerow([gx, gy, int(t)])
             written += 1
 
             if save_crops:
@@ -189,6 +202,7 @@ def run_for_video(video_path: Path) -> Path:
                 cv2.imwrite(str(crops_dir / out_name), out_img)
 
     print(f"Stage3.2 Wrote CSV → {out_csv} (rows={written})")
+    print(f"Stage3.2 Wrote 3D reconstruction CSV → {out_xyt_csv} (rows={written})")
     if missing_crops:
         print(f"Stage3.2 NOTE: missing_crops={missing_crops} (expected Stage3 crops in {pos_dir})")
     if bad_images:
@@ -199,4 +213,3 @@ def run_for_video(video_path: Path) -> Path:
 
 
 __all__ = ["run_for_video"]
-

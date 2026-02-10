@@ -172,6 +172,9 @@ STAGE3_2_DIRNAME: str = "stage3_2"
 STAGE3_2_GAUSSIAN_SIGMA: float = 1.0   # 0 => plain intensity centroid
 STAGE3_2_SAVE_ANNOTATED_CROPS: bool = True
 STAGE3_2_MARK_CENTROID_RED_PIXEL: bool = True
+# Stage 3.2 export for downstream 3D reconstruction:
+# one CSV per video with columns exactly: x,y,t
+STAGE3_2_XYT_EXPORT_DIR: Path = ROOT / "stage3_2 xyt for 3d reconstruction"
 
 
 # ------------------------------------------------------------------
@@ -320,6 +323,7 @@ __all__ = [
     "STAGE3_2_GAUSSIAN_SIGMA",
     "STAGE3_2_SAVE_ANNOTATED_CROPS",
     "STAGE3_2_MARK_CENTROID_RED_PIXEL",
+    "STAGE3_2_XYT_EXPORT_DIR",
     # post-pipeline test suite (Stage 5–9)
     "RUN_STAGE5_VALIDATE",
     "RUN_STAGE6_OVERLAY",
