@@ -43,7 +43,7 @@ RUN_PRE_RUN_CLEANUP: bool = True
 # Frame cap for fast iteration / testing
 # - MAX_FRAMES: if an integer, process only the first N frames of each video
 #               when forming long-exposure images. If None, process the full video.
-MAX_FRAMES: int | None = 200
+MAX_FRAMES: int | None = None
 
 # Stage 1 — long-exposure generation from raw video
 # - LONG_EXPOSURE_MODE: 'lighten' | 'average' | 'trails'

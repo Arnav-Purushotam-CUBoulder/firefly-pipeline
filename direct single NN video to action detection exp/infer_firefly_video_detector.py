@@ -30,10 +30,10 @@ from firefly_video_detector.video_io import VideoClipReader, VideoInfo, get_vide
 #   (optional) rendered MP4s with predicted boxes drawn
 
 # Folder of videos to run inference on.
-VIDEOS_DIR = "~/Desktop/arnav's files/testing data for e2e NN prototye/training/videos"  # e.g. "/path/to/videos"
+VIDEOS_DIR = "~/Desktop/arnav's files/testing data for e2e NN prototye/inference13a/input videos"  # e.g. "/path/to/videos"
 
 # Output folder to write per-video CSVs to.
-OUT_CSV_DIR = "~/Desktop/arnav's files/testing data for e2e NN prototye/inference"  # e.g. "/path/to/output_csvs"
+OUT_CSV_DIR = "~/Desktop/arnav's files/testing data for e2e NN prototye/inference13a/output inference data"  # e.g. "/path/to/output_csvs"
 
 # Model checkpoint to load.
 CKPT_PATH = "~/Desktop/arnav's files/testing data for e2e NN prototye/training/training outputs/checkpoints/best.pt"  # e.g. "runs/firefly_video_centernet/checkpoints/best.pt"
@@ -57,7 +57,7 @@ MAX_FRAMES = 4000  # e.g. 500
 
 # Render annotated videos after writing CSVs.
 RENDER_VIDEOS = True
-OUT_VIDEO_DIR = ""  # default: same folder as the CSV outputs
+OUT_VIDEO_DIR = "~/Desktop/arnav's files/testing data for e2e NN prototye/inference13a/output inference data"
 OUT_VIDEO_SUFFIX = "_annotated"  # output name: "<stem><suffix>.mp4"
 OUT_VIDEO_CODEC = "mp4v"
 BBOX_THICKNESS_PX = 1
