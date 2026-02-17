@@ -15,7 +15,7 @@ from typing import List
 # Root folder for this pipeline (EDIT THIS)
 # - All stage outputs are saved here.
 # - Must contain a subfolder named "original videos" with input videos.
-ROOT: str | Path = "~/Desktop/arnav's files/day time pipeline inference output data"
+ROOT: str | Path = "/mnt/Samsung_SSD_2TB/day time pipeline inference output data"
 
 # Normalize ROOT to a Path object even if provided as a string
 if not isinstance(ROOT, Path):

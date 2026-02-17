@@ -106,6 +106,11 @@ PATCH_LOCATIONS_BACKGROUND_CSV_NAME: str = "patch_locations_background.csv"
 PATCH_LOCATIONS_BACKGROUND_SPLIT_PREFIX: str = "patch_locations_background_"  # e.g. patch_locations_background_train.csv
 VALIDATION_CSV_NAME: str = "annotations.csv"
 
+# Annotation coordinate semantics for x,y in annotator CSVs.
+# - "center": x,y is patch center (requested dataset convention)
+# - "top_left": x,y is top-left corner
+ANNOTATION_XY_SEMANTICS: str = "center"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Folder-name constants (match your on-disk schema)
@@ -174,7 +179,9 @@ def _parse_batch_identity(csv_path: Path) -> Tuple[str, str, str, str]:
     """
     stem = csv_path.stem.strip()
     # tolerate mild variations
-    stem = stem.replace("-", "_").replace("(", "_").replace(")", "_")
+    # Keep hyphens so multi-word species can remain a single token, e.g.
+    # "photinus-knulli" stays intact during parsing.
+    stem = stem.replace("(", "_").replace(")", "_")
     stem = re.sub(r"_+", "_", stem).strip("_")
 
     parts = [p for p in stem.split("_") if p]
@@ -308,7 +315,15 @@ def _crop_with_pad(frame_bgr, x: int, y: int, w: int, h: int):
     import numpy as np  # local import to avoid hard dependency if caller doesn't use extraction
 
     H, W = frame_bgr.shape[:2]
-    x0, y0 = int(x), int(y)
+    xy_mode = str(ANNOTATION_XY_SEMANTICS or "center").strip().lower()
+    if xy_mode == "center":
+        # Convert center point to top-left for fixed-size crop extraction.
+        x0 = int(round(float(x) - float(w) / 2.0))
+        y0 = int(round(float(y) - float(h) / 2.0))
+    elif xy_mode == "top_left":
+        x0, y0 = int(x), int(y)
+    else:
+        raise ValueError(f"Unsupported ANNOTATION_XY_SEMANTICS={ANNOTATION_XY_SEMANTICS!r}")
     x1, y1 = x0 + int(w), y0 + int(h)
     vx0, vy0 = max(0, x0), max(0, y0)
     vx1, vy1 = min(W, x1), min(H, y1)
