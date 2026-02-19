@@ -243,12 +243,14 @@ def recenter_boxes_with_centroid(
         if logs_removed:
             audit.log_removed('02_recenter', 'dim_seed', logs_removed, extra_cols=['bright_max','bright_min_thr'])
             if audit_video_path is not None:
-                for rr in logs_removed[:2000]:
+                n = min(2000, len(logs_removed))
+                for i, rr in enumerate(logs_removed[:n]):
                     audit.save_crop(
                         audit_video_path,
                         rr['frame'], rr['x'], rr['y'], rr['w'], rr['h'],
                         '02_recenter/removed_dim',
                         f"t{rr['frame']:06d}_x{rr['x']}_y{rr['y']}_b{rr['bright_max']}"
                     )
+                    progress(i + 1, n, 'audit_crops')
         if logs_kept:
             audit.log_kept('02_recenter', logs_kept, extra_cols=['shift_dx','shift_dy','bright_max'])

@@ -15,6 +15,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import stage1_ingestor
+try:
+    from tqdm import tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    tqdm = None  # type: ignore[assignment]
+
 # -----------------------------------------------------------------------------
 # User-configurable globals (defaults; CLI args can override)
 # -----------------------------------------------------------------------------
@@ -24,27 +30,74 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 #   <ROOT>/patch training datasets and pipeline validation data
 #   <ROOT>/model zoo
 #   <ROOT>/inference outputs
-ROOT_PATH: str | Path = "/Volumes/DL Project SSD/integrated prototype data"
+ROOT_PATH: str | Path = "/mnt/Samsung_SSD_2TB/integrated prototype data/integrated prototype data" 
+
+
 
 # Folder containing *many* observed videos + their annotator CSVs (and potentially other files).
 # The orchestrator will:
 # - match annotation CSVs to .mp4 videos by filename
-# - split matched video/csv pairs: half → training ingestion, half → validation/testing
-OBSERVED_DATA_DIR: str | Path = ""
+# - split matched video/csv pairs: TRAIN fraction → training ingestion, remainder → validation/testing
+OBSERVED_DATA_DIR: str | Path = "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/Photinus Knulli"
 
 # Species name for this run. This is the source of truth; the orchestrator does not
 # infer species from CSV filenames.
-SPECIES_NAME: str = ""
+SPECIES_NAME: str = "photinus-knulli"
 
 # Global video type for this run (used for dataset routing + model-zoo selection).
 # Allowed values: "day" | "night"
-TYPE_OF_VIDEO: str = "day"
+TYPE_OF_VIDEO: str = "night"
+
+# Train/validation split at the *video* level when ingesting an observed folder.
+# Example: 0.8 -> 80% of videos for training ingestion, 20% held out for validation/testing.
+TRAIN_PAIR_FRACTION: float = 0.8
+
+# Ingestion versioning:
+# If True, ingest all TRAIN videos into a single new dataset version and all held-out
+# VALIDATION videos into a single new validation-dataset version (instead of one
+# version per video).
+ONE_DATASET_VERSION_PER_BATCH: bool = True
 
 # Search dirs for locating existing validation videos by stem (used when no new held-out validation rows).
 VALIDATION_VIDEO_SEARCH_DIRS: List[str | Path] = []
 
-# Species scaler config overrides (passed into the scaler module)
+# Stage 1 ingestor-core config overrides (passed into stage1_ingestor_core)
 AUTO_LOAD_SIBLING_CLASS_CSV: bool = True
+
+# Auto background patch generation (passed into stage1_ingestor_core)
+# ------------------------------------------------------------
+# Enables training a 2-class patch classifier even when the input CSVs only contain
+# FIREFFLY annotations. Background patches are synthesized by sampling random
+# frames that do NOT contain any annotated firefly frames, then extracting 10x10
+# "hard negative" blob-centered crops (with optional fallback to random centers).
+AUTO_GENERATE_BACKGROUND_PATCHES: bool = True
+AUTO_BACKGROUND_TO_FIREFLY_RATIO: float = 10.0
+AUTO_BACKGROUND_PATCH_SIZE_PX: int = 10
+AUTO_BACKGROUND_MAX_PATCHES_PER_FRAME: int = 10
+AUTO_BACKGROUND_MAX_FRAME_SAMPLES: int = 5000
+AUTO_BACKGROUND_SEED: int = 1337
+AUTO_BACKGROUND_FALLBACK_RANDOM_CENTERS: bool = True
+
+AUTO_BACKGROUND_SBD_MIN_AREA_PX: float = 0.5
+AUTO_BACKGROUND_SBD_MAX_AREA_SCALE: float = 1.0
+AUTO_BACKGROUND_SBD_MIN_DIST: float = 0.25
+AUTO_BACKGROUND_SBD_MIN_REPEAT: int = 1
+
+AUTO_BACKGROUND_USE_CLAHE: bool = True
+AUTO_BACKGROUND_CLAHE_CLIP: float = 2.0
+AUTO_BACKGROUND_CLAHE_TILE: Tuple[int, int] = (8, 8)
+
+AUTO_BACKGROUND_USE_TOPHAT: bool = False
+AUTO_BACKGROUND_TOPHAT_KSIZE: int = 7
+
+AUTO_BACKGROUND_USE_DOG: bool = False
+AUTO_BACKGROUND_DOG_SIGMA1: float = 0.8
+AUTO_BACKGROUND_DOG_SIGMA2: float = 1.6
+
+# Dataset versioning copy mode (Stage 1)
+# - "hardlink": fast + space efficient (recommended when working on a single filesystem)
+# - "copy": duplicates files per version (slow + uses more storage)
+DATASET_VERSION_COPY_MODE: str = "hardlink"
 
 # Training config (ResNet patch/CNN classifier)
 TRAIN_EPOCHS: int = 50
@@ -53,6 +106,14 @@ TRAIN_LR: float = 3e-4
 TRAIN_NUM_WORKERS: int = 2
 TRAIN_RESNET: str = "resnet18"
 TRAIN_SEED: int = 1337
+
+# Dataset sanitization (Stage 2 preflight)
+# ---------------------------------------
+# Prevent crashes due to corrupt image files in train/val/test (e.g. 0-byte PNGs).
+SANITIZE_DATASET_IMAGES: bool = True
+SANITIZE_DATASET_MODE: str = "quarantine"  # "quarantine" | "delete"
+SANITIZE_DATASET_VERIFY_WITH_PIL: bool = True
+SANITIZE_DATASET_REPORT_MAX: int = 20
 
 # Evaluation config
 GATEWAY_BRIGHTNESS_THRESHOLD: float = 60.0
@@ -72,7 +133,7 @@ EVAL_SINGLE_SPECIES_MODEL: bool = True
 # If True, trains new models when this batch contains TRAIN rows; otherwise reuses latest models.
 TRAIN_MODELS_IF_TRAIN_ROWS_PRESENT: bool = True
 
-# Set True to do everything except actually call species scaler / training / gateway.
+# Set True to do everything except actually call stage1 ingest / training / gateway.
 DRY_RUN: bool = False
 
 # -----------------------------------------------------------------------------
@@ -86,11 +147,17 @@ RUN_BASELINE_EVAL: bool = True
 # If True, only run baselines on videos routed to the night pipeline.
 BASELINES_ONLY_FOR_NIGHT: bool = True
 
-# Baseline validator settings (match day pipeline defaults)
-BASELINE_DIST_THRESHOLDS_PX: List[float] = [1.0, 2.0, 3.0, 4.0, 5.0]
+# Baseline validator settings.
+# Use a wider sweep so baseline reports include looser match thresholds too.
+BASELINE_DIST_THRESHOLDS_PX: List[float] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
 BASELINE_VALIDATE_CROP_W: int = 10
 BASELINE_VALIDATE_CROP_H: int = 10
 BASELINE_MAX_FRAMES: int | None = None
+
+# If True, also render a debug overlay video for baselines (GT=GREEN, preds=RED).
+# This is separate from the pipelines' own overlay stages.
+BASELINE_RENDER_OVERLAY_VIDEO: bool = True
+BASELINE_OVERLAY_RENDER_THRESH_VIDEOS: bool = False  # TP/FP/FN per-threshold videos (very expensive)
 
 # Baseline 1: Nolan-style rolling-mean background detector
 RUN_BASELINE_LAB_METHOD: bool = True
@@ -120,17 +187,45 @@ DEFAULT_MODEL_ZOO_SUBDIR = "model zoo"
 DEFAULT_INFERENCE_OUTPUT_SUBDIR = "inference outputs"
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".ppm", ".pgm"}
 
-GATEWAY_REL_PATH = Path("test1/integrated pipeline/gateway.py")
-SPECIES_SCALER_REL_DIR = Path("test1/species scaler")
-TRAINING_SCRIPT_REL_PATH = Path("test1/tools/model training tools/training resnet18 model.py")
+
+def _count_images_in_dir(d: Path) -> int:
+    if not d.exists():
+        return 0
+    return sum(1 for p in d.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+
+def _infer_repo_layout(this_file: Path) -> Tuple[Path, Path]:
+    """
+    This repo is sometimes vendored under a `test1/` folder.
+
+    Supported layouts:
+    - <repo_root>/integrated pipeline/gateway.py
+    - <repo_root>/test1/integrated pipeline/gateway.py
+    """
+    this_file = Path(this_file).resolve()
+    for root in [this_file.parents[1], this_file.parents[2], this_file.parents[3]]:
+        if (root / "integrated pipeline" / "gateway.py").is_file():
+            return root, Path(".")
+        if (root / "test1" / "integrated pipeline" / "gateway.py").is_file():
+            return root, Path("test1")
+    # Fall back to the historical assumption (repo root is two levels up, with a test1/ prefix).
+    return this_file.parents[2], Path("test1")
+
+
+_REPO_ROOT, _REPO_SUBDIR_PREFIX = _infer_repo_layout(Path(__file__))
+
+_THIS_DIR = Path(__file__).resolve().parent
+LOCAL_TRAINING_SCRIPT_PY = (_THIS_DIR / "stage2_trainer.py").resolve()
+
+GATEWAY_REL_PATH = _REPO_SUBDIR_PREFIX / "integrated pipeline/gateway.py"
 
 DAY_OUTPUT_SUBDIR = "day_pipeline_v3"
 NIGHT_OUTPUT_SUBDIR = "night_time_pipeline"
 
-DAY_PIPELINE_DIR_REL_PATH = Path("test1/day time pipeline v3 (yolo + patch classifier ensemble)")
-LAB_BASELINE_SCRIPT_REL_PATH = Path("test1/tools/legacy_baselines/nolan_mp4_to_predcsv.py")
-RAPHAEL_BASELINE_SCRIPT_REL_PATH = Path("test1/tools/legacy_baselines/raphael_oorb_detect_and_gauss.py")
+DAY_PIPELINE_DIR_REL_PATH = _REPO_SUBDIR_PREFIX / "day time pipeline v3 (yolo + patch classifier ensemble)"
+LAB_BASELINE_SCRIPT_REL_PATH = _REPO_SUBDIR_PREFIX / "tools/legacy_baselines/nolan_mp4_to_predcsv.py"
+RAPHAEL_BASELINE_SCRIPT_REL_PATH = _REPO_SUBDIR_PREFIX / "tools/legacy_baselines/raphael_oorb_detect_and_gauss.py"
 BASELINE_OUTPUT_SUBDIR = "baselines"
 BASELINE_MODELS_SUBDIR = "baseline models"
 
@@ -140,21 +235,6 @@ class RunIdentity:
     dataset_name: str
     species_name: str
     time_of_day: str  # "day_time" | "night_time"
-
-
-@dataclass(frozen=True)
-class ObservedPair:
-    video_name: str
-    video_path: Path
-    firefly_csv: Path
-    background_csv: Path | None
-
-
-@dataclass(frozen=True)
-class StagedPair:
-    pair: ObservedPair
-    staged_firefly_csv: Path
-    staged_background_csv: Path | None
 
 
 def _today_tag() -> str:
@@ -247,216 +327,8 @@ def _time_of_day_from_video_type(video_type: str) -> str:
     v = _normalize_video_type(video_type)
     return f"{v}_time"
 
-
-def _is_annotator_csv(csv_path: Path) -> bool:
-    try:
-        with csv_path.open(newline="") as fh:
-            r = csv.DictReader(fh)
-            fieldnames = [str(x or "").strip().lower() for x in (r.fieldnames or [])]
-    except Exception:
-        return False
-    if not fieldnames:
-        return False
-    cols = set(fieldnames)
-    if not {"x", "y", "w", "h"}.issubset(cols):
-        return False
-    return bool({"t", "frame", "time"} & cols)
-
-
-def _parse_label_from_csv_name(csv_path: Path, *, video_key: str) -> str:
-    """
-    Parse label from an annotator CSV filename.
-
-    Expected: <video_stem>_..._[firefly|background].csv
-    - label defaults to "firefly" if omitted
-    - species is intentionally NOT parsed here (SPECIES_NAME controls this run)
-    """
-    vk = (video_key or "").strip().lower()
-
-    remainder = ""
-    raw_key = csv_path.stem.strip().lower()
-    if vk and (raw_key == vk or raw_key.startswith(vk + "_")):
-        remainder = raw_key[len(vk) :].lstrip("_")
-    else:
-        stem = csv_path.stem.strip()
-        stem = stem.replace("-", "_").replace("(", "_").replace(")", "_")
-        stem = re.sub(r"_+", "_", stem).strip("_")
-        key = stem.lower()
-
-        vk_norm = vk.replace("-", "_").replace("(", "_").replace(")", "_")
-        vk_norm = re.sub(r"_+", "_", vk_norm).strip("_")
-
-        if vk_norm and (key == vk_norm or key.startswith(vk_norm + "_")):
-            remainder = key[len(vk_norm) :].lstrip("_")
-        else:
-            # Fall back to parsing by suffix only.
-            remainder = key
-
-    parts = [p for p in remainder.split("_") if p]
-    if parts and parts[-1].lower() in {"firefly", "background"}:
-        return parts[-1].lower()
-    return "firefly"
-
-
-def _discover_observed_pairs(observed_dir: Path) -> List[ObservedPair]:
-    observed_dir = Path(observed_dir)
-    if not observed_dir.exists():
-        raise FileNotFoundError(observed_dir)
-    if not observed_dir.is_dir():
-        raise NotADirectoryError(observed_dir)
-
-    videos = sorted([p for p in observed_dir.rglob("*") if p.is_file() and p.suffix.lower() == ".mp4"])
-    if not videos:
-        raise SystemExit(f"No .mp4 videos found under: {observed_dir}")
-
-    videos_by_stem: Dict[str, Path] = {}
-    for v in videos:
-        key = v.stem.strip().lower()
-        if not key:
-            continue
-        if key in videos_by_stem and str(videos_by_stem[key].resolve()) != str(v.resolve()):
-            raise SystemExit(f"Duplicate video stem {v.stem!r} found in: {videos_by_stem[key]} and {v}")
-        videos_by_stem[key] = v
-
-    stem_keys = sorted(videos_by_stem.keys(), key=len, reverse=True)
-
-    csv_candidates = sorted([p for p in observed_dir.rglob("*.csv") if p.is_file() and _is_annotator_csv(p)])
-    if not csv_candidates:
-        raise SystemExit(f"No annotator CSVs found under: {observed_dir} (need x,y,w,h and t/frame columns).")
-
-    grouped: Dict[str, Dict[str, Any]] = {}
-    unmatched: List[Path] = []
-    for c in csv_candidates:
-        c_stem = c.stem.strip()
-        c_key = c_stem.lower()
-        match: str | None = None
-        for vk in stem_keys:
-            if c_key == vk or c_key.startswith(vk + "_"):
-                match = vk
-                break
-        if match is None:
-            unmatched.append(c)
-            continue
-
-        vp = videos_by_stem[match]
-        video_name = _safe_name(vp.stem)
-        try:
-            label = _parse_label_from_csv_name(c, video_key=match)
-        except Exception as e:
-            raise SystemExit(f"Failed parsing CSV identity for {c}: {e}") from e
-
-        g = grouped.setdefault(
-            match,
-            {
-                "video_path": vp,
-                "video_name": video_name,
-                "firefly_csv": None,
-                "background_csv": None,
-            },
-        )
-
-        if label == "firefly":
-            if g["firefly_csv"] is not None and str(Path(g["firefly_csv"]).resolve()) != str(c.resolve()):
-                raise SystemExit(f"Multiple firefly CSVs matched to video {vp.name}: {g['firefly_csv']} and {c}")
-            g["firefly_csv"] = c
-        elif label == "background":
-            if g["background_csv"] is not None and str(Path(g["background_csv"]).resolve()) != str(c.resolve()):
-                raise SystemExit(f"Multiple background CSVs matched to video {vp.name}: {g['background_csv']} and {c}")
-            g["background_csv"] = c
-
-    if unmatched:
-        preview = "\n".join([f"  - {p}" for p in unmatched[:20]])
-        more = "" if len(unmatched) <= 20 else f"\n  ... and {len(unmatched) - 20} more"
-        raise SystemExit(
-            "Found annotator CSVs that did not match any .mp4 by filename prefix:\n"
-            f"{preview}{more}\n"
-            "Ensure each CSV name starts with the corresponding video stem."
-        )
-
-    pairs: List[ObservedPair] = []
-    for _, g in sorted(grouped.items(), key=lambda kv: str(kv[1].get("video_name") or "")):
-        if g.get("firefly_csv") is None:
-            vp = g["video_path"]
-            raise SystemExit(f"Missing firefly CSV for video: {vp} (need ..._firefly.csv or unlabeled CSV).")
-        pairs.append(
-            ObservedPair(
-                video_name=str(g["video_name"]),
-                video_path=Path(g["video_path"]),
-                firefly_csv=Path(g["firefly_csv"]),
-                background_csv=Path(g["background_csv"]) if g.get("background_csv") else None,
-            )
-        )
-
-    if not pairs:
-        raise SystemExit(f"No valid (video, firefly_csv) pairs found under: {observed_dir}")
-
-    return pairs
-
-
-def _split_pairs_train_vs_val(pairs: Sequence[ObservedPair]) -> Tuple[List[ObservedPair], List[ObservedPair]]:
-    """
-    Split matched (video,csv) pairs into TRAIN vs VALIDATION at the *video* level.
-
-    Requirement:
-    - half of pairs → training
-    - half of pairs → validation/testing
-    - if odd: validation gets the larger half
-    """
-    ordered = sorted(pairs, key=lambda p: (p.video_name, str(p.video_path)))
-    n_train = int(len(ordered) // 2)
-    return ordered[:n_train], ordered[n_train:]
-
-
-def _stage_pairs_for_species_scaler(
-    pairs: Sequence[ObservedPair],
-    *,
-    species_name: str,
-    staging_dir: Path,
-    time_of_day: str,
-    dry_run: bool,
-) -> List[StagedPair]:
-    """
-    Species-scaler parses identity from CSV filename, so we stage/copy CSVs into a
-    canonical naming scheme:
-      <video_name>_<species_name>_<day_time|night_time>_<firefly|background>.csv
-    """
-    staging_dir = Path(staging_dir)
-    if not dry_run:
-        staging_dir.mkdir(parents=True, exist_ok=True)
-
-    staged: List[StagedPair] = []
-    seen: set[str] = set()
-    safe_species = _safe_name(species_name)
-    if not safe_species:
-        raise SystemExit(f"Invalid species_name for staging: {species_name!r}")
-    for p in pairs:
-        base = f"{_safe_name(p.video_name)}_{safe_species}_{_safe_name(time_of_day)}"
-        dst_firefly = staging_dir / f"{base}_firefly.csv"
-        if str(dst_firefly) in seen:
-            raise SystemExit(f"Staging name collision (firefly): {dst_firefly}")
-        seen.add(str(dst_firefly))
-
-        if dry_run:
-            print(f"[dry-run] Would stage CSV → {dst_firefly}  (src={p.firefly_csv})")
-        else:
-            dst_firefly.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(p.firefly_csv, dst_firefly)
-
-        dst_bg: Path | None = None
-        if p.background_csv is not None:
-            dst_bg = staging_dir / f"{base}_background.csv"
-            if str(dst_bg) in seen:
-                raise SystemExit(f"Staging name collision (background): {dst_bg}")
-            seen.add(str(dst_bg))
-            if dry_run:
-                print(f"[dry-run] Would stage CSV → {dst_bg}  (src={p.background_csv})")
-            else:
-                dst_bg.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(p.background_csv, dst_bg)
-
-        staged.append(StagedPair(pair=p, staged_firefly_csv=dst_firefly, staged_background_csv=dst_bg))
-
-    return staged
+# Ingestion mechanics (pair discovery, splitting, CSV staging, stage1_ingestor_core invocation)
+# live in: integrated ingestor-trainer-tester orchestrator/stage1_ingestor.py
 
 
 def _read_annotator_csv(csv_path: Path) -> List[Dict[str, int]]:
@@ -626,40 +498,84 @@ def _species_summary_from_patch_locations(csv_path: Path) -> Dict[str, Any]:
     return {"species": list(ordered_counts.keys()), "counts": ordered_counts, "source_csv": str(csv_path)}
 
 
-def _run_species_scaler(
-    *,
-    repo_root: Path,
-    annotations_csv: Path,
-    video_path: Path,
-    data_root: Path,
-    train_fraction: float,
-    train_val_seed: int,
-    auto_load_sibling: bool,
-    dry_run: bool,
-) -> None:
-    scaler_dir = repo_root / SPECIES_SCALER_REL_DIR
-    scaler_py = scaler_dir / "species_scaler.py"
-    if not scaler_py.exists():
-        raise FileNotFoundError(scaler_py)
+def _infer_species_from_patch_filename(filename: str) -> str:
+    """
+    Heuristic parser for patch filenames.
 
-    if dry_run:
-        print(f"[dry-run] Would run species scaler on: {annotations_csv}")
-        return
+    We have multiple legacy naming conventions:
+      - photinus-knulli patches: "..._photinus-knulli.png"
+      - legacy single-species patches: "forresti__img_0123.png", "frontalis__f00123_b003.png",
+        "tremulans__frame_000900_component_535_1.png", etc.
 
-    code = "\n".join(
-        [
-            "from pathlib import Path",
-            "import species_scaler as ss",
-            f"ss.ANNOTATIONS_CSV_PATH = Path({repr(str(annotations_csv))})",
-            f"ss.VIDEO_PATH = Path({repr(str(video_path))})",
-            f"ss.DATA_ROOT = Path({repr(str(data_root))})",
-            f"ss.TRAIN_FRACTION_OF_BATCH = {float(train_fraction)}",
-            f"ss.TRAIN_VAL_SPLIT_SEED = {int(train_val_seed)}",
-            f"ss.AUTO_LOAD_SIBLING_CLASS_CSV = {bool(auto_load_sibling)}",
-            "ss.main()",
-        ]
-    )
-    subprocess.run([sys.executable, "-c", code], cwd=str(scaler_dir), check=True)
+    Returns a safe species_name or "" if unknown.
+    """
+    stem = Path(filename).stem
+    stem = stem.strip()
+    if not stem:
+        return ""
+
+    # Legacy: "<species>__...".
+    if "__" in stem:
+        prefix = stem.split("__", 1)[0]
+        prefix = _safe_name(prefix)
+        # Guard against numeric-leading stems (e.g., "100_200_...").
+        if prefix and not prefix[0].isdigit():
+            return prefix
+
+    # Modern: "..._<species-with-hyphens>" at the end (e.g., photinus-knulli).
+    m = re.search(r"(?:^|_)([A-Za-z0-9]+(?:-[A-Za-z0-9]+)+)$", stem)
+    if m:
+        return _safe_name(m.group(1))
+
+    return ""
+
+
+def _species_summary_from_dataset_dir(dataset_dir: Path) -> Dict[str, Any]:
+    """
+    Summarize which species are present in a dataset folder by scanning *filenames* in:
+      dataset_dir/{train,val,test}/firefly
+
+    This is the source of truth for training (ImageFolder trains on the folder contents),
+    and catches legacy imported patches that may be missing from patch_locations*.csv.
+    """
+    splits = ("train", "val", "test")
+    counts_by_split: Dict[str, Dict[str, int]] = {}
+    unknown_by_split: Dict[str, int] = {}
+    total: Counter[str] = Counter()
+
+    for split in splits:
+        firefly_dir = dataset_dir / split / "firefly"
+        if not firefly_dir.exists():
+            counts_by_split[split] = {}
+            unknown_by_split[split] = 0
+            continue
+
+        counts: Counter[str] = Counter()
+        unknown = 0
+        for p in firefly_dir.iterdir():
+            if not p.is_file():
+                continue
+            sp = _infer_species_from_patch_filename(p.name)
+            if sp:
+                counts[sp] += 1
+            else:
+                unknown += 1
+
+        ordered = dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+        counts_by_split[split] = ordered
+        unknown_by_split[split] = unknown
+        total.update(counts)
+
+    total_ordered = dict(sorted(total.items(), key=lambda kv: (-kv[1], kv[0])))
+    train_counts = counts_by_split.get("train", {}) or {}
+    return {
+        "species": list(train_counts.keys()),
+        "counts": train_counts,
+        "counts_by_split": counts_by_split,
+        "unknown_counts_by_split": unknown_by_split,
+        "counts_total": total_ordered,
+        "source_dir": str(dataset_dir),
+    }
 
 
 def _run_training(
@@ -676,43 +592,37 @@ def _run_training(
     seed: int,
     dry_run: bool,
 ) -> Dict[str, Any]:
-    trainer = repo_root / TRAINING_SCRIPT_REL_PATH
-    if not trainer.exists():
-        raise FileNotFoundError(trainer)
-
-    cmd = [
-        sys.executable,
-        str(trainer),
-        "--data-dir",
-        str(data_dir),
-        "--best-model-path",
-        str(out_model_path),
-        "--epochs",
-        str(int(epochs)),
-        "--batch-size",
-        str(int(batch_size)),
-        "--lr",
-        str(float(lr)),
-        "--num-workers",
-        str(int(num_workers)),
-        "--resnet",
-        str(resnet),
-        "--seed",
-        str(int(seed)),
-        "--no-gui",
-        "--metrics-out",
-        str(metrics_out_path),
-    ]
-
     if dry_run:
-        print("[dry-run] Would run training:", " ".join(cmd))
+        print(
+            "[dry-run] Would run training:",
+            f"data_dir={data_dir} out_model_path={out_model_path} epochs={epochs} batch_size={batch_size} lr={lr} "
+            f"num_workers={num_workers} resnet={resnet} seed={seed} metrics_out={metrics_out_path}",
+        )
         return {}
 
-    subprocess.run(cmd, cwd=str(repo_root), check=True)
-    try:
-        return json.loads(metrics_out_path.read_text())
-    except Exception:
-        return {}
+    if not LOCAL_TRAINING_SCRIPT_PY.exists():
+        raise FileNotFoundError(LOCAL_TRAINING_SCRIPT_PY)
+
+    import stage2_trainer as tr  # type: ignore
+
+    metrics_out_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics = tr.train_resnet_classifier(
+        data_dir=Path(data_dir).expanduser().resolve(),
+        best_model_path=Path(out_model_path).expanduser().resolve(),
+        epochs=int(epochs),
+        batch_size=int(batch_size),
+        lr=float(lr),
+        num_workers=int(num_workers),
+        resnet_model=str(resnet),
+        seed=int(seed),
+        no_gui=True,
+        sanitize_dataset=bool(SANITIZE_DATASET_IMAGES),
+        sanitize_mode=str(SANITIZE_DATASET_MODE),
+        sanitize_verify_with_pil=bool(SANITIZE_DATASET_VERIFY_WITH_PIL),
+        sanitize_report_max=int(SANITIZE_DATASET_REPORT_MAX),
+    )
+    metrics_out_path.write_text(json.dumps(metrics, indent=2))
+    return metrics
 
 
 def _avg_brightness_first_frames(video_path: Path, *, num_frames: int) -> float:
@@ -782,6 +692,157 @@ def _parse_validation_metrics(stage_dir: Path) -> Dict[str, Any]:
 
     best = max(per, key=lambda d: (float(d.get("f1", 0.0)), -float(d.get("fp", 0.0))))
     return {"best": best, "per_threshold": per}
+
+
+def _thr_name_to_float(thr_name: str) -> float | None:
+    """
+    Convert 'thr_5.0px' -> 5.0 (or None if it doesn't match).
+    """
+    try:
+        s = str(thr_name).strip()
+        if not s.startswith("thr_"):
+            return None
+        s = s.replace("thr_", "", 1)
+        if s.endswith("px"):
+            s = s[: -len("px")]
+        return float(s)
+    except Exception:
+        return None
+
+
+def _combine_metrics_across_videos(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    thresholds_px: Sequence[float],
+) -> Dict[str, Any]:
+    """
+    Combine TP/FP/FN across videos (per threshold).
+
+    Input `rows` is the orchestrator's per-video result rows for a single method_key:
+      {model_key, video_name, validation_metrics={per_threshold:[{thr,tp,fp,fn,...}]}}
+    """
+    thr_list = [float(t) for t in thresholds_px]
+    totals_by_thr: Dict[float, Dict[str, Any]] = {
+        t: {"tp": 0, "fp": 0, "fn": 0, "n_videos_used": 0} for t in thr_list
+    }
+
+    n_videos_total = 0
+    n_videos_with_metrics = 0
+    failures: List[Dict[str, Any]] = []
+
+    for r in rows:
+        n_videos_total += 1
+        video_name = str(r.get("video_name") or "")
+        vm = r.get("validation_metrics")
+        if not isinstance(vm, dict) or vm.get("error"):
+            failures.append({"video_name": video_name, "error": vm.get("error") if isinstance(vm, dict) else "no_metrics"})
+            continue
+        per = vm.get("per_threshold")
+        if not isinstance(per, list) or not per:
+            failures.append({"video_name": video_name, "error": "no_per_threshold"})
+            continue
+
+        # Map thr->counts for this video.
+        by_thr: Dict[float, Dict[str, int]] = {}
+        for it in per:
+            if not isinstance(it, dict):
+                continue
+            thr = _thr_name_to_float(str(it.get("thr") or ""))
+            if thr is None:
+                continue
+            try:
+                by_thr[float(thr)] = {
+                    "tp": int(it.get("tp") or 0),
+                    "fp": int(it.get("fp") or 0),
+                    "fn": int(it.get("fn") or 0),
+                }
+            except Exception:
+                continue
+
+        if not by_thr:
+            failures.append({"video_name": video_name, "error": "no_thr_parsed"})
+            continue
+
+        n_videos_with_metrics += 1
+        for thr in thr_list:
+            c = by_thr.get(thr)
+            if c is None:
+                continue
+            totals_by_thr[thr]["tp"] += c["tp"]
+            totals_by_thr[thr]["fp"] += c["fp"]
+            totals_by_thr[thr]["fn"] += c["fn"]
+            totals_by_thr[thr]["n_videos_used"] += 1
+
+    per_threshold_combined: List[Dict[str, Any]] = []
+    for thr in thr_list:
+        tp = int(totals_by_thr[thr]["tp"])
+        fp = int(totals_by_thr[thr]["fp"])
+        fn = int(totals_by_thr[thr]["fn"])
+        prec = (tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+        rec = (tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+        f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+        per_threshold_combined.append(
+            {
+                "thr_px": thr,
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                "precision": prec,
+                "recall": rec,
+                "f1": f1,
+                "n_videos_used": int(totals_by_thr[thr]["n_videos_used"]),
+            }
+        )
+
+    return {
+        "n_videos_total": int(n_videos_total),
+        "n_videos_with_metrics": int(n_videos_with_metrics),
+        "failures": failures,
+        "per_threshold": per_threshold_combined,
+    }
+
+
+def _format_combined_metrics_txt(
+    combined_by_method: Dict[str, Dict[str, Any]],
+    *,
+    thresholds_px: Sequence[float],
+) -> str:
+    thr_list = [float(t) for t in thresholds_px]
+    lines: List[str] = []
+    lines.append("COMBINED RESULTS (SUM TP/FP/FN ACROSS VIDEOS)")
+    lines.append(f"Thresholds (px): {', '.join(f'{t:.1f}' for t in thr_list)}")
+    lines.append("")
+    for method_key, payload in combined_by_method.items():
+        lines.append(f"== {method_key} ==")
+        lines.append(
+            f"videos_total={payload.get('n_videos_total', 0)}  videos_with_metrics={payload.get('n_videos_with_metrics', 0)}"
+        )
+        lines.append("thr_px  tp      fp      fn      precision  recall     f1        videos_used")
+        lines.append("-----  ------  ------  ------  ---------  --------  --------  ----------")
+        per = payload.get("per_threshold")
+        per_map: Dict[float, Dict[str, Any]] = {}
+        if isinstance(per, list):
+            for it in per:
+                try:
+                    per_map[float(it.get("thr_px"))] = it
+                except Exception:
+                    continue
+        for thr in thr_list:
+            it = per_map.get(thr, {})
+            tp = int(it.get("tp") or 0)
+            fp = int(it.get("fp") or 0)
+            fn = int(it.get("fn") or 0)
+            prec = float(it.get("precision") or 0.0)
+            rec = float(it.get("recall") or 0.0)
+            f1 = float(it.get("f1") or 0.0)
+            used = int(it.get("n_videos_used") or 0)
+            lines.append(f"{thr:5.1f}  {tp:6d}  {fp:6d}  {fn:6d}  {prec:9.4f}  {rec:8.4f}  {f1:8.4f}  {used:10d}")
+        failures = payload.get("failures")
+        if isinstance(failures, list) and failures:
+            n_fail = len(failures)
+            lines.append(f"failures={n_fail} (see run_record.json for per-video errors)")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _run_gateway(
@@ -1019,6 +1080,63 @@ def _run_stage5_validator(
     subprocess.run([sys.executable, "-c", code], cwd=str(day_dir), check=True)
 
 
+def _run_stage6_overlay(
+    *,
+    repo_root: Path,
+    orig_video_path: Path,
+    pred_csv_path: Path,
+    out_video_path: Path,
+    thickness: int,
+    gt_box_w: int,
+    gt_box_h: int,
+    only_firefly_rows: bool,
+    max_frames: int | None,
+    stage5_dir_hint: Path | None,
+    render_threshold_overlays: bool,
+    thr_box_w: int | None,
+    thr_box_h: int | None,
+    dry_run: bool,
+) -> None:
+    day_dir = (repo_root / DAY_PIPELINE_DIR_REL_PATH).resolve()
+    stage6_py = day_dir / "stage6_overlay_gt_vs_model.py"
+    if not stage6_py.exists():
+        raise FileNotFoundError(stage6_py)
+
+    max_frames_code = str(int(max_frames)) if max_frames is not None else "None"
+    stage5_hint_code = (
+        f"Path({repr(str(stage5_dir_hint))})" if stage5_dir_hint is not None else "None"
+    )
+    thr_box_w_code = str(int(thr_box_w)) if thr_box_w is not None else "None"
+    thr_box_h_code = str(int(thr_box_h)) if thr_box_h is not None else "None"
+
+    code = "\n".join(
+        [
+            "from pathlib import Path",
+            "from stage6_overlay_gt_vs_model import overlay_gt_vs_model",
+            "overlay_gt_vs_model(",
+            f"    orig_video_path=Path({repr(str(orig_video_path))}),",
+            f"    pred_csv_path=Path({repr(str(pred_csv_path))}),",
+            f"    out_video_path=Path({repr(str(out_video_path))}),",
+            "    gt_norm_csv_path=None,",
+            f"    thickness={int(thickness)},",
+            f"    gt_box_w={int(gt_box_w)},",
+            f"    gt_box_h={int(gt_box_h)},",
+            f"    only_firefly_rows={bool(only_firefly_rows)},",
+            f"    max_frames={max_frames_code},",
+            f"    stage5_dir_hint={stage5_hint_code},",
+            f"    render_threshold_overlays={bool(render_threshold_overlays)},",
+            f"    thr_box_w={thr_box_w_code},",
+            f"    thr_box_h={thr_box_h_code},",
+            ")",
+        ]
+    )
+
+    if dry_run:
+        print(f"[dry-run] Would run Stage6 overlay in {day_dir} -> {out_video_path.name}")
+        return
+    subprocess.run([sys.executable, "-c", code], cwd=str(day_dir), check=True)
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Integrated ingest → train → validate orchestrator.")
     p.add_argument(
@@ -1039,6 +1157,16 @@ def _parse_args() -> argparse.Namespace:
         default=str(TYPE_OF_VIDEO),
         help="Global video type for this run: day|night (controls dataset routing + model-zoo selection).",
     )
+    p.add_argument(
+        "--train-pair-fraction",
+        type=float,
+        default=float(TRAIN_PAIR_FRACTION),
+        help="Fraction of discovered (video,csv) pairs assigned to training (remainder held out for validation/testing).",
+    )
+
+    p.add_argument("--skip-ingest", action="store_true", default=False, help="Skip Stage 1 ingestion.")
+    p.add_argument("--skip-train", action="store_true", default=False, help="Skip Stage 2 training.")
+    p.add_argument("--skip-test", action="store_true", default=False, help="Skip Stage 3 testing/evaluation.")
 
     p.add_argument(
         "--root",
@@ -1084,7 +1212,7 @@ def main() -> int:
     root = Path(root_arg).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
 
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = _REPO_ROOT
     gateway_path = (repo_root / GATEWAY_REL_PATH).resolve()
     if not gateway_path.exists():
         raise FileNotFoundError(gateway_path)
@@ -1102,12 +1230,25 @@ def main() -> int:
     (data_root / "Integrated_prototype_validation_datasets" / "individual species folder").mkdir(parents=True, exist_ok=True)
     inference_root.mkdir(parents=True, exist_ok=True)
 
-    # Discover and split observed (video,csv) pairs.
-    pairs = _discover_observed_pairs(observed_dir)
+    # -------------------------------------------------------------------------
+    # Stage 1: Ingest (extract patches + version datasets)
+    # -------------------------------------------------------------------------
 
-    train_pairs, val_pairs = _split_pairs_train_vs_val(pairs)
+    # Discover and split observed (video,csv) pairs.
+    pairs = stage1_ingestor.discover_observed_pairs(observed_dir)
+
+    try:
+        train_pairs, val_pairs = stage1_ingestor.split_pairs_train_vs_val(
+            pairs, train_fraction=float(args.train_pair_fraction)
+        )
+    except Exception as e:
+        raise SystemExit(f"Invalid --train-pair-fraction: {e}") from e
     train_video_names = {p.video_name for p in train_pairs}
     val_video_names = {p.video_name for p in val_pairs}
+    print(
+        "[orchestrator] Discovered pairs:",
+        f"total={len(pairs)} train={len(train_pairs)} val={len(val_pairs)} train_fraction={float(args.train_pair_fraction):.3f}",
+    )
 
     # Count rows for run naming + train decision.
     train_firefly_rows_total = sum(len(_read_annotator_csv(p.firefly_csv)) for p in train_pairs)
@@ -1118,20 +1259,15 @@ def main() -> int:
 
     has_train_rows = bool(train_firefly_rows_total or train_background_rows_total)
 
-    # Stage CSVs into canonical names expected by species scaler.
-    staging_dir = (
-        data_root
-        / "batch_exports"
-        / "orchestrator_observed_dir_staging"
-        / f"{_run_tag()}__{_safe_name(observed_dir.name)}"
-    )
-    staged_pairs = _stage_pairs_for_species_scaler(
-        pairs,
-        species_name=species_name,
-        staging_dir=staging_dir,
-        time_of_day=time_of_day,
-        dry_run=bool(args.dry_run),
-    )
+    skip_ingest = bool(getattr(args, "skip_ingest", False))
+    skip_train = bool(getattr(args, "skip_train", False))
+    skip_test = bool(getattr(args, "skip_test", False))
+    if skip_ingest:
+        print("[orchestrator] Skipping Stage 1 ingestion (--skip-ingest).")
+    if skip_train:
+        print("[orchestrator] Skipping Stage 2 training (--skip-train).")
+    if skip_test:
+        print("[orchestrator] Skipping Stage 3 testing (--skip-test).")
 
     zoo = _ensure_model_zoo_scaffold(model_root)
     history_path = zoo["history"]
@@ -1141,44 +1277,179 @@ def main() -> int:
         registry[p.video_name] = str(p.video_path)
     _save_registry(registry_path, registry)
 
-    staged_by_video: Dict[str, StagedPair] = {sp.pair.video_name: sp for sp in staged_pairs}
-
-    # Run species scaler (ingestion) for training pairs (train_fraction=1.0) and validation pairs (train_fraction=0.0).
-    for p in pairs:
-        sp = staged_by_video[p.video_name]
-        if p.video_name in train_video_names:
-            _run_species_scaler(
-                repo_root=repo_root,
-                annotations_csv=sp.staged_firefly_csv,
-                video_path=p.video_path,
-                data_root=data_root,
-                train_fraction=1.0,
-                train_val_seed=1337,
-                auto_load_sibling=bool(AUTO_LOAD_SIBLING_CLASS_CSV),
-                dry_run=bool(args.dry_run),
-            )
-        elif p.video_name in val_video_names:
-            _run_species_scaler(
-                repo_root=repo_root,
-                annotations_csv=sp.staged_firefly_csv,
-                video_path=p.video_path,
-                data_root=data_root,
-                train_fraction=0.0,
-                train_val_seed=1337,
-                auto_load_sibling=False,
-                dry_run=bool(args.dry_run),
-            )
-
-    # Resolve dataset roots produced by species scaler
+    # Dataset roots produced by stage1_ingestor_core.
     integrated_root = data_root / "Integrated_prototype_datasets" / "integrated pipeline datasets"
     single_root = data_root / "Integrated_prototype_datasets" / "single species datasets" / species_name
     validation_combined_root = data_root / "Integrated_prototype_validation_datasets" / "combined species folder"
     validation_species_root = (
-        data_root
-        / "Integrated_prototype_validation_datasets"
-        / "individual species folder"
-        / species_name
+        data_root / "Integrated_prototype_validation_datasets" / "individual species folder" / species_name
     )
+
+    # Stage CSVs into canonical names expected by stage1_ingestor_core.
+    staging_dir = (
+        data_root
+        / "batch_exports"
+        / "orchestrator_observed_dir_staging"
+        / f"{_run_tag()}__{_safe_name(observed_dir.name)}"
+    )
+
+    if not skip_ingest:
+        staged_pairs = stage1_ingestor.stage_pairs_for_ingestor(
+            pairs,
+            species_name=species_name,
+            staging_dir=staging_dir,
+            time_of_day=time_of_day,
+            dry_run=bool(args.dry_run),
+        )
+        staged_by_video: Dict[str, stage1_ingestor.StagedPair] = {sp.pair.video_name: sp for sp in staged_pairs}
+
+        scaler_overrides: Dict[str, Any] = {
+            # Versioning behavior
+            "VERSION_COPY_MODE": str(DATASET_VERSION_COPY_MODE),
+            # Background auto-generation knobs
+            "AUTO_GENERATE_BACKGROUND_PATCHES": bool(AUTO_GENERATE_BACKGROUND_PATCHES),
+            "AUTO_BACKGROUND_TO_FIREFLY_RATIO": float(AUTO_BACKGROUND_TO_FIREFLY_RATIO),
+            "AUTO_BACKGROUND_PATCH_SIZE_PX": int(AUTO_BACKGROUND_PATCH_SIZE_PX),
+            "AUTO_BACKGROUND_MAX_PATCHES_PER_FRAME": int(AUTO_BACKGROUND_MAX_PATCHES_PER_FRAME),
+            "AUTO_BACKGROUND_MAX_FRAME_SAMPLES": int(AUTO_BACKGROUND_MAX_FRAME_SAMPLES),
+            "AUTO_BACKGROUND_SEED": int(AUTO_BACKGROUND_SEED),
+            "AUTO_BACKGROUND_FALLBACK_RANDOM_CENTERS": bool(AUTO_BACKGROUND_FALLBACK_RANDOM_CENTERS),
+            # SBD + preprocessing
+            "AUTO_BACKGROUND_SBD_MIN_AREA_PX": float(AUTO_BACKGROUND_SBD_MIN_AREA_PX),
+            "AUTO_BACKGROUND_SBD_MAX_AREA_SCALE": float(AUTO_BACKGROUND_SBD_MAX_AREA_SCALE),
+            "AUTO_BACKGROUND_SBD_MIN_DIST": float(AUTO_BACKGROUND_SBD_MIN_DIST),
+            "AUTO_BACKGROUND_SBD_MIN_REPEAT": int(AUTO_BACKGROUND_SBD_MIN_REPEAT),
+            "AUTO_BACKGROUND_USE_CLAHE": bool(AUTO_BACKGROUND_USE_CLAHE),
+            "AUTO_BACKGROUND_CLAHE_CLIP": float(AUTO_BACKGROUND_CLAHE_CLIP),
+            "AUTO_BACKGROUND_CLAHE_TILE": tuple(AUTO_BACKGROUND_CLAHE_TILE),
+            "AUTO_BACKGROUND_USE_TOPHAT": bool(AUTO_BACKGROUND_USE_TOPHAT),
+            "AUTO_BACKGROUND_TOPHAT_KSIZE": int(AUTO_BACKGROUND_TOPHAT_KSIZE),
+            "AUTO_BACKGROUND_USE_DOG": bool(AUTO_BACKGROUND_USE_DOG),
+            "AUTO_BACKGROUND_DOG_SIGMA1": float(AUTO_BACKGROUND_DOG_SIGMA1),
+            "AUTO_BACKGROUND_DOG_SIGMA2": float(AUTO_BACKGROUND_DOG_SIGMA2),
+        }
+
+        batch_integrated_target_ver: Path | None = None
+        batch_single_target_ver: Path | None = None
+        batch_val_comb_target_ver: Path | None = None
+        batch_val_species_target_ver: Path | None = None
+
+        if ONE_DATASET_VERSION_PER_BATCH:
+            # One dataset version per "observed_dir ingest" run.
+            batch_integrated_target_ver = _next_version_dir(integrated_root)
+            batch_single_target_ver = _next_version_dir(single_root)
+            if val_pairs:
+                batch_val_comb_target_ver = _next_version_dir(validation_combined_root)
+                batch_val_species_target_ver = _next_version_dir(validation_species_root)
+
+            print(
+                "[orchestrator] Batch ingest versions:",
+                f"integrated={batch_integrated_target_ver.name} single_species={batch_single_target_ver.name}"
+                + (
+                    f" validation_combined={batch_val_comb_target_ver.name} validation_species={batch_val_species_target_ver.name}"
+                    if val_pairs
+                    and batch_val_comb_target_ver is not None
+                    and batch_val_species_target_ver is not None
+                    else ""
+                ),
+            )
+
+            # TRAIN ingestion (append into a single target version; finalize split once at the end).
+            train_pbar = (
+                tqdm(train_pairs, desc="[stage1] ingest TRAIN", unit="video", dynamic_ncols=True)
+                if tqdm is not None and train_pairs
+                else None
+            )
+            train_it = train_pbar if train_pbar is not None else train_pairs
+            for i, p in enumerate(train_it):
+                sp = staged_by_video[p.video_name]
+                finalize = (i == (len(train_pairs) - 1))
+                if train_pbar is not None:
+                    train_pbar.set_postfix(video=str(p.video_name), finalize=bool(finalize))
+                stage1_ingestor.run_ingestor_core(
+                    annotations_csv=sp.staged_firefly_csv,
+                    video_path=p.video_path,
+                    data_root=data_root,
+                    train_fraction=1.0,
+                    train_val_seed=1337,
+                    auto_load_sibling=bool(AUTO_LOAD_SIBLING_CLASS_CSV),
+                    single_species_target_version_dir=batch_single_target_ver,
+                    integrated_target_version_dir=batch_integrated_target_ver,
+                    validation_combined_target_version_dir=None,
+                    validation_individual_target_version_dir=None,
+                    skip_final_split_rebuild=(not finalize),
+                    scaler_overrides=scaler_overrides,
+                    dry_run=bool(args.dry_run),
+                )
+            if train_pbar is not None:
+                train_pbar.close()
+
+            # FINAL-VALIDATION ingestion (append into a single target validation version).
+            val_pbar = (
+                tqdm(val_pairs, desc="[stage1] ingest VALIDATION", unit="video", dynamic_ncols=True)
+                if tqdm is not None and val_pairs
+                else None
+            )
+            val_it = val_pbar if val_pbar is not None else val_pairs
+            for p in val_it:
+                sp = staged_by_video[p.video_name]
+                if val_pbar is not None:
+                    val_pbar.set_postfix(video=str(p.video_name))
+                stage1_ingestor.run_ingestor_core(
+                    annotations_csv=sp.staged_firefly_csv,
+                    video_path=p.video_path,
+                    data_root=data_root,
+                    train_fraction=0.0,
+                    train_val_seed=1337,
+                    auto_load_sibling=False,
+                    single_species_target_version_dir=None,
+                    integrated_target_version_dir=None,
+                    validation_combined_target_version_dir=batch_val_comb_target_ver,
+                    validation_individual_target_version_dir=batch_val_species_target_ver,
+                    skip_final_split_rebuild=True,
+                    scaler_overrides=scaler_overrides,
+                    dry_run=bool(args.dry_run),
+                )
+            if val_pbar is not None:
+                val_pbar.close()
+        else:
+            # Legacy behavior: one dataset version per video ingested.
+            pairs_pbar = (
+                tqdm(pairs, desc="[stage1] ingest VIDEOS", unit="video", dynamic_ncols=True)
+                if tqdm is not None and pairs
+                else None
+            )
+            pairs_it = pairs_pbar if pairs_pbar is not None else pairs
+            for p in pairs_it:
+                sp = staged_by_video[p.video_name]
+                if p.video_name in train_video_names:
+                    if pairs_pbar is not None:
+                        pairs_pbar.set_postfix(video=str(p.video_name), split="train")
+                    stage1_ingestor.run_ingestor_core(
+                        annotations_csv=sp.staged_firefly_csv,
+                        video_path=p.video_path,
+                        data_root=data_root,
+                        train_fraction=1.0,
+                        train_val_seed=1337,
+                        auto_load_sibling=bool(AUTO_LOAD_SIBLING_CLASS_CSV),
+                        scaler_overrides=scaler_overrides,
+                        dry_run=bool(args.dry_run),
+                    )
+                elif p.video_name in val_video_names:
+                    if pairs_pbar is not None:
+                        pairs_pbar.set_postfix(video=str(p.video_name), split="validation")
+                    stage1_ingestor.run_ingestor_core(
+                        annotations_csv=sp.staged_firefly_csv,
+                        video_path=p.video_path,
+                        data_root=data_root,
+                        train_fraction=0.0,
+                        train_val_seed=1337,
+                        auto_load_sibling=False,
+                        scaler_overrides=scaler_overrides,
+                        dry_run=bool(args.dry_run),
+                    )
+            if pairs_pbar is not None:
+                pairs_pbar.close()
 
     integrated_ver = _latest_version_dir(integrated_root)
     single_ver = _latest_version_dir(single_root)
@@ -1194,13 +1465,17 @@ def main() -> int:
     global_data_dir = integrated_ver / dataset_time_dir / "final dataset"
     species_data_dir = single_ver / "final dataset"
 
+    # -------------------------------------------------------------------------
+    # Stage 2: Train (patch classifier models)
+    # -------------------------------------------------------------------------
+
     # Train models (if this batch added training rows)
     global_model_path: Path | None = None
     species_model_path: Path | None = None
     global_train_metrics: Dict[str, Any] | None = None
     species_train_metrics: Dict[str, Any] | None = None
 
-    do_train = bool(TRAIN_MODELS_IF_TRAIN_ROWS_PRESENT) and has_train_rows
+    do_train = bool(TRAIN_MODELS_IF_TRAIN_ROWS_PRESENT) and has_train_rows and (not skip_train)
 
     if do_train:
         print(f"[orchestrator] TRAIN rows present; training new models (time_of_day={time_of_day})")
@@ -1229,9 +1504,21 @@ def main() -> int:
                 dry_run=bool(args.dry_run),
             )
 
-            species_summary = _species_summary_from_patch_locations(
-                integrated_ver / dataset_time_dir / "patch_locations_train.csv"
-            )
+            patch_locations_train_csv = integrated_ver / dataset_time_dir / "patch_locations_train.csv"
+            species_summary_csv = _species_summary_from_patch_locations(patch_locations_train_csv)
+            species_summary_dir = _species_summary_from_dataset_dir(global_data_dir)
+
+            # Prefer the dataset-dir scan (training uses ImageFolder over the folder contents),
+            # but keep the patch_locations summary for traceability/debugging.
+            species_summary = species_summary_dir if species_summary_dir.get("counts") else species_summary_csv
+
+            warn_mismatch = None
+            if species_summary_dir.get("counts") and species_summary_csv.get("counts"):
+                if species_summary_dir.get("counts") != species_summary_csv.get("counts"):
+                    warn_mismatch = (
+                        "patch_locations_train.csv species counts do not match dataset_dir/train/firefly. "
+                        "This usually means legacy-imported patches exist on disk but are missing from patch_locations*.csv."
+                    )
             (global_ver / "model_card.txt").write_text(
                 json.dumps(
                     {
@@ -1241,8 +1528,13 @@ def main() -> int:
                         "dataset_dir": str(global_data_dir),
                         "trained_species": species_summary.get("species", []),
                         "trained_species_counts": species_summary.get("counts", {}),
-                        "trained_species_source_csv": species_summary.get("source_csv"),
-                        "trained_species_error": species_summary.get("error"),
+                        "trained_species_source_csv": species_summary_csv.get("source_csv"),
+                        "trained_species_error": species_summary_csv.get("error"),
+                        "trained_species_source_train_dir": str(global_data_dir / "train" / "firefly"),
+                        "trained_species_counts_by_split": species_summary_dir.get("counts_by_split", {}),
+                        "trained_species_counts_total": species_summary_dir.get("counts_total", {}),
+                        "trained_species_unknown_counts_by_split": species_summary_dir.get("unknown_counts_by_split", {}),
+                        "trained_species_warning": warn_mismatch,
                         "train_metrics": global_train_metrics,
                     },
                     indent=2,
@@ -1250,38 +1542,46 @@ def main() -> int:
             )
 
         if EVAL_SINGLE_SPECIES_MODEL:
-            sp_root = zoo["single_root"] / species_name
-            sp_root.mkdir(parents=True, exist_ok=True)
-            sp_ver = _next_version_dir(sp_root)
-            sp_ver.mkdir(parents=True, exist_ok=False)
-            species_model_path = sp_ver / "model.pt"
-            species_metrics_path = sp_ver / "training_metrics.json"
-            species_train_metrics = _run_training(
-                repo_root=repo_root,
-                data_dir=species_data_dir,
-                out_model_path=species_model_path,
-                metrics_out_path=species_metrics_path,
-                epochs=int(TRAIN_EPOCHS),
-                batch_size=int(TRAIN_BATCH_SIZE),
-                lr=float(TRAIN_LR),
-                num_workers=int(TRAIN_NUM_WORKERS),
-                resnet=str(TRAIN_RESNET),
-                seed=int(TRAIN_SEED),
-                dry_run=bool(args.dry_run),
-            )
-            (sp_ver / "model_card.txt").write_text(
-                json.dumps(
-                    {
-                        "kind": "single_species",
-                        "species": species_name,
-                        "time_of_day": time_of_day,
-                        "dataset_version": single_ver.name,
-                        "dataset_dir": str(species_data_dir),
-                        "train_metrics": species_train_metrics,
-                    },
-                    indent=2,
+            ff_n = _count_images_in_dir(species_data_dir / "train" / "firefly")
+            bg_n = _count_images_in_dir(species_data_dir / "train" / "background")
+            if ff_n <= 0 or bg_n <= 0:
+                print(
+                    "[orchestrator] WARNING: skipping single-species training (need both classes).",
+                    f"train_firefly_images={ff_n} train_background_images={bg_n} dataset={species_data_dir}",
                 )
-            )
+            else:
+                sp_root = zoo["single_root"] / species_name
+                sp_root.mkdir(parents=True, exist_ok=True)
+                sp_ver = _next_version_dir(sp_root)
+                sp_ver.mkdir(parents=True, exist_ok=False)
+                species_model_path = sp_ver / "model.pt"
+                species_metrics_path = sp_ver / "training_metrics.json"
+                species_train_metrics = _run_training(
+                    repo_root=repo_root,
+                    data_dir=species_data_dir,
+                    out_model_path=species_model_path,
+                    metrics_out_path=species_metrics_path,
+                    epochs=int(TRAIN_EPOCHS),
+                    batch_size=int(TRAIN_BATCH_SIZE),
+                    lr=float(TRAIN_LR),
+                    num_workers=int(TRAIN_NUM_WORKERS),
+                    resnet=str(TRAIN_RESNET),
+                    seed=int(TRAIN_SEED),
+                    dry_run=bool(args.dry_run),
+                )
+                (sp_ver / "model_card.txt").write_text(
+                    json.dumps(
+                        {
+                            "kind": "single_species",
+                            "species": species_name,
+                            "time_of_day": time_of_day,
+                            "dataset_version": single_ver.name,
+                            "dataset_dir": str(species_data_dir),
+                            "train_metrics": species_train_metrics,
+                        },
+                        indent=2,
+                    )
+                )
 
     # If we didn't train, use latest models from the zoo
     if global_model_path is None and EVAL_GLOBAL_MODEL:
@@ -1306,6 +1606,10 @@ def main() -> int:
                 pts = sorted(latest.glob("*.pt"))
                 species_model_path = pts[0] if pts else None
 
+    # -------------------------------------------------------------------------
+    # Stage 3: Test (run pipelines + score vs GT)
+    # -------------------------------------------------------------------------
+
     # Determine evaluation set (validation pairs)
     eval_items: List[Tuple[str, Path, List[Dict[str, int]]]] = []
     eval_source: Dict[str, Any] = {}
@@ -1321,28 +1625,31 @@ def main() -> int:
         "n_pairs_train": len(train_pairs),
         "n_pairs_validation": len(val_pairs),
     }
-    for p in val_pairs:
-        gt_rows = _read_annotator_csv(p.firefly_csv)
-        if not gt_rows:
-            continue
-        try:
-            route = _route_for_video(
-                p.video_path, thr=float(GATEWAY_BRIGHTNESS_THRESHOLD), frames=int(GATEWAY_BRIGHTNESS_NUM_FRAMES)
-            )
-        except Exception:
-            continue
-        if expected_route == "day" and route != "day":
-            print(f"[orchestrator] WARNING: skipping {p.video_path.name} (routed {route}, expected day)")
-            continue
-        if expected_route == "night" and route != "night":
-            print(f"[orchestrator] WARNING: skipping {p.video_path.name} (routed {route}, expected night)")
-            continue
-        eval_items.append((p.video_name, p.video_path, gt_rows))
+    if not skip_test:
+        for p in val_pairs:
+            gt_rows = _read_annotator_csv(p.firefly_csv)
+            if not gt_rows:
+                continue
+            try:
+                route = _route_for_video(
+                    p.video_path, thr=float(GATEWAY_BRIGHTNESS_THRESHOLD), frames=int(GATEWAY_BRIGHTNESS_NUM_FRAMES)
+                )
+            except Exception:
+                continue
+            if expected_route == "day" and route != "day":
+                print(f"[orchestrator] WARNING: skipping {p.video_path.name} (routed {route}, expected day)")
+                continue
+            if expected_route == "night" and route != "night":
+                print(f"[orchestrator] WARNING: skipping {p.video_path.name} (routed {route}, expected night)")
+                continue
+            eval_items.append((p.video_name, p.video_path, gt_rows))
 
-    if not eval_items:
-        if eval_error is None:
-            eval_error = "no_eval_videos_selected"
-        print(f"[orchestrator] WARNING: {eval_error}")
+        if not eval_items:
+            if eval_error is None:
+                eval_error = "no_eval_videos_selected"
+            print(f"[orchestrator] WARNING: {eval_error}")
+    else:
+        eval_error = "skipped"
 
     run_ident = RunIdentity(dataset_name=_safe_name(observed_dir.name), species_name=species_name, time_of_day=time_of_day)
     run_id = _run_dir_name(
@@ -1358,31 +1665,70 @@ def main() -> int:
     results: List[Dict[str, Any]] = []
 
     def _eval_one_model(model_key: str, *, day_patch_model: Path | None, night_cnn_model: Path | None) -> None:
-        for video_name, vp, gt_rows in eval_items:
+        pbar = (
+            tqdm(eval_items, desc=f"[stage3] {model_key}", unit="video", dynamic_ncols=True)
+            if tqdm is not None and eval_items
+            else None
+        )
+        it = pbar if pbar is not None else eval_items
+        for video_name, vp, gt_rows in it:
             out_root = inference_root / run_id / model_key / video_name
             out_root.mkdir(parents=True, exist_ok=True)
 
             # Write GT for both pipeline roots (only one will be used depending on route)
-            day_gt_dir = out_root / DAY_OUTPUT_SUBDIR / "ground truth"
-            night_gt_dir = out_root / NIGHT_OUTPUT_SUBDIR / "ground truth"
+            day_root = out_root / DAY_OUTPUT_SUBDIR
+            night_root = out_root / NIGHT_OUTPUT_SUBDIR
+            day_gt_dir = day_root / "ground truth"
+            night_gt_dir = night_root / "ground truth"
             _write_gt_csv(day_gt_dir / f"gt_{vp.stem}.csv", gt_rows)
             _write_gt_csv(day_gt_dir / "gt.csv", gt_rows)
+            # Night pipeline's stage0_cleanup expects a root-level CSV to seed ground truth.
+            _write_gt_csv(day_root / "gt.csv", gt_rows)
             _write_gt_csv(night_gt_dir / "gt.csv", gt_rows)
+            _write_gt_csv(night_root / "gt.csv", gt_rows)
 
             t0 = time.time()
-            _run_gateway(
-                repo_root=repo_root,
-                gateway_path=gateway_path,
-                video_path=vp,
-                output_root=out_root,
-                day_patch_model=day_patch_model,
-                night_cnn_model=night_cnn_model,
-                thr=float(GATEWAY_BRIGHTNESS_THRESHOLD),
-                frames=int(GATEWAY_BRIGHTNESS_NUM_FRAMES),
-                max_concurrent=int(GATEWAY_MAX_CONCURRENT),
-                force_tests=bool(FORCE_GATEWAY_TESTS),
-                dry_run=bool(args.dry_run),
-            )
+            try:
+                _run_gateway(
+                    repo_root=repo_root,
+                    gateway_path=gateway_path,
+                    video_path=vp,
+                    output_root=out_root,
+                    day_patch_model=day_patch_model,
+                    night_cnn_model=night_cnn_model,
+                    thr=float(GATEWAY_BRIGHTNESS_THRESHOLD),
+                    frames=int(GATEWAY_BRIGHTNESS_NUM_FRAMES),
+                    max_concurrent=int(GATEWAY_MAX_CONCURRENT),
+                    force_tests=bool(FORCE_GATEWAY_TESTS),
+                    dry_run=bool(args.dry_run),
+                )
+            except subprocess.CalledProcessError as e:
+                dt = time.time() - t0
+                route = "unknown"
+                try:
+                    route = _route_for_video(
+                        vp, thr=float(GATEWAY_BRIGHTNESS_THRESHOLD), frames=int(GATEWAY_BRIGHTNESS_NUM_FRAMES)
+                    )
+                except Exception:
+                    pass
+                if pbar is not None:
+                    pbar.set_postfix(video=str(video_name), route=str(route), exit=int(e.returncode), dt_s=f"{dt:.1f}")
+                results.append(
+                    {
+                        "model_key": model_key,
+                        "video_name": video_name,
+                        "video_path": str(vp),
+                        "route": route,
+                        "output_root": str(out_root),
+                        "duration_s": float(dt),
+                        "validation_metrics": {
+                            "error": "gateway_failed",
+                            "exit_code": int(e.returncode),
+                            "cmd": [str(x) for x in (e.cmd or [])],
+                        },
+                    }
+                )
+                continue
             dt = time.time() - t0
 
             # Parse validation metrics from whichever pipeline was chosen
@@ -1392,6 +1738,20 @@ def main() -> int:
             else:
                 stage_dir = out_root / NIGHT_OUTPUT_SUBDIR / "stage9 validation" / vp.stem
             metrics = _parse_validation_metrics(stage_dir)
+            if pbar is not None:
+                best = metrics.get("best") if isinstance(metrics, dict) else None
+                if isinstance(best, dict):
+                    pbar.set_postfix(
+                        video=str(video_name),
+                        route=str(route),
+                        tp=int(best.get("tp") or 0),
+                        fp=int(best.get("fp") or 0),
+                        fn=int(best.get("fn") or 0),
+                        f1=float(best.get("f1") or 0.0),
+                        dt_s=f"{dt:.1f}",
+                    )
+                else:
+                    pbar.set_postfix(video=str(video_name), route=str(route), dt_s=f"{dt:.1f}")
 
             results.append(
                 {
@@ -1404,6 +1764,8 @@ def main() -> int:
                     "validation_metrics": metrics,
                 }
             )
+        if pbar is not None:
+            pbar.close()
 
     if EVAL_GLOBAL_MODEL and global_model_path is not None:
         if time_of_day == "day_time":
@@ -1498,7 +1860,15 @@ def main() -> int:
 
         warned_no_raphael_model = False
 
-        for video_name, vp, gt_rows in eval_items:
+        base_pbar = (
+            tqdm(eval_items, desc="[stage3] baselines", unit="video", dynamic_ncols=True)
+            if tqdm is not None and eval_items
+            else None
+        )
+        base_it = base_pbar if base_pbar is not None else eval_items
+        for video_name, vp, gt_rows in base_it:
+            if base_pbar is not None:
+                base_pbar.set_postfix(video=str(video_name))
             try:
                 route = _route_for_video(
                     vp, thr=float(GATEWAY_BRIGHTNESS_THRESHOLD), frames=int(GATEWAY_BRIGHTNESS_NUM_FRAMES)
@@ -1521,6 +1891,8 @@ def main() -> int:
                 stage5_dir = out_root / "stage5 validation" / vp.stem
 
                 t0 = time.time()
+                overlay_video = None
+                overlay_error = None
                 try:
                     _run_baseline_lab_detector(
                         repo_root=repo_root,
@@ -1548,6 +1920,34 @@ def main() -> int:
                     metrics = _parse_validation_metrics(stage5_dir)
                 except Exception as e:
                     metrics = {"error": str(e)}
+
+                if BASELINE_RENDER_OVERLAY_VIDEO and isinstance(metrics, dict) and not metrics.get("error"):
+                    legend = "LEGEND_GT=GREEN_MODEL=RED_OVERLAP=YELLOW"
+                    overlay_dir = out_root / "stage6 overlay videos"
+                    overlay_path = overlay_dir / f"{vp.stem}_gt_vs_model__{legend}.mp4"
+                    try:
+                        _run_stage6_overlay(
+                            repo_root=repo_root,
+                            orig_video_path=vp,
+                            pred_csv_path=pred_csv,
+                            out_video_path=overlay_path,
+                            thickness=1,
+                            gt_box_w=int(BASELINE_VALIDATE_CROP_W),
+                            gt_box_h=int(BASELINE_VALIDATE_CROP_H),
+                            only_firefly_rows=True,
+                            max_frames=int(BASELINE_MAX_FRAMES) if BASELINE_MAX_FRAMES is not None else None,
+                            stage5_dir_hint=(out_root / "stage5 validation"),
+                            render_threshold_overlays=bool(BASELINE_OVERLAY_RENDER_THRESH_VIDEOS),
+                            thr_box_w=None,
+                            thr_box_h=None,
+                            dry_run=bool(args.dry_run),
+                        )
+                        if not bool(args.dry_run) and overlay_path.exists():
+                            overlay_video = str(overlay_path)
+                    except Exception as e:
+                        overlay_error = str(e)
+                        print(f"[baseline-overlay] WARNING: lab overlay failed for {video_name}: {e}")
+
                 baseline_results.append(
                     {
                         "model_key": "baseline_lab_method",
@@ -1557,8 +1957,22 @@ def main() -> int:
                         "output_root": str(out_root),
                         "duration_s": float(time.time() - t0),
                         "validation_metrics": metrics,
+                        "overlay_video_path": overlay_video,
+                        "overlay_error": overlay_error,
                     }
                 )
+                if base_pbar is not None and isinstance(metrics, dict):
+                    best = metrics.get("best") if isinstance(metrics.get("best"), dict) else None
+                    if isinstance(best, dict):
+                        base_pbar.set_postfix(
+                            video=str(video_name),
+                            route=str(route),
+                            kind="lab",
+                            tp=int(best.get("tp") or 0),
+                            fp=int(best.get("fp") or 0),
+                            fn=int(best.get("fn") or 0),
+                            f1=float(best.get("f1") or 0.0),
+                        )
 
             # Baseline: Raphael method
             if RUN_BASELINE_RAPHAEL_METHOD:
@@ -1583,6 +1997,8 @@ def main() -> int:
                 stage5_dir = out_root / "stage5 validation" / vp.stem
 
                 t0 = time.time()
+                overlay_video = None
+                overlay_error = None
                 try:
                     _run_baseline_raphael_detector(
                         repo_root=repo_root,
@@ -1618,6 +2034,34 @@ def main() -> int:
                     metrics = _parse_validation_metrics(stage5_dir)
                 except Exception as e:
                     metrics = {"error": str(e)}
+
+                if BASELINE_RENDER_OVERLAY_VIDEO and isinstance(metrics, dict) and not metrics.get("error"):
+                    legend = "LEGEND_GT=GREEN_MODEL=RED_OVERLAP=YELLOW"
+                    overlay_dir = out_root / "stage6 overlay videos"
+                    overlay_path = overlay_dir / f"{vp.stem}_gt_vs_model__{legend}.mp4"
+                    try:
+                        _run_stage6_overlay(
+                            repo_root=repo_root,
+                            orig_video_path=vp,
+                            pred_csv_path=pred_csv,
+                            out_video_path=overlay_path,
+                            thickness=1,
+                            gt_box_w=int(BASELINE_VALIDATE_CROP_W),
+                            gt_box_h=int(BASELINE_VALIDATE_CROP_H),
+                            only_firefly_rows=True,
+                            max_frames=int(BASELINE_MAX_FRAMES) if BASELINE_MAX_FRAMES is not None else None,
+                            stage5_dir_hint=(out_root / "stage5 validation"),
+                            render_threshold_overlays=bool(BASELINE_OVERLAY_RENDER_THRESH_VIDEOS),
+                            thr_box_w=None,
+                            thr_box_h=None,
+                            dry_run=bool(args.dry_run),
+                        )
+                        if not bool(args.dry_run) and overlay_path.exists():
+                            overlay_video = str(overlay_path)
+                    except Exception as e:
+                        overlay_error = str(e)
+                        print(f"[baseline-overlay] WARNING: raphael overlay failed for {video_name}: {e}")
+
                 baseline_results.append(
                     {
                         "model_key": "baseline_raphael_method",
@@ -1627,10 +2071,51 @@ def main() -> int:
                         "output_root": str(out_root),
                         "duration_s": float(time.time() - t0),
                         "validation_metrics": metrics,
+                        "overlay_video_path": overlay_video,
+                        "overlay_error": overlay_error,
                     }
                 )
+                if base_pbar is not None and isinstance(metrics, dict):
+                    best = metrics.get("best") if isinstance(metrics.get("best"), dict) else None
+                    if isinstance(best, dict):
+                        base_pbar.set_postfix(
+                            video=str(video_name),
+                            route=str(route),
+                            kind="raphael",
+                            tp=int(best.get("tp") or 0),
+                            fp=int(best.get("fp") or 0),
+                            fn=int(best.get("fn") or 0),
+                            f1=float(best.get("f1") or 0.0),
+                        )
+        if base_pbar is not None:
+            base_pbar.close()
 
     baseline_summary = _summarize_results(baseline_results) if baseline_results else {}
+
+    # Write combined (multi-video) metrics per method at fixed thresholds.
+    # This is a SUM of TP/FP/FN across the eval videos for each threshold, then recompute P/R/F1.
+    combined_thresholds_px = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    combined_by_method: Dict[str, Dict[str, Any]] = {}
+    for mk in ("global_model", "single_species_model"):
+        combined_by_method[mk] = _combine_metrics_across_videos(
+            [r for r in results if str(r.get("model_key")) == mk],
+            thresholds_px=combined_thresholds_px,
+        )
+    for mk in ("baseline_lab_method", "baseline_raphael_method"):
+        combined_by_method[mk] = _combine_metrics_across_videos(
+            [r for r in baseline_results if str(r.get("model_key")) == mk],
+            thresholds_px=combined_thresholds_px,
+        )
+
+    combined_txt = _format_combined_metrics_txt(combined_by_method, thresholds_px=combined_thresholds_px)
+    run_dir = inference_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    combined_txt_path = run_dir / "combined_results__thr1-10.txt"
+    if bool(args.dry_run):
+        print(f"[dry-run] Would write combined results → {combined_txt_path}")
+    else:
+        combined_txt_path.write_text(combined_txt)
+        print(f"[orchestrator] Combined results → {combined_txt_path}")
 
     record = {
         "run_id": run_id,
@@ -1694,12 +2179,15 @@ def main() -> int:
             "results": baseline_results,
             "results_summary": baseline_summary,
         },
+        "combined_results": {
+            "thresholds_px": list(combined_thresholds_px),
+            "by_method": combined_by_method,
+            "text_path": str(combined_txt_path),
+        },
         "results": results,
         "results_summary": results_summary,
     }
     # Save a full run record alongside inference outputs for easy inspection.
-    run_dir = inference_root / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
     record_path = run_dir / "run_record.json"
     if bool(args.dry_run):
         print(f"[dry-run] Would write run record → {record_path}")

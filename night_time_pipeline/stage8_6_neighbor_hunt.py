@@ -61,9 +61,44 @@ def _filtered_call(fn, **kwargs):
 # (Avoid circular imports by reading __main__ at call time.)
 #####################################################################################
 def _orc():
-    """Return the running orchestrator module (loaded as __main__)."""
-    import __main__ as ORC  # orchestrator.py when executed is __main__
-    return ORC
+    """
+    Return the running orchestrator module.
+
+    Historically this pipeline was run via: `python orchestrator.py`, which makes
+    the orchestrator available as `__main__`.
+
+    When the integrated gateway runs the night pipeline, it does `python -c ...`
+    and then `import orchestrator`, so the orchestrator is *not* `__main__`.
+    In that case, fall back to the imported `orchestrator` module (or, as a
+    last resort, `pipeline_params` which holds the same constants).
+    """
+    import sys
+
+    import __main__ as main
+    if hasattr(main, "ROOT"):
+        return main
+
+    m = sys.modules.get("orchestrator")
+    if m is not None and hasattr(m, "ROOT"):
+        return m
+
+    try:
+        import orchestrator as orch  # type: ignore
+
+        if hasattr(orch, "ROOT"):
+            return orch
+    except Exception:
+        pass
+
+    try:
+        import pipeline_params as pp  # type: ignore
+
+        if hasattr(pp, "ROOT"):
+            return pp
+    except Exception:
+        pass
+
+    return main
 
 def _pack_stage1_params_for(ORC, variant: str) -> dict:
     """Build the right Stage-1 kwargs from orchestrator constants for the chosen variant."""

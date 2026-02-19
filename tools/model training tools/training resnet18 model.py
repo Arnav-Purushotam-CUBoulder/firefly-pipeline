@@ -143,9 +143,20 @@ def main(argv: list[str] | None = None):
     # ─ handle class imbalance
     counts = Counter(train_ds.targets)
     n_classes = len(train_ds.classes)
-    class_weights = torch.tensor(
-        [sum(counts.values()) / counts[c] for c in range(n_classes)],
-        dtype=torch.float)
+    total = sum(counts.values())
+    class_weights_list = []
+    missing = []
+    for c in range(n_classes):
+        n_c = int(counts.get(c, 0))
+        if n_c <= 0:
+            class_weights_list.append(0.0)
+            missing.append(train_ds.classes[c])
+        else:
+            class_weights_list.append(total / n_c)
+    if missing:
+        print(f"WARNING: Missing classes in train split (no samples): {missing}")
+        print("Training will proceed, but metrics/models may be meaningless without negatives/positives.")
+    class_weights = torch.tensor(class_weights_list, dtype=torch.float)
     sample_weights = [class_weights[t] for t in train_ds.targets]
     sampler = WeightedRandomSampler(sample_weights,
                                     num_samples=len(train_ds),

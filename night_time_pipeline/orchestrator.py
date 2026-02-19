@@ -596,7 +596,8 @@ def main():
         # Stage 10 — overlay GT (GREEN), model (RED), overlap (YELLOW) on one video
         #            and render per-threshold TP/FP/FN videos (TP=YELLOW, FP=RED, FN=GREEN)
         if RUN_STAGE10 and ran_stage9:
-            out_overlay_path = DIR_STAGE10_OUT / f'{base}_gt_vs_model.mp4'
+            legend = "LEGEND_GT=GREEN_MODEL=RED_OVERLAP=YELLOW"
+            out_overlay_path = DIR_STAGE10_OUT / f'{base}_gt_vs_model__{legend}.mp4'
             overlay_gt_vs_model(
                 orig_video_path=orig_path,
                 pred_csv_path=csv_path,

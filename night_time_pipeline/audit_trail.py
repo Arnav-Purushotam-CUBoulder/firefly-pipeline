@@ -99,18 +99,37 @@ class AuditTrail:
                 return
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
             if frame_idx < 0 or (total and frame_idx >= total):
-                cap.release(); return
-            # read sequentially up to frame idx
-            fr = 0
-            while fr <= frame_idx:
+                cap.release()
+                return
+
+            ok = False
+            frame = None
+
+            # Fast path: random seek to the requested frame.
+            # This is dramatically faster than decoding from frame 0 for every crop.
+            try:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
                 ok, frame = cap.read()
-                if not ok:
-                    break
-                if fr == frame_idx:
-                    break
-                fr += 1
+            except Exception:
+                ok = False
+
+            # Fallback: sequential decode (kept for robustness on containers with flaky seeking).
+            if (not ok) or (frame is None):
+                try:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                except Exception:
+                    pass
+                fr = 0
+                while fr <= frame_idx:
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    if fr == frame_idx:
+                        break
+                    fr += 1
+
             cap.release()
-            if not ok:
+            if (not ok) or (frame is None):
                 return
             H, W = frame.shape[:2]
             w = max(1, int(w)); h = max(1, int(h))

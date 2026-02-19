@@ -539,6 +539,7 @@ def detect_stage1_to_csv(
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_area = frame_w * frame_h
+    frame_bytes_u8 = max(1, int(frame_area))  # grayscale uint8 per-frame bytes
 
     if max_sigma <= min_sigma:
         raise ValueError("max_sigma must be greater than min_sigma for cuCIM detector")
@@ -559,7 +560,143 @@ def detect_stage1_to_csv(
     except Exception:
         batch_n = 1
 
+    # Safety cap: avoid huge CPU/GPU allocations on high-resolution videos (e.g. 4k).
+    # For example, 4k gray frames are ~8MB each; stacking 250 frames is ~2GB CPU and ~8GB GPU (float32),
+    # and intermediate ops can briefly double that. Cap by bytes to prevent GPU OOM/VS Code OOM.
+    CPU_BATCH_BYTES_CAP = 512 * 1024 * 1024  # 512MB of uint8 frames
+    GPU_BATCH_BYTES_CAP = 2 * 1024 * 1024 * 1024  # 2GB of float32 stacked frames
+    max_by_cpu = max(1, int(CPU_BATCH_BYTES_CAP // frame_bytes_u8))
+    max_by_gpu = max(1, int(GPU_BATCH_BYTES_CAP // (frame_bytes_u8 * 4)))
+    max_safe = max(1, min(max_by_cpu, max_by_gpu))
+    if batch_n > max_safe:
+        print(
+            f"[cuCIM][Stage1] Capping batch_size {batch_n} -> {max_safe} for frame {frame_w}x{frame_h} "
+            f"(cap_cpu={CPU_BATCH_BYTES_CAP}B cap_gpu={GPU_BATCH_BYTES_CAP}B)."
+        )
+        batch_n = max_safe
+
     use_fallback_log = False
+
+    def _process_gray_batch(gray_batch: list[np.ndarray], idx_batch: list[int]) -> None:
+        """
+        Process a batch of grayscale frames.
+
+        Uses recursive splitting on GPU OOM so we can keep progressing even when a
+        configured batch size is too large for current GPU memory conditions.
+        """
+        gpu_batch = None
+        try:
+            # Upload: (N,H,W) float32 in [0,1]. Keep normalization in-place to
+            # avoid doubling peak GPU memory.
+            gpu_batch = cp.asarray(np.stack(gray_batch, axis=0), dtype=cp.float32)
+            gpu_batch *= (1.0 / 255.0)
+
+            # Run cuCIM detector per-slice (API is 2D); keep results identical to per-frame path.
+            for bi, fidx in enumerate(idx_batch):
+                gpu_img = gpu_batch[bi]
+
+                if detector == "log":
+                    try:
+                        blobs = blob_log(
+                            gpu_img,
+                            min_sigma=float(min_sigma),
+                            max_sigma=float(max_sigma),
+                            num_sigma=int(max(1, num_sigma)),
+                            threshold=float(threshold),
+                            overlap=float(overlap),
+                            log_scale=bool(log_scale),
+                        )
+                    except Exception as e:
+                        global _NVRTC_LOG_PRINTED
+                        if not _NVRTC_LOG_PRINTED:
+                            _NVRTC_LOG_PRINTED = True
+                            print("[cuCIM][Stage1] blob_log raised exception:", type(e).__name__, str(e))
+                            # Surface any available compile log once to help debug
+                            log = getattr(e, "log", None)
+                            if log:
+                                try:
+                                    txt = str(log)
+                                    if len(txt) > 20000:
+                                        txt = txt[:20000] + "\n... [truncated] ..."
+                                    print("[cuCIM][NVRTC log]", txt)
+                                except Exception:
+                                    pass
+                            dump = getattr(e, "dump", None)
+                            if callable(dump):
+                                try:
+                                    dump(sys.stderr)
+                                except Exception:
+                                    pass
+                        raise
+                elif detector == "dog":
+                    blobs = blob_dog(
+                        gpu_img,
+                        min_sigma=float(min_sigma),
+                        max_sigma=float(max_sigma),
+                        sigma_ratio=float(max(1.01, sigma_ratio)),
+                        threshold=float(threshold),
+                        overlap=float(overlap),
+                    )
+                else:  # 'doh'
+                    blobs = blob_doh(
+                        gpu_img,
+                        min_sigma=float(min_sigma),
+                        max_sigma=float(max_sigma),
+                        threshold=float(threshold),
+                        overlap=float(overlap),
+                    )
+
+                if blobs.size:
+                    blobs_np = cp.asnumpy(blobs)
+                    for (yy, xx, ss) in blobs_np:
+                        radius = max(1.0, _sigma_to_radius(detector, float(ss), log_scale))
+                        side = max(3, int(round(2.0 * radius)))
+
+                        w = side + pad * 2
+                        h = w
+                        x0 = int(round(xx - side / 2.0)) - pad
+                        y0 = int(round(yy - side / 2.0)) - pad
+                        x0, y0, w, h = _clip_box(x0, y0, w, h, frame_w, frame_h)
+                        if w <= 0 or h <= 0:
+                            continue
+
+                        area = w * h
+                        if area < float(min_area_px) or area > max_area_px:
+                            continue
+
+                        rows.append((fidx, x0, y0, w, h))
+
+        except cp.cuda.memory.OutOfMemoryError as e:
+            # Try to recover by freeing cached blocks and splitting the batch.
+            try:
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+
+            if len(gray_batch) <= 1:
+                raise
+
+            mid = max(1, len(gray_batch) // 2)
+            print(
+                "[cuCIM][Stage1] WARNING: GPU OOM. Splitting batch "
+                f"{len(gray_batch)} -> {mid}+{len(gray_batch) - mid}. ({type(e).__name__}: {e})"
+            )
+            _process_gray_batch(gray_batch[:mid], idx_batch[:mid])
+            _process_gray_batch(gray_batch[mid:], idx_batch[mid:])
+
+        finally:
+            if gpu_batch is not None:
+                try:
+                    del gpu_batch
+                except Exception:
+                    pass
+                # Encourage prompt release between batches.
+                try:
+                    cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+
     while True:
         # Stop if we've reached the requested maximum frames
         if max_frames is not None and frame_idx >= max_frames:
@@ -583,83 +720,7 @@ def detect_stage1_to_csv(
         if not gray_batch:
             break
 
-        # Upload a single stacked batch to GPU: (N,H,W) float32 in [0,1]
-        gpu_batch = cp.asarray(np.stack(gray_batch, axis=0), dtype=cp.float32) / 255.0
-
-        # Run cuCIM detector per-slice (API is 2D); keep results identical to per-frame path
-        for bi, fidx in enumerate(idx_batch):
-            gpu_img = gpu_batch[bi]
-
-            if detector == "log":
-                try:
-                    blobs = blob_log(
-                        gpu_img,
-                        min_sigma=float(min_sigma),
-                        max_sigma=float(max_sigma),
-                        num_sigma=int(max(1, num_sigma)),
-                        threshold=float(threshold),
-                        overlap=float(overlap),
-                        log_scale=bool(log_scale),
-                    )
-                except Exception as e:
-                    global _NVRTC_LOG_PRINTED
-                    if not _NVRTC_LOG_PRINTED:
-                        _NVRTC_LOG_PRINTED = True
-                        print("[cuCIM][Stage1] blob_log raised exception:", type(e).__name__, str(e))
-                        # Surface any available compile log once to help debug
-                        log = getattr(e, 'log', None)
-                        if log:
-                            try:
-                                txt = str(log)
-                                if len(txt) > 20000:
-                                    txt = txt[:20000] + "\n... [truncated] ..."
-                                print("[cuCIM][NVRTC log]", txt)
-                            except Exception:
-                                pass
-                        dump = getattr(e, 'dump', None)
-                        if callable(dump):
-                            try:
-                                dump(sys.stderr)
-                            except Exception:
-                                pass
-                    raise
-            elif detector == "dog":
-                blobs = blob_dog(
-                    gpu_img,
-                    min_sigma=float(min_sigma),
-                    max_sigma=float(max_sigma),
-                    sigma_ratio=float(max(1.01, sigma_ratio)),
-                    threshold=float(threshold),
-                    overlap=float(overlap),
-                )
-            else:  # 'doh'
-                blobs = blob_doh(
-                    gpu_img,
-                    min_sigma=float(min_sigma),
-                    max_sigma=float(max_sigma),
-                    threshold=float(threshold),
-                    overlap=float(overlap),
-                )
-
-            if blobs.size:
-                blobs_np = cp.asnumpy(blobs)
-                for (yy, xx, ss) in blobs_np:
-                    radius = max(1.0, _sigma_to_radius(detector, float(ss), log_scale))
-                    side = max(3, int(round(2.0 * radius)))
-
-                    w = side + pad * 2
-                    h = w
-                    x0 = int(round(xx - side / 2.0)) - pad
-                    y0 = int(round(yy - side / 2.0)) - pad
-                    x0, y0, w, h = _clip_box(x0, y0, w, h, frame_w, frame_h)
-                    if w <= 0 or h <= 0:
-                        continue
-
-                    area = w * h
-                    if area < float(min_area_px) or area > max_area_px:
-                        continue
-
-                    rows.append((fidx, x0, y0, w, h))
+        _process_gray_batch(gray_batch, idx_batch)
 
         # Update progress by batch
         progress(min(frame_idx, total_frames), total_frames, 'detect(cuCIM)')

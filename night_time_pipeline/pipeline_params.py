@@ -18,7 +18,7 @@ DIR_STAGE10_OUT = ROOT / 'stage10 overlay videos'
 DIR_STAGE8_9_OUT = ROOT / 'stage8.9 gt centroid crops'
 
 # Audit toggle
-ENABLE_AUDIT = True
+ENABLE_AUDIT = False
 
 # Global knobs / flags
 MAX_FRAMES = None
