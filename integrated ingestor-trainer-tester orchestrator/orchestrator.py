@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import errno
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -60,6 +62,25 @@ ONE_DATASET_VERSION_PER_BATCH: bool = True
 
 # Search dirs for locating existing validation videos by stem (used when no new held-out validation rows).
 VALIDATION_VIDEO_SEARCH_DIRS: List[str | Path] = []
+
+# Global-model evaluation:
+# If True, when evaluating the GLOBAL model we will re-run inference/validation on *all*
+# validation videos accumulated so far across all species (from the combined validation annotations.csv),
+# not just the held-out videos from the current OBSERVED_DATA_DIR.
+EVAL_GLOBAL_MODEL_ON_ALL_VALIDATION_VIDEOS: bool = True
+
+# Validation video store (for visibility + stable automation input paths).
+# The orchestrator will maintain:
+#   <ROOT>/validation videos/<species_name>/*.mp4
+VALIDATION_VIDEOS_DIRNAME: str = "validation videos"
+AUTO_SYNC_VALIDATION_VIDEOS_STORE: bool = True
+VALIDATION_VIDEOS_STORE_MODE: str = "hardlink"  # "hardlink" | "copy"
+
+# Training video metadata store (no video files, just metadata).
+# The orchestrator will maintain versioned snapshots under:
+#   <ROOT>/training videos/training_videos__vN_<timestamp>.json
+TRAINING_VIDEOS_DIRNAME: str = "training videos"
+TRAINING_VIDEOS_SNAPSHOT_PREFIX: str = "training_videos"
 
 # Stage 1 ingestor-core config overrides (passed into stage1_ingestor_core)
 AUTO_LOAD_SIBLING_CLASS_CSV: bool = True
@@ -185,6 +206,11 @@ RAPHAEL_DEVICE: str = "auto"
 DEFAULT_DATA_SUBDIR = "patch training datasets and pipeline validation data"
 DEFAULT_MODEL_ZOO_SUBDIR = "model zoo"
 DEFAULT_INFERENCE_OUTPUT_SUBDIR = "inference outputs"
+
+MODEL_ZOO_RESULTS_HISTORY_DIRNAME = "results_history"
+MODEL_ZOO_RESULTS_HISTORY_SNAPSHOT_PREFIX = "results_history"
+MODEL_ZOO_VIDEO_REGISTRY_DIRNAME = "video_registry"
+MODEL_ZOO_VIDEO_REGISTRY_SNAPSHOT_PREFIX = "video_registry"
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".ppm", ".pgm"}
@@ -373,21 +399,28 @@ def _ensure_model_zoo_scaffold(model_root: Path) -> Dict[str, Path]:
     for d in (day_global, night_global, single_root):
         d.mkdir(parents=True, exist_ok=True)
 
-    history = model_root / "results_history.jsonl"
-    if not history.exists():
-        history.parent.mkdir(parents=True, exist_ok=True)
-        history.write_text("")
+    # Legacy (single-file) paths. These are no longer mutated in-place.
+    legacy_history = model_root / "results_history.jsonl"
+    legacy_registry = model_root / "video_registry.json"
 
-    registry = model_root / "video_registry.json"
-    if not registry.exists():
-        registry.write_text(json.dumps({}, indent=2))
+    # New (append-only via snapshots) metadata dirs.
+    history_dir = model_root / MODEL_ZOO_RESULTS_HISTORY_DIRNAME
+    registry_dir = model_root / MODEL_ZOO_VIDEO_REGISTRY_DIRNAME
+    history_dir.mkdir(parents=True, exist_ok=True)
+    registry_dir.mkdir(parents=True, exist_ok=True)
+
+    # Seed snapshot dirs from legacy files on first run.
+    _migrate_legacy_results_history_to_snapshots(legacy_path=legacy_history, history_dir=history_dir)
+    _migrate_legacy_registry_to_snapshots(legacy_path=legacy_registry, registry_dir=registry_dir)
 
     return {
         "day_global": day_global,
         "night_global": night_global,
         "single_root": single_root,
-        "history": history,
-        "registry": registry,
+        "results_history_dir": history_dir,
+        "video_registry_dir": registry_dir,
+        "legacy_results_history_file": legacy_history,
+        "legacy_video_registry_file": legacy_registry,
     }
 
 
@@ -395,6 +428,151 @@ def _append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def _snapshot_num_from_name(*, prefix: str, name: str) -> Optional[int]:
+    m = re.match(rf"^{re.escape(prefix)}__v(?P<n>\\d+)(?:_|$)", str(name))
+    if not m:
+        return None
+    try:
+        return int(m.group("n"))
+    except Exception:
+        return None
+
+
+def _latest_snapshot_file(*, root: Path, prefix: str, suffix: str) -> Tuple[int, Path] | None:
+    if not root.exists():
+        return None
+    best: Tuple[int, str, Path] | None = None
+    for p in root.iterdir():
+        if not p.is_file():
+            continue
+        if p.suffix.lower() != suffix.lower():
+            continue
+        n = _snapshot_num_from_name(prefix=prefix, name=p.name)
+        if n is None:
+            continue
+        key = (n, p.name, p)
+        if best is None or key[0] > best[0] or (key[0] == best[0] and key[1] > best[1]):
+            best = key
+    return (best[0], best[2]) if best else None
+
+
+def _migrate_legacy_registry_to_snapshots(*, legacy_path: Path, registry_dir: Path) -> None:
+    """
+    One-time migration helper: if a legacy `video_registry.json` exists but there are no snapshots yet,
+    create `video_registry__v1_<timestamp>.json` under `registry_dir`.
+    """
+    if not legacy_path.exists():
+        return
+    if _latest_snapshot_file(root=registry_dir, prefix=MODEL_ZOO_VIDEO_REGISTRY_SNAPSHOT_PREFIX, suffix=".json") is not None:
+        return
+    try:
+        reg = _load_registry(legacy_path)
+    except Exception:
+        reg = {}
+    out = registry_dir / f"{MODEL_ZOO_VIDEO_REGISTRY_SNAPSHOT_PREFIX}__v1_{_run_tag()}.json"
+    _save_registry(out, reg)
+
+
+def _migrate_legacy_results_history_to_snapshots(*, legacy_path: Path, history_dir: Path) -> None:
+    """
+    One-time migration helper: if a legacy `results_history.jsonl` exists but there are no snapshots yet,
+    create `results_history__v1_<timestamp>.jsonl` under `history_dir`.
+    """
+    if _latest_snapshot_file(root=history_dir, prefix=MODEL_ZOO_RESULTS_HISTORY_SNAPSHOT_PREFIX, suffix=".jsonl") is not None:
+        return
+    # If legacy exists, copy; else write an empty v1.
+    out = history_dir / f"{MODEL_ZOO_RESULTS_HISTORY_SNAPSHOT_PREFIX}__v1_{_run_tag()}.jsonl"
+    if legacy_path.exists():
+        try:
+            out.write_text(legacy_path.read_text())
+            return
+        except Exception:
+            pass
+    out.write_text("")
+
+
+def _load_latest_video_registry(*, registry_dir: Path, legacy_path: Path) -> Tuple[Dict[str, str], int, Path | None]:
+    """
+    Load latest registry snapshot if present; else fall back to legacy file.
+    Returns: (registry_dict, prev_version_number, prev_path)
+    """
+    latest = _latest_snapshot_file(root=registry_dir, prefix=MODEL_ZOO_VIDEO_REGISTRY_SNAPSHOT_PREFIX, suffix=".json")
+    if latest is not None:
+        n, p = latest
+        return _load_registry(p), int(n), p
+    if legacy_path.exists():
+        return _load_registry(legacy_path), 0, legacy_path
+    return {}, 0, None
+
+
+def _write_video_registry_snapshot(
+    *,
+    registry_dir: Path,
+    registry: Dict[str, str],
+    prev_version: int,
+    dry_run: bool,
+) -> Path | None:
+    new_n = int(prev_version) + 1
+    out = registry_dir / f"{MODEL_ZOO_VIDEO_REGISTRY_SNAPSHOT_PREFIX}__v{new_n}_{_run_tag()}.json"
+    if dry_run:
+        print(f"[dry-run] Would write video registry snapshot → {out}")
+        return None
+    _save_registry(out, registry)
+    return out
+
+
+def _append_results_history_snapshot(
+    *,
+    history_dir: Path,
+    legacy_path: Path,
+    record: Dict[str, Any],
+    dry_run: bool,
+) -> Path | None:
+    """
+    Append a run record by creating a NEW snapshot file:
+      results_history__vN_<timestamp>.jsonl
+    which is a copy of the latest snapshot + one appended JSONL line.
+    """
+    latest = _latest_snapshot_file(root=history_dir, prefix=MODEL_ZOO_RESULTS_HISTORY_SNAPSHOT_PREFIX, suffix=".jsonl")
+    if latest is not None:
+        prev_n, prev_path = latest
+    elif legacy_path.exists():
+        prev_n, prev_path = 0, legacy_path
+    else:
+        prev_n, prev_path = 0, None
+
+    new_n = int(prev_n) + 1
+    out = history_dir / f"{MODEL_ZOO_RESULTS_HISTORY_SNAPSHOT_PREFIX}__v{new_n}_{_run_tag()}.jsonl"
+    if dry_run:
+        print(f"[dry-run] Would append results history snapshot → {out}")
+        return None
+
+    history_dir.mkdir(parents=True, exist_ok=True)
+    with out.open("wb") as wf:
+        if prev_path is not None and Path(prev_path).exists():
+            with Path(prev_path).open("rb") as rf:
+                shutil.copyfileobj(rf, wf)
+
+    # Ensure file ends with newline before appending.
+    needs_nl = False
+    try:
+        if out.stat().st_size > 0:
+            with out.open("rb") as f:
+                f.seek(-1, os.SEEK_END)
+                last = f.read(1)
+            if last not in {b"\n"}:
+                needs_nl = True
+    except Exception:
+        needs_nl = True
+
+    with out.open("ab") as f:
+        if needs_nl:
+            f.write(b"\n")
+        f.write((json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8"))
+
+    return out
 
 
 def _load_registry(path: Path) -> Dict[str, str]:
@@ -432,6 +610,356 @@ def _find_video_by_stem(stem: str, search_dirs: Sequence[Path]) -> Optional[Path
             if p.is_file() and p.suffix.lower() in VIDEO_EXTS and p.stem == stem:
                 return p
     return None
+
+
+def _link_or_copy(src: Path, dst: Path, *, mode: str) -> None:
+    """
+    Create dst as either a hardlink to src (preferred) or a full copy.
+    Falls back to copy if hardlink fails (e.g. cross-device).
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    mode = (mode or "hardlink").strip().lower()
+    if mode == "hardlink":
+        try:
+            os.link(src, dst)
+            return
+        except OSError as e:
+            if e.errno in {errno.EXDEV, errno.EPERM, errno.EACCES, errno.EEXIST}:
+                shutil.copy2(src, dst)
+                return
+            shutil.copy2(src, dst)
+            return
+    shutil.copy2(src, dst)
+
+
+def _ensure_validation_video_store(root: Path) -> Path:
+    store = Path(root) / VALIDATION_VIDEOS_DIRNAME
+    store.mkdir(parents=True, exist_ok=True)
+    return store
+
+
+def _resolve_validation_video_path(
+    *,
+    video_name: str,
+    species_name: str,
+    store_root: Path,
+    individual_validation_root: Path,
+    registry: Dict[str, str],
+    extra_search_dirs: Sequence[Path],
+) -> Tuple[Path | None, str]:
+    """
+    Resolve a validation video path for (species_name, video_name).
+    Returns (path, source) where source is a short string for run-record/debugging.
+    """
+    vn = _safe_name(video_name)
+    sp = _safe_name(species_name)
+    if not vn or not sp:
+        return None, "invalid_names"
+
+    # 1) Preferred: stable visible store under ROOT/validation videos/<species>/...
+    sp_store = Path(store_root) / sp
+    for ext in sorted(VIDEO_EXTS):
+        cand = sp_store / f"{vn}{ext}"
+        if cand.exists():
+            return cand, "validation_videos_store"
+
+    # 2) Existing individual validation datasets (if present on disk).
+    sp_ind = Path(individual_validation_root) / sp
+    if sp_ind.exists():
+        for ext in sorted(VIDEO_EXTS):
+            for cand in sp_ind.glob(f"**/videos/{vn}{ext}"):
+                if cand.exists():
+                    return cand, "individual_validation_dataset"
+
+    # 3) Registry (may point to original observed/raw location).
+    reg_path = registry.get(vn) or registry.get(video_name)
+    if reg_path:
+        try:
+            rp = Path(reg_path).expanduser().resolve()
+            if rp.exists():
+                return rp, "video_registry"
+        except Exception:
+            pass
+
+    # 4) Fallback: user-provided search roots.
+    found = _find_video_by_stem(vn, extra_search_dirs)
+    if found is not None and found.exists():
+        return found, "extra_search_dirs"
+
+    return None, "not_found"
+
+
+def _sync_validation_videos_for_pairs(
+    *,
+    pairs: Sequence[Any],
+    species_name: str,
+    store_root: Path,
+    mode: str,
+    dry_run: bool,
+) -> None:
+    """
+    Ensure held-out validation videos from the *current* run are visible under:
+      <ROOT>/validation videos/<species>/<video_name>.<ext>
+    """
+    sp_dir = Path(store_root) / str(species_name)
+    if not dry_run:
+        sp_dir.mkdir(parents=True, exist_ok=True)
+
+    for p in pairs:
+        try:
+            video_name = str(p.video_name)
+            video_path = Path(p.video_path)
+        except Exception:
+            continue
+        if not video_name or not video_path.exists():
+            continue
+
+        ext = video_path.suffix.lower()
+        if ext not in VIDEO_EXTS:
+            ext = ".mp4"
+        dst = sp_dir / f"{video_name}{ext}"
+        if dst.exists():
+            continue
+        if dry_run:
+            print(f"[dry-run] Would sync validation video -> {dst}  (src={video_path})")
+            continue
+        _link_or_copy(video_path, dst, mode=mode)
+
+
+def _ensure_training_videos_root(root: Path) -> Path:
+    d = Path(root) / TRAINING_VIDEOS_DIRNAME
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _training_snapshot_num_from_name(name: str) -> Optional[int]:
+    """
+    Parse: training_videos__v12_20260219__235959.json -> 12
+    """
+    m = re.match(rf"^{re.escape(TRAINING_VIDEOS_SNAPSHOT_PREFIX)}__v(?P<n>\\d+)(?:_|$)", str(name))
+    if not m:
+        return None
+    try:
+        return int(m.group("n"))
+    except Exception:
+        return None
+
+
+def _latest_training_snapshot(training_root: Path) -> Tuple[int, Path] | None:
+    if not training_root.exists():
+        return None
+    best: Tuple[int, str, Path] | None = None
+    for p in training_root.iterdir():
+        if not p.is_file() or p.suffix.lower() != ".json":
+            continue
+        n = _training_snapshot_num_from_name(p.name)
+        if n is None:
+            continue
+        key = (n, p.name, p)
+        if best is None or key[0] > best[0] or (key[0] == best[0] and key[1] > best[1]):
+            best = key
+    return (best[0], best[2]) if best else None
+
+
+def _collect_legacy_species_imports(data_root: Path) -> List[Dict[str, Any]]:
+    """
+    Best-effort reconstruction of "training sources" for the initial legacy species.
+    These legacy imports do not have per-video provenance; we store their import_manifest.json info.
+    """
+    out: List[Dict[str, Any]] = []
+    single_root = data_root / "Integrated_prototype_datasets" / "single species datasets"
+    if not single_root.exists():
+        return out
+    for sp_dir in sorted([p for p in single_root.iterdir() if p.is_dir()], key=lambda p: p.name):
+        for mf in sorted(sp_dir.glob("v*/import_manifest.json")):
+            try:
+                data = json.loads(mf.read_text() or "{}")
+            except Exception:
+                continue
+            if str(data.get("kind") or "") != "single_species":
+                continue
+            notes = data.get("notes") if isinstance(data.get("notes"), list) else []
+            notes_txt = " ".join(str(x) for x in notes)
+            # Only treat these as legacy if they explicitly say so.
+            if "Imported legacy dataset" not in notes_txt:
+                continue
+            out.append(
+                {
+                    "species_name": str(data.get("species") or sp_dir.name),
+                    "import_manifest_path": str(mf),
+                    "imported_at": data.get("imported_at"),
+                    "source": data.get("source"),
+                    "dest": data.get("dest"),
+                    "counts": data.get("counts"),
+                    "split": data.get("split"),
+                    "notes": notes,
+                }
+            )
+    return out
+
+
+def _bootstrap_training_videos_payload(data_root: Path) -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "legacy_species_imports": _collect_legacy_species_imports(data_root),
+        "runs": [],
+    }
+
+
+def _update_training_videos_history(
+    *,
+    root: Path,
+    data_root: Path,
+    run_id: str,
+    species_name: str,
+    observed_dir: Path,
+    time_of_day: str,
+    expected_route: str,
+    train_pair_fraction: float,
+    train_pairs: Sequence[Any],
+    val_pairs: Sequence[Any],
+    integrated_dataset_version: Path | None,
+    single_species_dataset_version: Path | None,
+    did_train: bool,
+    dry_run: bool,
+) -> Path | None:
+    """
+    Maintain versioned JSON snapshots under:
+      <ROOT>/training videos/training_videos__vN_<timestamp>.json
+
+    Each new snapshot contains all previous runs + the new run appended.
+    """
+    training_root = _ensure_training_videos_root(root)
+    prev = _latest_training_snapshot(training_root)
+    if prev is None:
+        payload: Dict[str, Any] = _bootstrap_training_videos_payload(data_root)
+        prev_n = 0
+        prev_path = None
+    else:
+        prev_n, prev_path = prev
+        try:
+            payload = json.loads(Path(prev_path).read_text() or "{}")
+            if not isinstance(payload, dict):
+                payload = _bootstrap_training_videos_payload(data_root)
+        except Exception:
+            payload = _bootstrap_training_videos_payload(data_root)
+
+    runs = payload.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+
+    # Per-video metadata for training split.
+    train_items: List[Dict[str, Any]] = []
+    train_rows_firefly_total = 0
+    train_rows_background_total = 0
+    for p in train_pairs:
+        try:
+            vn = str(p.video_name)
+            vp = Path(p.video_path)
+            ff_csv = Path(p.firefly_csv)
+            bg_csv = Path(p.background_csv) if getattr(p, "background_csv", None) else None
+        except Exception:
+            continue
+
+        n_ff = 0
+        n_bg = 0
+        try:
+            n_ff = len(_read_annotator_csv(ff_csv)) if ff_csv.exists() else 0
+        except Exception:
+            n_ff = 0
+        if bg_csv is not None:
+            try:
+                n_bg = len(_read_annotator_csv(bg_csv)) if bg_csv.exists() else 0
+            except Exception:
+                n_bg = 0
+
+        train_rows_firefly_total += int(n_ff)
+        train_rows_background_total += int(n_bg)
+
+        st: os.stat_result | None = None
+        try:
+            st = vp.stat() if vp.exists() else None
+        except Exception:
+            st = None
+        train_items.append(
+            {
+                "video_name": vn,
+                "video_path": str(vp),
+                "exists": bool(vp.exists()),
+                "bytes": int(st.st_size) if st is not None else None,
+                "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds") if st is not None else None,
+                "firefly_csv": str(ff_csv),
+                "background_csv": str(bg_csv) if bg_csv is not None else None,
+                "n_firefly_rows": int(n_ff),
+                "n_background_rows": int(n_bg),
+            }
+        )
+
+    entry = {
+        "run_id": str(run_id),
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "species_name": str(species_name),
+        "observed_dir": str(observed_dir),
+        "time_of_day": str(time_of_day),
+        "expected_route": str(expected_route),
+        "train_pair_fraction": float(train_pair_fraction),
+        "n_pairs_total": int(len(train_pairs) + len(val_pairs)),
+        "n_pairs_train": int(len(train_pairs)),
+        "n_pairs_validation": int(len(val_pairs)),
+        "did_train_models": bool(did_train),
+        "dataset_versions": {
+            "integrated": integrated_dataset_version.name if integrated_dataset_version else None,
+            "integrated_path": str(integrated_dataset_version) if integrated_dataset_version else None,
+            "single_species": single_species_dataset_version.name if single_species_dataset_version else None,
+            "single_species_path": str(single_species_dataset_version) if single_species_dataset_version else None,
+        },
+        "train_rows": {"firefly": int(train_rows_firefly_total), "background": int(train_rows_background_total)},
+        "train_videos": train_items,
+        "notes": [
+            "This file stores training-video METADATA only (no video files) to avoid high storage usage.",
+            "Legacy imported datasets may not have per-video provenance; see legacy_species_imports.",
+        ],
+    }
+    runs.append(entry)
+    payload["runs"] = runs
+    payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    payload["last_run_id"] = str(run_id)
+    if prev_path is not None:
+        payload["previous_snapshot"] = str(prev_path)
+
+    new_n = int(prev_n) + 1
+    out_path = training_root / f"{TRAINING_VIDEOS_SNAPSHOT_PREFIX}__v{new_n}_{_run_tag()}.json"
+
+    if dry_run:
+        print(f"[dry-run] Would write training videos history → {out_path}")
+        return None
+
+    out_path.write_text(json.dumps(payload, indent=2))
+    return out_path
+
+
+def _group_validation_rows_by_species_and_video(
+    rows: Sequence[Dict[str, str]]
+) -> Dict[Tuple[str, str], List[Dict[str, int]]]:
+    """
+    Group combined validation CSV rows by (species_name, video_name).
+    Returns rows in the gt-row format used by _write_gt_csv (x,y,t,...).
+    """
+    out: Dict[Tuple[str, str], List[Dict[str, int]]] = {}
+    for r in rows:
+        video_name = _safe_name(r.get("video_name", "") or "")
+        species_name = _safe_name(r.get("species_name", "") or "")
+        if not video_name or not species_name:
+            continue
+        try:
+            x = int(round(float(r.get("x", "") or 0)))
+            y = int(round(float(r.get("y", "") or 0)))
+            t = int(round(float(r.get("t", "") or 0)))
+        except Exception:
+            continue
+        out.setdefault((species_name, video_name), []).append({"x": x, "y": y, "t": t, "w": 0, "h": 0})
+    return out
 
 
 def _write_gt_csv(gt_path: Path, rows: Sequence[Dict[str, int]]) -> None:
@@ -1212,6 +1740,9 @@ def main() -> int:
     root = Path(root_arg).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
 
+    # Visible validation-video store under ROOT (for human inspection + stable automation input paths).
+    validation_videos_store_root = _ensure_validation_video_store(root)
+
     repo_root = _REPO_ROOT
     gateway_path = (repo_root / GATEWAY_REL_PATH).resolve()
     if not gateway_path.exists():
@@ -1229,6 +1760,29 @@ def main() -> int:
     (data_root / "Integrated_prototype_validation_datasets" / "combined species folder").mkdir(parents=True, exist_ok=True)
     (data_root / "Integrated_prototype_validation_datasets" / "individual species folder").mkdir(parents=True, exist_ok=True)
     inference_root.mkdir(parents=True, exist_ok=True)
+
+    # Best-effort backfill: make legacy validation videos visible under ROOT/validation videos/<species>/...
+    # (Hardlink preferred; copy fallback for cross-device.)
+    if AUTO_SYNC_VALIDATION_VIDEOS_STORE:
+        legacy_val_individual_root = data_root / "Integrated_prototype_validation_datasets" / "individual species folder"
+        if legacy_val_individual_root.exists():
+            for sp_dir in sorted(legacy_val_individual_root.iterdir(), key=lambda p: p.name):
+                if not sp_dir.is_dir():
+                    continue
+                for vp in sp_dir.glob("**/videos/*"):
+                    if not vp.is_file() or vp.suffix.lower() not in VIDEO_EXTS:
+                        continue
+                    dst = validation_videos_store_root / sp_dir.name / vp.name
+                    if dst.exists():
+                        continue
+                    if bool(args.dry_run):
+                        print(f"[dry-run] Would backfill validation video -> {dst}  (src={vp})")
+                        continue
+                    try:
+                        _link_or_copy(vp, dst, mode=str(VALIDATION_VIDEOS_STORE_MODE))
+                    except Exception:
+                        # Best-effort only.
+                        pass
 
     # -------------------------------------------------------------------------
     # Stage 1: Ingest (extract patches + version datasets)
@@ -1259,6 +1813,16 @@ def main() -> int:
 
     has_train_rows = bool(train_firefly_rows_total or train_background_rows_total)
 
+    # Sync this run's held-out validation videos into the visible store under ROOT.
+    if AUTO_SYNC_VALIDATION_VIDEOS_STORE and val_pairs:
+        _sync_validation_videos_for_pairs(
+            pairs=val_pairs,
+            species_name=species_name,
+            store_root=validation_videos_store_root,
+            mode=str(VALIDATION_VIDEOS_STORE_MODE),
+            dry_run=bool(args.dry_run),
+        )
+
     skip_ingest = bool(getattr(args, "skip_ingest", False))
     skip_train = bool(getattr(args, "skip_train", False))
     skip_test = bool(getattr(args, "skip_test", False))
@@ -1270,12 +1834,17 @@ def main() -> int:
         print("[orchestrator] Skipping Stage 3 testing (--skip-test).")
 
     zoo = _ensure_model_zoo_scaffold(model_root)
-    history_path = zoo["history"]
-    registry_path = zoo["registry"]
-    registry = _load_registry(registry_path)
+    results_history_dir = zoo["results_history_dir"]
+    legacy_results_history_file = zoo["legacy_results_history_file"]
+    video_registry_dir = zoo["video_registry_dir"]
+    legacy_video_registry_file = zoo["legacy_video_registry_file"]
+
+    registry, registry_prev_version, _registry_prev_path = _load_latest_video_registry(
+        registry_dir=video_registry_dir, legacy_path=legacy_video_registry_file
+    )
     for p in pairs:
         registry[p.video_name] = str(p.video_path)
-    _save_registry(registry_path, registry)
+    # Important: Do NOT mutate registry metadata in-place. We'll write a new snapshot at the end of the run.
 
     # Dataset roots produced by stage1_ingestor_core.
     integrated_root = data_root / "Integrated_prototype_datasets" / "integrated pipeline datasets"
@@ -1651,6 +2220,112 @@ def main() -> int:
     else:
         eval_error = "skipped"
 
+    # Optional: GLOBAL eval sweep uses the *combined* validation annotations.csv to evaluate
+    # the global model on all validation videos accumulated so far across all species.
+    global_eval_items: List[Dict[str, Any]] = []
+    global_eval_source: Dict[str, Any] = {}
+    global_eval_error: str | None = None
+    if EVAL_GLOBAL_MODEL and EVAL_GLOBAL_MODEL_ON_ALL_VALIDATION_VIDEOS and (not skip_test):
+        combined_csv = (validation_ver / "annotations.csv") if validation_ver is not None else None
+        if combined_csv is None or not combined_csv.exists():
+            global_eval_error = "combined_validation_annotations_not_found"
+        else:
+            rows = _read_validation_combined_csv(combined_csv)
+            grouped = _group_validation_rows_by_species_and_video(rows)
+
+            individual_validation_root = (
+                data_root / "Integrated_prototype_validation_datasets" / "individual species folder"
+            )
+            extra_dirs: List[Path] = []
+            # Common-case: current observed dir often contains validation videos for this run.
+            extra_dirs.append(observed_dir)
+            for d in VALIDATION_VIDEO_SEARCH_DIRS:
+                try:
+                    extra_dirs.append(Path(d).expanduser().resolve())
+                except Exception:
+                    continue
+
+            missing: List[Dict[str, Any]] = []
+            skipped_route: List[Dict[str, Any]] = []
+            used_sources: Counter[str] = Counter()
+
+            for (sp, vn), gt_rows in sorted(grouped.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+                vp, src = _resolve_validation_video_path(
+                    video_name=vn,
+                    species_name=sp,
+                    store_root=validation_videos_store_root,
+                    individual_validation_root=individual_validation_root,
+                    registry=registry,
+                    extra_search_dirs=extra_dirs,
+                )
+                if vp is None or (not vp.exists()):
+                    missing.append({"species_name": sp, "video_name": vn, "reason": src})
+                    continue
+
+                # Filter by route so we don't accidentally evaluate with the wrong time-of-day model.
+                try:
+                    route = _route_for_video(
+                        vp, thr=float(GATEWAY_BRIGHTNESS_THRESHOLD), frames=int(GATEWAY_BRIGHTNESS_NUM_FRAMES)
+                    )
+                except Exception as e:
+                    missing.append({"species_name": sp, "video_name": vn, "reason": f"route_failed: {e}"})
+                    continue
+                if expected_route == "day" and route != "day":
+                    skipped_route.append({"species_name": sp, "video_name": vn, "routed": route, "expected": "day"})
+                    continue
+                if expected_route == "night" and route != "night":
+                    skipped_route.append(
+                        {"species_name": sp, "video_name": vn, "routed": route, "expected": "night"}
+                    )
+                    continue
+
+                used_sources[str(src)] += 1
+                registry[vn] = str(vp)
+
+                # Keep the store populated even when videos come from legacy validation-dataset dirs.
+                if AUTO_SYNC_VALIDATION_VIDEOS_STORE:
+                    dst_dir = validation_videos_store_root / sp
+                    dst = dst_dir / f"{vn}{vp.suffix.lower()}"
+                    if not dst.exists():
+                        if bool(args.dry_run):
+                            print(f"[dry-run] Would backfill validation video store -> {dst}  (src={vp})")
+                        else:
+                            try:
+                                _link_or_copy(vp, dst, mode=str(VALIDATION_VIDEOS_STORE_MODE))
+                            except Exception:
+                                pass
+
+                global_eval_items.append(
+                    {
+                        "species_name": sp,
+                        "video_name": vn,
+                        "video_key": f"{sp}__{vn}",
+                        "video_path": vp,
+                        "gt_rows": gt_rows,
+                        "video_source": src,
+                        "route": route,
+                    }
+                )
+
+            # Do not persist mid-run; we write a new registry snapshot at the end.
+
+            global_eval_source = {
+                "kind": "combined_validation_sweep",
+                "combined_version": validation_ver.name if validation_ver else None,
+                "combined_csv": str(combined_csv),
+                "expected_route": expected_route,
+                "time_of_day": time_of_day,
+                "n_groups_total": len(grouped),
+                "n_videos_selected": len(global_eval_items),
+                "n_missing": len(missing),
+                "n_skipped_route": len(skipped_route),
+                "video_sources_used": dict(used_sources),
+                "missing_videos": missing[:50],  # cap to keep run_record reasonable
+                "skipped_route": skipped_route[:50],
+            }
+            if not global_eval_items:
+                global_eval_error = "no_global_eval_videos_selected"
+
     run_ident = RunIdentity(dataset_name=_safe_name(observed_dir.name), species_name=species_name, time_of_day=time_of_day)
     run_id = _run_dir_name(
         run_ident,
@@ -1662,17 +2337,48 @@ def main() -> int:
         val_rows_firefly=int(val_firefly_rows_total),
         did_train=bool(do_train),
     )
+
+    # Write/update training-video metadata BEFORE running any heavy eval work, so we keep provenance
+    # even if evaluation crashes mid-run.
+    training_videos_snapshot_path = _update_training_videos_history(
+        root=root,
+        data_root=data_root,
+        run_id=run_id,
+        species_name=species_name,
+        observed_dir=observed_dir,
+        time_of_day=time_of_day,
+        expected_route=expected_route,
+        train_pair_fraction=float(args.train_pair_fraction),
+        train_pairs=train_pairs,
+        val_pairs=val_pairs,
+        integrated_dataset_version=integrated_ver,
+        single_species_dataset_version=single_ver,
+        did_train=bool(do_train),
+        dry_run=bool(args.dry_run),
+    )
+    if training_videos_snapshot_path is not None:
+        print(f"[orchestrator] Training videos metadata → {training_videos_snapshot_path}")
+
     results: List[Dict[str, Any]] = []
 
     def _eval_one_model(model_key: str, *, day_patch_model: Path | None, night_cnn_model: Path | None) -> None:
+        # GLOBAL model can optionally evaluate on the full, accumulated validation set
+        # across all species (from the combined annotations.csv).
+        if model_key == "global_model" and global_eval_items:
+            items: List[Tuple[str, Path, List[Dict[str, int]], Dict[str, Any] | None]] = [
+                (str(it["video_key"]), Path(it["video_path"]), list(it["gt_rows"]), dict(it)) for it in global_eval_items
+            ]
+        else:
+            items = [(vn, vp, gt, None) for (vn, vp, gt) in eval_items]
+
         pbar = (
-            tqdm(eval_items, desc=f"[stage3] {model_key}", unit="video", dynamic_ncols=True)
-            if tqdm is not None and eval_items
+            tqdm(items, desc=f"[stage3] {model_key}", unit="video", dynamic_ncols=True)
+            if tqdm is not None and items
             else None
         )
-        it = pbar if pbar is not None else eval_items
-        for video_name, vp, gt_rows in it:
-            out_root = inference_root / run_id / model_key / video_name
+        it = pbar if pbar is not None else items
+        for video_key, vp, gt_rows, meta in it:
+            out_root = inference_root / run_id / model_key / video_key
             out_root.mkdir(parents=True, exist_ok=True)
 
             # Write GT for both pipeline roots (only one will be used depending on route)
@@ -1712,11 +2418,13 @@ def main() -> int:
                 except Exception:
                     pass
                 if pbar is not None:
-                    pbar.set_postfix(video=str(video_name), route=str(route), exit=int(e.returncode), dt_s=f"{dt:.1f}")
+                    pbar.set_postfix(video=str(video_key), route=str(route), exit=int(e.returncode), dt_s=f"{dt:.1f}")
                 results.append(
                     {
                         "model_key": model_key,
-                        "video_name": video_name,
+                        "video_name": video_key,
+                        "source_video_name": meta.get("video_name") if isinstance(meta, dict) else None,
+                        "species_name": meta.get("species_name") if isinstance(meta, dict) else None,
                         "video_path": str(vp),
                         "route": route,
                         "output_root": str(out_root),
@@ -1742,7 +2450,7 @@ def main() -> int:
                 best = metrics.get("best") if isinstance(metrics, dict) else None
                 if isinstance(best, dict):
                     pbar.set_postfix(
-                        video=str(video_name),
+                        video=str(video_key),
                         route=str(route),
                         tp=int(best.get("tp") or 0),
                         fp=int(best.get("fp") or 0),
@@ -1751,12 +2459,14 @@ def main() -> int:
                         dt_s=f"{dt:.1f}",
                     )
                 else:
-                    pbar.set_postfix(video=str(video_name), route=str(route), dt_s=f"{dt:.1f}")
+                    pbar.set_postfix(video=str(video_key), route=str(route), dt_s=f"{dt:.1f}")
 
             results.append(
                 {
                     "model_key": model_key,
-                    "video_name": video_name,
+                    "video_name": video_key,
+                    "source_video_name": meta.get("video_name") if isinstance(meta, dict) else None,
+                    "species_name": meta.get("species_name") if isinstance(meta, dict) else None,
                     "video_path": str(vp),
                     "route": route,
                     "output_root": str(out_root),
@@ -2173,6 +2883,11 @@ def main() -> int:
             "eval_source": eval_source,
             "n_eval_videos": len(eval_items),
             "eval_error": eval_error,
+            "global_model_eval_source": global_eval_source,
+            "n_global_model_eval_videos": len(global_eval_items),
+            "global_model_eval_error": global_eval_error,
+            "validation_videos_store_root": str(validation_videos_store_root),
+            "validation_videos_store_mode": str(VALIDATION_VIDEOS_STORE_MODE),
         },
         "baselines": {
             "assets": baseline_assets,
@@ -2184,6 +2899,10 @@ def main() -> int:
             "by_method": combined_by_method,
             "text_path": str(combined_txt_path),
         },
+        "training_videos_metadata": {
+            "root": str(root / TRAINING_VIDEOS_DIRNAME),
+            "snapshot_path": str(training_videos_snapshot_path) if training_videos_snapshot_path else None,
+        },
         "results": results,
         "results_summary": results_summary,
     }
@@ -2194,8 +2913,26 @@ def main() -> int:
     else:
         record_path.write_text(json.dumps(record, indent=2))
         print(f"[orchestrator] Run record → {record_path}")
-    _append_jsonl(history_path, record)
-    print(f"[orchestrator] Appended results → {history_path}")
+
+    # Model-zoo metadata: write new snapshots (append-only behavior).
+    registry_snapshot_path = _write_video_registry_snapshot(
+        registry_dir=video_registry_dir,
+        registry=registry,
+        prev_version=int(registry_prev_version),
+        dry_run=bool(args.dry_run),
+    )
+    if registry_snapshot_path is not None:
+        print(f"[orchestrator] Video registry snapshot → {registry_snapshot_path}")
+
+    history_snapshot_path = _append_results_history_snapshot(
+        history_dir=results_history_dir,
+        legacy_path=legacy_results_history_file,
+        record=record,
+        dry_run=bool(args.dry_run),
+    )
+    if history_snapshot_path is not None:
+        print(f"[orchestrator] Results history snapshot → {history_snapshot_path}")
+
     print(f"[orchestrator] Run outputs → {inference_root / run_id}")
     if results_summary:
         print("[orchestrator] Results summary (best-F1 per video):")
