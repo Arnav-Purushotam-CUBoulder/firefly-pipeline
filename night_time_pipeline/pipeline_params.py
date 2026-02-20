@@ -158,7 +158,8 @@ STAGE8_9_GAUSSIAN_SIGMA = STAGE8_GAUSSIAN_SIGMA
 # Stage 9 — validation vs ground truth
 GT_CSV_PATH = ROOT / 'ground truth' / 'gt.csv'
 GT_T_OFFSET = 4000
-DIST_THRESHOLDS_PX = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+# Validate only at 10px to reduce compute + output size.
+DIST_THRESHOLDS_PX = [10.0]
 STAGE9_CROP_W = 10
 STAGE9_CROP_H = 10
 STAGE9_ONLY_FIREFLY_ROWS = True

@@ -4,12 +4,14 @@ from __future__ import annotations
 import argparse
 import csv
 import errno
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -157,6 +159,11 @@ TRAIN_MODELS_IF_TRAIN_ROWS_PRESENT: bool = True
 # Set True to do everything except actually call stage1 ingest / training / gateway.
 DRY_RUN: bool = False
 
+# If True, write *all* terminal output (including subprocess output) to a per-run log file.
+# The log file is ultimately placed under: <ROOT>/inference outputs/<run_id>/
+SAVE_RUN_LOG: bool = True
+RUN_LOG_FILENAME: str = "run.log"
+
 # -----------------------------------------------------------------------------
 # Legacy baseline evaluation (optional)
 # -----------------------------------------------------------------------------
@@ -169,8 +176,8 @@ RUN_BASELINE_EVAL: bool = True
 BASELINES_ONLY_FOR_NIGHT: bool = True
 
 # Baseline validator settings.
-# Use a wider sweep so baseline reports include looser match thresholds too.
-BASELINE_DIST_THRESHOLDS_PX: List[float] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+# Validate only at 10px to reduce compute + output size.
+BASELINE_DIST_THRESHOLDS_PX: List[float] = [10.0]
 BASELINE_VALIDATE_CROP_W: int = 10
 BASELINE_VALIDATE_CROP_H: int = 10
 BASELINE_MAX_FRAMES: int | None = None
@@ -352,6 +359,213 @@ def _normalize_video_type(s: str) -> str:
 def _time_of_day_from_video_type(video_type: str) -> str:
     v = _normalize_video_type(video_type)
     return f"{v}_time"
+
+
+class _RunLogTee(io.TextIOBase):
+    def __init__(self, *, orig: io.TextIOBase, logger: "_RunOutputLogger"):
+        super().__init__()
+        self._orig = orig
+        self._logger = logger
+
+    def write(self, s: str) -> int:  # type: ignore[override]
+        self._logger._write_text(s, self._orig)
+        return len(s)
+
+    def flush(self) -> None:  # type: ignore[override]
+        self._logger._flush(self._orig)
+
+    def isatty(self) -> bool:  # pragma: no cover
+        try:
+            return bool(self._orig.isatty())
+        except Exception:
+            return False
+
+    @property
+    def encoding(self) -> str:  # pragma: no cover
+        return getattr(self._orig, "encoding", "utf-8")
+
+    def __getattr__(self, name: str) -> Any:  # pragma: no cover
+        return getattr(self._orig, name)
+
+
+class _RunOutputLogger:
+    """
+    Best-effort tee of:
+      1) Python prints (stdout/stderr), and
+      2) subprocess output invoked by this orchestrator
+    into a single per-run log file.
+
+    The log file starts in: <ROOT>/inference outputs/_run_logs/
+    and is moved into: <ROOT>/inference outputs/<run_id>/run.log
+    once the run_id is known.
+    """
+
+    def __init__(self, *, inference_root: Path, species_name: str, time_of_day: str, enabled: bool, dry_run: bool):
+        self._enabled = bool(enabled)
+        self._dry_run = bool(dry_run)
+        self._lock = threading.Lock()
+
+        self._orig_stdout = sys.stdout
+        self._orig_stderr = sys.stderr
+        self._tee_stdout = _RunLogTee(orig=self._orig_stdout, logger=self)
+        self._tee_stderr = _RunLogTee(orig=self._orig_stderr, logger=self)
+
+        self._fh: io.BufferedWriter | None = None
+        self._path: Path | None = None
+
+        if self._enabled and not self._dry_run:
+            log_dir = Path(inference_root).expanduser().resolve() / "_run_logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = "__".join(
+                p
+                for p in (_safe_name(species_name), _safe_name(time_of_day))
+                if str(p or "").strip()
+            )
+            name = f"{ts}__{base}.log" if base else f"{ts}.log"
+            self._path = log_dir / name
+            self._fh = self._path.open("ab", buffering=0)
+
+    @property
+    def path(self) -> Path | None:
+        return self._path
+
+    def install(self) -> None:
+        if not self._enabled:
+            return
+        sys.stdout = self._tee_stdout  # type: ignore[assignment]
+        sys.stderr = self._tee_stderr  # type: ignore[assignment]
+
+    def close(self) -> None:
+        if not self._enabled:
+            return
+        try:
+            sys.stdout = self._orig_stdout  # type: ignore[assignment]
+            sys.stderr = self._orig_stderr  # type: ignore[assignment]
+        finally:
+            try:
+                if self._fh is not None:
+                    self._fh.flush()
+                    self._fh.close()
+            except Exception:
+                pass
+
+    def move_into_run_dir(self, run_dir: Path) -> None:
+        if not (self._enabled and self._fh is not None and self._path is not None):
+            return
+        try:
+            run_dir = Path(run_dir).expanduser().resolve()
+            run_dir.mkdir(parents=True, exist_ok=True)
+            final = run_dir / str(RUN_LOG_FILENAME)
+            os.replace(str(self._path), str(final))
+            self._path = final
+        except Exception:
+            # Best-effort only; keep writing to the existing path.
+            pass
+
+    def _write_text(self, s: str, orig: io.TextIOBase) -> None:
+        if not self._enabled:
+            orig.write(s)
+            return
+        with self._lock:
+            try:
+                orig.write(s)
+                orig.flush()
+            except Exception:
+                pass
+            try:
+                if self._fh is not None:
+                    self._fh.write(s.encode("utf-8", errors="replace"))
+            except Exception:
+                pass
+
+    def _flush(self, orig: io.TextIOBase) -> None:
+        if not self._enabled:
+            try:
+                orig.flush()
+            except Exception:
+                pass
+            return
+        with self._lock:
+            try:
+                orig.flush()
+            except Exception:
+                pass
+            try:
+                if self._fh is not None:
+                    self._fh.flush()
+            except Exception:
+                pass
+
+    def write_subprocess_bytes(self, b: bytes) -> None:
+        if not b:
+            return
+        with self._lock:
+            try:
+                # Prefer raw bytes to preserve carriage returns/progress output.
+                buf = getattr(self._orig_stdout, "buffer", None)
+                if buf is not None:
+                    buf.write(b)
+                    buf.flush()
+                else:
+                    self._orig_stdout.write(b.decode("utf-8", errors="replace"))
+                    self._orig_stdout.flush()
+            except Exception:
+                pass
+            try:
+                if self._fh is not None:
+                    self._fh.write(b)
+            except Exception:
+                pass
+
+    def run(
+        self,
+        cmd: Sequence[str],
+        *,
+        cwd: Path,
+        check: bool,
+    ) -> None:
+        if not self._enabled or self._dry_run:
+            subprocess.run(list(cmd), cwd=str(cwd), check=bool(check))
+            return
+
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+
+        proc = subprocess.Popen(
+            list(cmd),
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+        assert proc.stdout is not None
+        try:
+            while True:
+                chunk = proc.stdout.read(4096)
+                if not chunk:
+                    break
+                self.write_subprocess_bytes(chunk)
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+
+        rc = int(proc.wait())
+        if check and rc != 0:
+            raise subprocess.CalledProcessError(rc, list(cmd))
+
+
+_RUN_OUTPUT_LOGGER: _RunOutputLogger | None = None
+
+
+def _subprocess_run(cmd: Sequence[str], *, cwd: Path, check: bool = True) -> None:
+    logger = _RUN_OUTPUT_LOGGER
+    if logger is not None:
+        logger.run(cmd, cwd=cwd, check=bool(check))
+    else:
+        subprocess.run(list(cmd), cwd=str(cwd), check=bool(check))
 
 # Ingestion mechanics (pair discovery, splitting, CSV staging, stage1_ingestor_core invocation)
 # live in: integrated ingestor-trainer-tester orchestrator/stage1_ingestor.py
@@ -1412,7 +1626,7 @@ def _run_gateway(
         print("[dry-run] Would run gateway:", " ".join(cmd))
         return
 
-    subprocess.run(cmd, cwd=str(repo_root), check=True)
+    _subprocess_run(cmd, cwd=repo_root, check=True)
 
 
 def _copy_file_if_needed(src: Path, dst: Path, *, dry_run: bool) -> None:
@@ -1491,7 +1705,7 @@ def _run_baseline_lab_detector(
     if dry_run:
         print("[dry-run] Would run lab baseline detector:", " ".join(cmd))
         return
-    subprocess.run(cmd, cwd=str(repo_root), check=True)
+    _subprocess_run(cmd, cwd=repo_root, check=True)
 
 
 def _run_baseline_raphael_detector(
@@ -1553,7 +1767,7 @@ def _run_baseline_raphael_detector(
     if dry_run:
         print("[dry-run] Would run Raphael baseline detector:", " ".join(cmd))
         return
-    subprocess.run(cmd, cwd=str(repo_root), check=True)
+    _subprocess_run(cmd, cwd=repo_root, check=True)
 
 
 def _run_stage5_validator(
@@ -1605,7 +1819,7 @@ def _run_stage5_validator(
     if dry_run:
         print(f"[dry-run] Would run Stage5 validator in {day_dir} on {pred_csv_path.name}")
         return
-    subprocess.run([sys.executable, "-c", code], cwd=str(day_dir), check=True)
+    _subprocess_run([sys.executable, "-c", code], cwd=day_dir, check=True)
 
 
 def _run_stage6_overlay(
@@ -1662,7 +1876,7 @@ def _run_stage6_overlay(
     if dry_run:
         print(f"[dry-run] Would run Stage6 overlay in {day_dir} -> {out_video_path.name}")
         return
-    subprocess.run([sys.executable, "-c", code], cwd=str(day_dir), check=True)
+    _subprocess_run([sys.executable, "-c", code], cwd=day_dir, check=True)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -1760,6 +1974,27 @@ def main() -> int:
     (data_root / "Integrated_prototype_validation_datasets" / "combined species folder").mkdir(parents=True, exist_ok=True)
     (data_root / "Integrated_prototype_validation_datasets" / "individual species folder").mkdir(parents=True, exist_ok=True)
     inference_root.mkdir(parents=True, exist_ok=True)
+
+    run_logger: _RunOutputLogger | None = None
+    if bool(SAVE_RUN_LOG):
+        run_logger = _RunOutputLogger(
+            inference_root=inference_root,
+            species_name=species_name,
+            time_of_day=time_of_day,
+            enabled=bool(SAVE_RUN_LOG),
+            dry_run=bool(args.dry_run),
+        )
+        run_logger.install()
+        global _RUN_OUTPUT_LOGGER
+        _RUN_OUTPUT_LOGGER = run_logger
+        try:
+            import atexit
+
+            atexit.register(run_logger.close)
+        except Exception:
+            pass
+        if run_logger.path is not None:
+            print(f"[orchestrator] Run log (temp) → {run_logger.path}")
 
     # Best-effort backfill: make legacy validation videos visible under ROOT/validation videos/<species>/...
     # (Hardlink preferred; copy fallback for cross-device.)
@@ -2338,6 +2573,14 @@ def main() -> int:
         did_train=bool(do_train),
     )
 
+    # Ensure the run dir exists early, and move the run log into it now that run_id is known.
+    run_dir = inference_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if run_logger is not None:
+        run_logger.move_into_run_dir(run_dir)
+        if run_logger.path is not None:
+            print(f"[orchestrator] Run log → {run_logger.path}")
+
     # Write/update training-video metadata BEFORE running any heavy eval work, so we keep provenance
     # even if evaluation crashes mid-run.
     training_videos_snapshot_path = _update_training_videos_history(
@@ -2804,7 +3047,7 @@ def main() -> int:
 
     # Write combined (multi-video) metrics per method at fixed thresholds.
     # This is a SUM of TP/FP/FN across the eval videos for each threshold, then recompute P/R/F1.
-    combined_thresholds_px = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    combined_thresholds_px = [10.0]
     combined_by_method: Dict[str, Dict[str, Any]] = {}
     for mk in ("global_model", "single_species_model"):
         combined_by_method[mk] = _combine_metrics_across_videos(
@@ -2820,7 +3063,7 @@ def main() -> int:
     combined_txt = _format_combined_metrics_txt(combined_by_method, thresholds_px=combined_thresholds_px)
     run_dir = inference_root / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    combined_txt_path = run_dir / "combined_results__thr1-10.txt"
+    combined_txt_path = run_dir / "combined_results__thr10.txt"
     if bool(args.dry_run):
         print(f"[dry-run] Would write combined results → {combined_txt_path}")
     else:
@@ -2950,6 +3193,12 @@ def main() -> int:
             print(
                 f"  - {mk}: mean_best_f1={mean_str}  n_videos={s.get('n_with_metrics', 0)}/{s.get('n_videos', 0)}"
             )
+
+    if run_logger is not None:
+        try:
+            run_logger.close()
+        finally:
+            _RUN_OUTPUT_LOGGER = None
 
     return 0
 
