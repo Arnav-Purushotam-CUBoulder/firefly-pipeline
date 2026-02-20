@@ -74,31 +74,27 @@ def _orc():
     """
     import sys
 
-    import __main__ as main
-    if hasattr(main, "ROOT"):
-        return main
-
+    # Preferred: when launched via the integrated gateway, the night pipeline is
+    # imported as module `orchestrator` (not __main__).
     m = sys.modules.get("orchestrator")
     if m is not None and hasattr(m, "ROOT"):
         return m
 
+    # Legacy direct run: `python orchestrator.py` makes the orchestrator be __main__.
+    import __main__ as main
+    if hasattr(main, "ROOT"):
+        return main
+
+    # Fallbacks: try importing orchestrator, else use pipeline_params (same constants).
     try:
         import orchestrator as orch  # type: ignore
-
         if hasattr(orch, "ROOT"):
             return orch
     except Exception:
         pass
 
-    try:
-        import pipeline_params as pp  # type: ignore
-
-        if hasattr(pp, "ROOT"):
-            return pp
-    except Exception:
-        pass
-
-    return main
+    import pipeline_params as pp  # type: ignore
+    return pp
 
 def _pack_stage1_params_for(ORC, variant: str) -> dict:
     """Build the right Stage-1 kwargs from orchestrator constants for the chosen variant."""

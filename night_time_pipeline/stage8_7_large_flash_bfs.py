@@ -44,8 +44,40 @@ def _ensure_dir(p: Path):
 # ──────────────────────────────────────────────────────────────
 # Orchestrator accessor so we can reuse global paths/params
 def _orc():
-    import __main__ as ORC
-    return ORC
+    """
+    Return the running orchestrator module.
+
+    Historically this pipeline was run via: `python orchestrator.py`, which makes
+    the orchestrator available as `__main__`.
+
+    When the integrated gateway runs the night pipeline, it does `python -c ...`
+    and then `import orchestrator`, so the orchestrator is *not* `__main__`.
+    In that case, fall back to the imported `orchestrator` module (or, as a
+    last resort, `pipeline_params` which holds the same constants).
+    """
+    import sys
+
+    # Preferred: when launched via the integrated gateway, the night pipeline is
+    # imported as module `orchestrator` (not __main__).
+    m = sys.modules.get("orchestrator")
+    if m is not None and hasattr(m, "ROOT"):
+        return m
+
+    # Legacy direct run: `python orchestrator.py` makes the orchestrator be __main__.
+    import __main__ as main
+    if hasattr(main, "ROOT"):
+        return main
+
+    # Fallbacks: try importing orchestrator, else use pipeline_params (same constants).
+    try:
+        import orchestrator as orch  # type: ignore
+        if hasattr(orch, "ROOT"):
+            return orch
+    except Exception:
+        pass
+
+    import pipeline_params as pp  # type: ignore
+    return pp
 
 # ──────────────────────────────────────────────────────────────
 def _read_csv_rows(p: Path) -> List[dict]:
