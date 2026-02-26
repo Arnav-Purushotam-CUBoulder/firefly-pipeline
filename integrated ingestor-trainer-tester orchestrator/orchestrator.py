@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import stage1_ingestor
+from codex_change_log import ChangeLogRun, SnapshotConfig, build_ingestion_index
 try:
     from tqdm import tqdm  # type: ignore
 except Exception:  # pragma: no cover
@@ -163,6 +164,12 @@ DRY_RUN: bool = False
 # The log file is ultimately placed under: <ROOT>/inference outputs/<run_id>/
 SAVE_RUN_LOG: bool = True
 RUN_LOG_FILENAME: str = "run.log"
+
+# Append-only change log (rollback-focused)
+# Writes to: <LOG_ROOT>/codex_change_log.jsonl
+ENABLE_CODEX_CHANGE_LOG: bool = True
+LOG_ROOT_PATH: str | Path = "/mnt/Samsung_SSD_2TB/integrated prototype data"
+CHANGE_LOG_FILENAME: str = "codex_change_log.jsonl"
 
 # -----------------------------------------------------------------------------
 # Legacy baseline evaluation (optional)
@@ -1922,6 +1929,15 @@ def _parse_args() -> argparse.Namespace:
             f"inference=<root>/{DEFAULT_INFERENCE_OUTPUT_SUBDIR!r}."
         ),
     )
+    p.add_argument(
+        "--log-root",
+        type=str,
+        default=None,
+        help=(
+            "Where to write the append-only Codex changelog (JSONL). "
+            "Defaults to LOG_ROOT_PATH (or <root>/.. if LOG_ROOT_PATH is empty)."
+        ),
+    )
     p.add_argument("--dry-run", action="store_true", default=bool(DRY_RUN))
     return p.parse_args()
 
@@ -1934,6 +1950,16 @@ def main() -> int:
     species_name = _safe_name(species_arg)
     if not species_name:
         raise SystemExit(f"Invalid species name: {species_arg!r}")
+    # stage1_ingestor_core parses identity from staged CSV name split on underscores,
+    # so species tokens must NOT contain underscores (use hyphens instead).
+    species_norm = str(species_name).strip().lower().replace("_", "-")
+    species_norm = re.sub(r"[^a-z0-9-]+", "-", species_norm)
+    species_norm = re.sub(r"-+", "-", species_norm).strip("-")
+    if not species_norm:
+        raise SystemExit(f"Invalid species name after normalization: {species_arg!r}")
+    if species_norm != species_name:
+        print(f"[orchestrator] NOTE: normalized species_name {species_name!r} -> {species_norm!r}")
+    species_name = species_norm
 
     observed_dir_arg = str(args.observed_dir or "").strip() or str(OBSERVED_DATA_DIR or "").strip()
     if not observed_dir_arg:
@@ -1952,6 +1978,61 @@ def main() -> int:
     if not root_arg:
         raise SystemExit("Pass --root (recommended) or set ROOT_PATH at top of file.")
     root = Path(root_arg).expanduser().resolve()
+
+    # ---------------------------------------------------------------------
+    # Append-only change log (best-effort)
+    # ---------------------------------------------------------------------
+    log_root_arg = (str(args.log_root).strip() if args.log_root else "") or (str(LOG_ROOT_PATH).strip() if LOG_ROOT_PATH else "")
+    if not log_root_arg:
+        log_root = root.parent
+    else:
+        log_root = Path(log_root_arg).expanduser().resolve()
+    log_path = (log_root / str(CHANGE_LOG_FILENAME)).expanduser().resolve()
+
+    changelog_meta: Dict[str, Any] = {
+        "actor": "orchestrator",
+        "argv": [str(x) for x in sys.argv],
+        "root": str(root),
+        "log_path": str(log_path),
+        "species_name": species_name,
+        "observed_dir": str(observed_dir),
+        "type_of_video": str(video_type_norm),
+        "time_of_day": str(time_of_day),
+        "expected_route": str(expected_route),
+        "dry_run": bool(args.dry_run),
+        "skip_ingest": bool(getattr(args, "skip_ingest", False)),
+        "skip_train": bool(getattr(args, "skip_train", False)),
+        "skip_test": bool(getattr(args, "skip_test", False)),
+    }
+    if bool(ENABLE_CODEX_CHANGE_LOG) and (not bool(args.dry_run)):
+        try:
+            log_root.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+    changelog_run: ChangeLogRun | None = None
+    if bool(ENABLE_CODEX_CHANGE_LOG):
+        try:
+            scopes = [
+                (root / DEFAULT_DATA_SUBDIR).expanduser().resolve(),
+                (root / DEFAULT_MODEL_ZOO_SUBDIR).expanduser().resolve(),
+                (root / DEFAULT_INFERENCE_OUTPUT_SUBDIR).expanduser().resolve(),
+                (root / VALIDATION_VIDEOS_DIRNAME).expanduser().resolve(),
+                (root / TRAINING_VIDEOS_DIRNAME).expanduser().resolve(),
+            ]
+            cfg = SnapshotConfig(root=root, scopes=scopes)
+            changelog_run = ChangeLogRun(cfg=cfg, log_path=log_path, meta=changelog_meta, enabled=True)
+            changelog_run.__enter__()
+            print(f"[orchestrator] Change log → {log_path}")
+            try:
+                import atexit
+
+                atexit.register(changelog_run.__exit__, None, None, None)
+            except Exception:
+                pass
+        except Exception:
+            changelog_run = None
+
     root.mkdir(parents=True, exist_ok=True)
 
     # Visible validation-video store under ROOT (for human inspection + stable automation input paths).
@@ -2024,7 +2105,31 @@ def main() -> int:
     # -------------------------------------------------------------------------
 
     # Discover and split observed (video,csv) pairs.
-    pairs = stage1_ingestor.discover_observed_pairs(observed_dir)
+    pairs_all = stage1_ingestor.discover_observed_pairs(observed_dir)
+
+    # Skip videos that were already ingested (centralized ingestion metadata lives in the change log).
+    already_ingested_video_names: set[str] = set()
+    try:
+        ing_idx = build_ingestion_index(log_path)
+        already_ingested_video_names = set(ing_idx.get(species_name, {}).keys())
+    except Exception:
+        already_ingested_video_names = set()
+
+    skipped_existing = [p for p in pairs_all if p.video_name in already_ingested_video_names]
+    pairs = [p for p in pairs_all if p.video_name not in already_ingested_video_names]
+    if skipped_existing:
+        preview = ", ".join([p.video_name for p in skipped_existing[:10]])
+        more = "" if len(skipped_existing) <= 10 else f" (+{len(skipped_existing) - 10} more)"
+        print(f"[orchestrator] NOTE: skipping already-ingested videos: {preview}{more}")
+    try:
+        changelog_meta["raw_pairs_total"] = int(len(pairs_all))
+        changelog_meta["raw_pairs_to_ingest"] = int(len(pairs))
+        changelog_meta["raw_pairs_skipped_existing"] = int(len(skipped_existing))
+        if skipped_existing:
+            changelog_meta["skipped_existing_video_names"] = [p.video_name for p in skipped_existing[:200]]
+            changelog_meta["skipped_existing_video_names_truncated"] = bool(len(skipped_existing) > 200)
+    except Exception:
+        pass
 
     try:
         train_pairs, val_pairs = stage1_ingestor.split_pairs_train_vs_val(
@@ -2036,7 +2141,8 @@ def main() -> int:
     val_video_names = {p.video_name for p in val_pairs}
     print(
         "[orchestrator] Discovered pairs:",
-        f"total={len(pairs)} train={len(train_pairs)} val={len(val_pairs)} train_fraction={float(args.train_pair_fraction):.3f}",
+        f"total={len(pairs_all)} new={len(pairs)} skipped_existing={len(skipped_existing)} "
+        f"train={len(train_pairs)} val={len(val_pairs)} train_fraction={float(args.train_pair_fraction):.3f}",
     )
 
     # Count rows for run naming + train decision.
@@ -2067,6 +2173,36 @@ def main() -> int:
         print("[orchestrator] Skipping Stage 2 training (--skip-train).")
     if skip_test:
         print("[orchestrator] Skipping Stage 3 testing (--skip-test).")
+
+    # Ingestion metadata for downstream incremental runs (stored in the centralized change log).
+    if not skip_ingest:
+        try:
+            ingested_pairs_meta: List[Dict[str, Any]] = []
+            for p in train_pairs:
+                ingested_pairs_meta.append(
+                    {
+                        "species_token": str(species_name),
+                        "video_name": str(p.video_name),
+                        "video_path": str(p.video_path),
+                        "firefly_csv": str(p.firefly_csv),
+                        "background_csv": str(p.background_csv) if p.background_csv else None,
+                        "split": "train",
+                    }
+                )
+            for p in val_pairs:
+                ingested_pairs_meta.append(
+                    {
+                        "species_token": str(species_name),
+                        "video_name": str(p.video_name),
+                        "video_path": str(p.video_path),
+                        "firefly_csv": str(p.firefly_csv),
+                        "background_csv": str(p.background_csv) if p.background_csv else None,
+                        "split": "validation",
+                    }
+                )
+            changelog_meta["ingested_pairs"] = ingested_pairs_meta
+        except Exception:
+            pass
 
     zoo = _ensure_model_zoo_scaffold(model_root)
     results_history_dir = zoo["results_history_dir"]
@@ -2572,6 +2708,10 @@ def main() -> int:
         val_rows_firefly=int(val_firefly_rows_total),
         did_train=bool(do_train),
     )
+    try:
+        changelog_meta["run_id"] = str(run_id)
+    except Exception:
+        pass
 
     # Ensure the run dir exists early, and move the run log into it now that run_id is known.
     run_dir = inference_root / run_id
