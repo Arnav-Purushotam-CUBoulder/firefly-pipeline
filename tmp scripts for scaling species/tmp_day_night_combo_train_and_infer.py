@@ -10,12 +10,14 @@ What it does:
 3) Builds one combined dataset per route.
 4) Trains one day model and one night model.
 5) Scans a raw-videos root, splits videos into day/night groups.
-6) Runs gateway inference on each video using the route-specific model.
+6) Loads GT per video, then runs gateway inference using the route-specific model.
+   Processing is capped to the last annotated GT frame.
 
 Routing uses folder/file/species names (no brightness filter).
 """
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -38,18 +40,25 @@ REPO_ROOT: Path = Path("/home/guest/Desktop/arnav's files/firefly pipeline")
 INTEGRATED_OUTER_ROOT: Path = Path("/mnt/Samsung_SSD_2TB/integrated prototype data")
 INTEGRATED_INNER_ROOT: Path = INTEGRATED_OUTER_ROOT / "integrated prototype data"
 PATCH_DATA_ROOT: Path = INTEGRATED_INNER_ROOT / "patch training datasets and pipeline validation data"
+VAL_INDIVIDUAL_ROOT: Path = PATCH_DATA_ROOT / "Integrated_prototype_validation_datasets" / "individual species folder"
 
 # Raw videos root to infer on (can be overridden via CLI).
 RAW_VIDEOS_ROOT: Path = Path("/mnt/Samsung_SSD_2TB/integrated prototype raw videos")
 
 # Final outputs for this temporary run.
-RUNS_ROOT: Path = Path("/mnt/Samsung_SSD_2TB/night time pipeline inference output data")
+# Keep all generated outputs (combined datasets, trained models, inference, metadata)
+# under this single root.
+RUNS_ROOT: Path = Path("/mnt/Samsung_SSD_2TB/temp to delete/firefly_patch_training_local_run")
 RUN_NAME_PREFIX: str = "tmp_day_night_combo_train_and_infer"
 
 # If False (default), this script skips any raw-video ingestion stage and uses
 # already-ingested species datasets under PATCH_DATA_ROOT directly.
 # Keep False for your requested flow: train + test only.
 RUN_INGESTION_FROM_SCRATCH: bool = False
+
+# Evaluation safeguard: require per-video GT and cap processing to the last
+# annotated frame in that GT (enforced through gateway + pipeline MAX_FRAMES).
+REQUIRE_GT_FOR_INFERENCE: bool = True
 
 # Route assignment by species token.
 # Used for both training-source grouping and inference-video grouping.
@@ -219,6 +228,116 @@ def _latest_version_dir(root: Path) -> Optional[Path]:
         if best is None or key[0] > best[0] or (key[0] == best[0] and key[1] > best[1]):
             best = key
     return best[2] if best else None
+
+
+def _parse_frame_like(value: object) -> Optional[int]:
+    s = str(value or "").strip()
+    if not s:
+        return None
+    try:
+        return int(round(float(s)))
+    except Exception:
+        m = re.search(r"\d+", s)
+        if m:
+            try:
+                return int(m.group(0))
+            except Exception:
+                return None
+    return None
+
+
+def _normalize_video_stem(name_or_path: object) -> str:
+    s = str(name_or_path or "").strip()
+    if not s:
+        return ""
+    s = Path(s).name
+    if s.lower().endswith(".mp4"):
+        s = s[: -len(".mp4")]
+    return s
+
+
+def _read_gt_rows_from_csv(csv_path: Path, *, video_stem: Optional[str]) -> List[Dict[str, int]]:
+    if not csv_path.exists():
+        return []
+    out: List[Dict[str, int]] = []
+    with csv_path.open(newline="") as f:
+        r = csv.DictReader(f)
+        fieldnames = list(r.fieldnames or [])
+        if not fieldnames:
+            return []
+        cols = {str(c).strip().lower(): c for c in fieldnames}
+        x_col = cols.get("x")
+        y_col = cols.get("y")
+        t_col = cols.get("t") or cols.get("frame") or cols.get("frame_idx")
+        vn_col = cols.get("video_name")
+        if not (x_col and y_col and t_col):
+            return []
+
+        want_stem = _normalize_video_stem(video_stem or "")
+        for row in r:
+            if vn_col and want_stem:
+                row_stem = _normalize_video_stem(row.get(vn_col))
+                if row_stem != want_stem:
+                    continue
+            try:
+                x = int(round(float(row.get(x_col) or 0)))
+                y = int(round(float(row.get(y_col) or 0)))
+            except Exception:
+                continue
+            t = _parse_frame_like(row.get(t_col))
+            if t is None:
+                continue
+            out.append({"x": x, "y": y, "t": int(t)})
+    return out
+
+
+def _load_gt_rows_for_video(*, video_path: Path, species_name: Optional[str]) -> tuple[List[Dict[str, int]], Optional[Path]]:
+    video_stem = _normalize_video_stem(video_path.stem)
+
+    # 1) Local per-video GT candidates near the video file.
+    local_candidates = [
+        video_path.with_suffix(".csv"),
+        video_path.parent / f"{video_path.stem}_gt.csv",
+        video_path.parent / "gt.csv",
+    ]
+    for cand in local_candidates:
+        if not cand.exists():
+            continue
+        rows = _read_gt_rows_from_csv(cand, video_stem=video_stem)
+        if rows:
+            return rows, cand
+
+    # 2) Species validation annotations store.
+    if species_name:
+        sp_dir = VAL_INDIVIDUAL_ROOT / str(species_name)
+        latest = _latest_version_dir(sp_dir)
+        if latest is not None:
+            ann = latest / "annotations.csv"
+            rows = _read_gt_rows_from_csv(ann, video_stem=video_stem)
+            if rows:
+                return rows, ann
+
+    # 3) Last-resort scan across species validation annotations.
+    if VAL_INDIVIDUAL_ROOT.exists():
+        for sp_dir in sorted([p for p in VAL_INDIVIDUAL_ROOT.iterdir() if p.is_dir()], key=lambda p: p.name):
+            latest = _latest_version_dir(sp_dir)
+            if latest is None:
+                continue
+            ann = latest / "annotations.csv"
+            rows = _read_gt_rows_from_csv(ann, video_stem=video_stem)
+            if rows:
+                return rows, ann
+
+    return [], None
+
+
+def _write_gt_csv(path: Path, rows: Sequence[Dict[str, int]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["x", "y", "t"])
+        w.writeheader()
+        for r in rows:
+            w.writerow({"x": int(r["x"]), "y": int(r["y"]), "t": int(r["t"])})
 
 
 def _iter_image_files(folder: Path) -> Iterable[Path]:
@@ -575,6 +694,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for v in videos:
         by_route_counts[v.route] = by_route_counts.get(v.route, 0) + 1
     print(f"[tmp-run] inference split: day={by_route_counts.get('day', 0)} night={by_route_counts.get('night', 0)}")
+    print(f"[tmp-run] require_gt_for_inference={bool(REQUIRE_GT_FOR_INFERENCE)}")
 
     inference_results: List[Dict[str, Any]] = []
     for i, v in enumerate(videos, start=1):
@@ -593,6 +713,36 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         print(f"[tmp-run][infer] {i}/{len(videos)} route={v.route} species={v.species_name} video={v.video_path.name}")
         out_root = inference_root / v.route / v.video_path.stem
+
+        gt_rows, gt_src = _load_gt_rows_for_video(video_path=v.video_path, species_name=v.species_name)
+        if not gt_rows and bool(REQUIRE_GT_FOR_INFERENCE):
+            inference_results.append(
+                {
+                    "video_path": str(v.video_path),
+                    "route": v.route,
+                    "species_name": v.species_name,
+                    "status": "skipped",
+                    "error": "missing_gt_csv_or_annotations",
+                    "gt_source": "",
+                }
+            )
+            continue
+
+        gt_max_t = max((int(r["t"]) for r in gt_rows), default=None)
+        if gt_rows:
+            print(
+                f"[tmp-run][gt] {v.video_path.name} "
+                f"rows={len(gt_rows)} max_t={gt_max_t} source={gt_src}"
+            )
+            if not dry_run:
+                day_root = out_root / "day_pipeline_v3"
+                night_root = out_root / "night_time_pipeline"
+                _write_gt_csv(day_root / "ground truth" / f"gt_{v.video_path.stem}.csv", gt_rows)
+                _write_gt_csv(day_root / "ground truth" / "gt.csv", gt_rows)
+                _write_gt_csv(day_root / "gt.csv", gt_rows)
+                _write_gt_csv(night_root / "ground truth" / "gt.csv", gt_rows)
+                _write_gt_csv(night_root / "gt.csv", gt_rows)
+
         res = _run_inference_for_video(
             route=v.route,
             model_path=model_path,
@@ -601,6 +751,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             dry_run=dry_run,
         )
         res["species_name"] = v.species_name
+        res["gt_source"] = str(gt_src) if gt_src is not None else ""
+        res["gt_rows"] = int(len(gt_rows))
+        res["gt_max_t"] = int(gt_max_t) if gt_max_t is not None else None
         inference_results.append(res)
 
     record: Dict[str, Any] = {
@@ -620,6 +773,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "route_night_hint_tokens": list(ROUTE_NAME_HINT_NIGHT_TOKENS),
             "route_default": str(ROUTE_DEFAULT),
             "require_explicit_route": bool(REQUIRE_EXPLICIT_ROUTE),
+            "require_gt_for_inference": bool(REQUIRE_GT_FOR_INFERENCE),
         },
         "training_sources_by_route": {
             r: [{"species": s.species_name, "path": str(s.path)} for s in srcs]

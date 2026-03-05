@@ -575,6 +575,7 @@ def _run_stage5_validator(
     orig_video_path: Path,
     pred_csv_path: Path,
     gt_csv_path: Path,
+    max_frames: int | None,
     out_dir: Path,
     log_path: Path,
     dry_run: bool,
@@ -586,7 +587,7 @@ def _run_stage5_validator(
 
     # Prevent Stage5 validator from auto-searching for FN-scoring weights.
     no_weights = out_dir / "__no_fn_scoring_weights__.pt"
-    max_frames_code = str(int(BASELINE_MAX_FRAMES)) if BASELINE_MAX_FRAMES is not None else "None"
+    max_frames_code = str(int(max_frames)) if max_frames is not None else "None"
 
     code = "\n".join(
         [
@@ -613,6 +614,20 @@ def _run_stage5_validator(
     _run_subprocess_logged([sys.executable, "-c", code], cwd=day_dir, log_path=log_path, dry_run=dry_run)
 
 
+def _video_max_frames_from_gt(video: EvalVideo) -> int | None:
+    """
+    Keep baseline processing aligned with pipeline inference:
+      max_frames = last_annotated_t + 1
+    """
+    if not video.gt_rows:
+        return None
+    try:
+        max_t = max(int(r["t"]) for r in video.gt_rows)
+    except Exception:
+        return None
+    return int(max_t) + 1
+
+
 def _run_baselines_for_video(
     *,
     run_dir: Path,
@@ -629,6 +644,7 @@ def _run_baselines_for_video(
     """
     out: Dict[str, Dict[str, Any]] = {}
     scripts = _baseline_scripts()
+    max_frames_for_video = _video_max_frames_from_gt(video)
 
     if BASELINES_ONLY_FOR_NIGHT and str(video.route) != "night":
         return out
@@ -669,7 +685,7 @@ def _run_baselines_for_video(
                             "--box-h",
                             str(int(BASELINE_VALIDATE_CROP_H)),
                         ]
-                        + (["--max-frames", str(int(BASELINE_MAX_FRAMES))] if BASELINE_MAX_FRAMES is not None else []),
+                        + (["--max-frames", str(int(max_frames_for_video))] if max_frames_for_video is not None else []),
                         cwd=_repo_root(),
                         log_path=logs_dir / f"baseline_lab__{video.video_key}.log",
                         dry_run=dry_run,
@@ -678,6 +694,7 @@ def _run_baselines_for_video(
                         orig_video_path=video.video_path,
                         pred_csv_path=pred_csv,
                         gt_csv_path=gt_csv,
+                        max_frames=max_frames_for_video,
                         out_dir=stage5_dir,
                         log_path=logs_dir / f"baseline_lab_stage5__{video.video_key}.log",
                         dry_run=dry_run,
@@ -742,7 +759,7 @@ def _run_baselines_for_video(
                             "--device",
                             str(RAPHAEL_DEVICE),
                         ]
-                        + (["--max-frames", str(int(BASELINE_MAX_FRAMES))] if BASELINE_MAX_FRAMES is not None else []),
+                        + (["--max-frames", str(int(max_frames_for_video))] if max_frames_for_video is not None else []),
                         cwd=_repo_root(),
                         log_path=logs_dir / f"baseline_raphael__{video.video_key}.log",
                         dry_run=dry_run,
@@ -751,6 +768,7 @@ def _run_baselines_for_video(
                         orig_video_path=video.video_path,
                         pred_csv_path=pred_csv,
                         gt_csv_path=gt_csv,
+                        max_frames=max_frames_for_video,
                         out_dir=stage5_dir,
                         log_path=logs_dir / f"baseline_raphael_stage5__{video.video_key}.log",
                         dry_run=dry_run,

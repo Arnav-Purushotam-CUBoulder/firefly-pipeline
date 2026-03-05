@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import re
 import subprocess
 import sys
 import time
@@ -132,6 +134,70 @@ def _infer_route_for_video(video_path: Path) -> str:
     return str(ROUTE_DEFAULT).strip().lower()
 
 
+def _parse_frame_like(value: object) -> int | None:
+    s = str(value or "").strip()
+    if not s:
+        return None
+    try:
+        return int(round(float(s)))
+    except Exception:
+        m = re.search(r"\d+", s)
+        if m:
+            try:
+                return int(m.group(0))
+            except Exception:
+                return None
+    return None
+
+
+def _max_annotated_t_from_gt_csv(gt_csv: Path) -> int | None:
+    try:
+        with gt_csv.open(newline="") as f:
+            r = csv.DictReader(f)
+            fieldnames = list(r.fieldnames or [])
+            if not fieldnames:
+                return None
+            cols = {str(c).strip().lower(): c for c in fieldnames}
+            t_col = cols.get("t") or cols.get("frame") or cols.get("frame_idx")
+            if not t_col:
+                return None
+            max_t: int | None = None
+            for row in r:
+                t = _parse_frame_like(row.get(t_col))
+                if t is None:
+                    continue
+                if max_t is None or t > max_t:
+                    max_t = t
+            return max_t
+    except Exception as exc:
+        print(f"[gateway] WARNING: failed reading GT CSV {gt_csv}: {exc}")
+        return None
+
+
+def _max_frames_override_from_gt(video_path: Path, *, route: str, out_base: Path | None) -> int | None:
+    if out_base is None:
+        return None
+    route_root = out_base / (DAY_OUTPUT_SUBDIR if str(route) == "day" else NIGHT_OUTPUT_SUBDIR)
+    candidates = [
+        route_root / "ground truth" / f"gt_{video_path.stem}.csv",
+        route_root / "ground truth" / "gt.csv",
+        route_root / "gt.csv",
+    ]
+    for gt_csv in candidates:
+        if not gt_csv.exists():
+            continue
+        max_t = _max_annotated_t_from_gt_csv(gt_csv)
+        if max_t is None:
+            continue
+        max_frames = int(max_t) + 1
+        print(
+            f"[gateway] {video_path.name}  gt_max_t={max_t}  ->  max_frames={max_frames} "
+            f"(from {gt_csv})"
+        )
+        return max_frames
+    return None
+
+
 def _run_subprocess_python(code: str, *, cwd: Path) -> int:
     proc = subprocess.run([sys.executable, "-c", code], cwd=str(cwd))
     return int(proc.returncode)
@@ -148,6 +214,7 @@ def _day_pipeline_code(
     patch_model_path: Path | None,
     force_tests: bool,
     force_no_cleanup: bool,
+    max_frames_override: int | None,
 ) -> str:
     return "\n".join(
         [
@@ -159,6 +226,7 @@ def _day_pipeline_code(
             f"force_no_cleanup = {bool(force_no_cleanup)}",
             f"force_all_frames = {bool(FORCE_ALL_FRAMES)}",
             f"force_start_from_0 = {bool(FORCE_START_FROM_FRAME_0)}",
+            f"max_frames_override = {int(max_frames_override)} if {max_frames_override is not None} else None",
             "if output_root is not None:",
             "    root = output_root",
             "    root.mkdir(parents=True, exist_ok=True)",
@@ -178,7 +246,9 @@ def _day_pipeline_code(
             "    params.PATCH_MODEL_PATH = patch_model_path",
             "    if hasattr(params, 'STAGE5_MODEL_PATH'):",
             "        params.STAGE5_MODEL_PATH = patch_model_path",
-            "if force_all_frames:",
+            "if max_frames_override is not None:",
+            "    params.MAX_FRAMES = int(max_frames_override)",
+            "elif force_all_frames:",
             "    params.MAX_FRAMES = None",
             "if force_start_from_0:",
             "    if hasattr(params, 'GT_T_OFFSET'):",
@@ -220,6 +290,7 @@ def _night_pipeline_code(
     cnn_model_path: Path | None,
     force_tests: bool,
     force_no_cleanup: bool,
+    max_frames_override: int | None,
 ) -> str:
     return "\n".join(
         [
@@ -231,6 +302,7 @@ def _night_pipeline_code(
             f"force_no_cleanup = {bool(force_no_cleanup)}",
             f"force_all_frames = {bool(FORCE_ALL_FRAMES)}",
             f"force_start_from_0 = {bool(FORCE_START_FROM_FRAME_0)}",
+            f"max_frames_override = {int(max_frames_override)} if {max_frames_override is not None} else None",
             "if output_root is not None:",
             "    root = output_root",
             "    root.mkdir(parents=True, exist_ok=True)",
@@ -250,7 +322,9 @@ def _night_pipeline_code(
             "    pp.CNN_MODEL_PATH = cnn_model_path",
             "    if hasattr(pp, 'STAGE9_MODEL_PATH'):",
             "        pp.STAGE9_MODEL_PATH = cnn_model_path",
-            "if force_all_frames:",
+            "if max_frames_override is not None:",
+            "    pp.MAX_FRAMES = int(max_frames_override)",
+            "elif force_all_frames:",
             "    pp.MAX_FRAMES = None",
             "if force_start_from_0:",
             "    if hasattr(pp, 'GT_T_OFFSET'):",
@@ -291,6 +365,7 @@ def _run_day_pipeline(
     patch_model_path: Path | None,
     force_tests: bool,
     force_no_cleanup: bool,
+    max_frames_override: int | None,
 ) -> int:
     code = _day_pipeline_code(
         video_path,
@@ -298,6 +373,7 @@ def _run_day_pipeline(
         patch_model_path=patch_model_path,
         force_tests=force_tests,
         force_no_cleanup=force_no_cleanup,
+        max_frames_override=max_frames_override,
     )
     return _run_subprocess_python(code, cwd=pipeline.day_dir)
 
@@ -310,6 +386,7 @@ def _run_night_pipeline(
     cnn_model_path: Path | None,
     force_tests: bool,
     force_no_cleanup: bool,
+    max_frames_override: int | None,
 ) -> int:
     code = _night_pipeline_code(
         video_path,
@@ -317,6 +394,7 @@ def _run_night_pipeline(
         cnn_model_path=cnn_model_path,
         force_tests=force_tests,
         force_no_cleanup=force_no_cleanup,
+        max_frames_override=max_frames_override,
     )
     return _run_subprocess_python(code, cwd=pipeline.night_dir)
 
@@ -329,6 +407,7 @@ def _start_day_pipeline(
     patch_model_path: Path | None,
     force_tests: bool,
     force_no_cleanup: bool,
+    max_frames_override: int | None,
 ) -> subprocess.Popen:
     code = _day_pipeline_code(
         video_path,
@@ -336,6 +415,7 @@ def _start_day_pipeline(
         patch_model_path=patch_model_path,
         force_tests=force_tests,
         force_no_cleanup=force_no_cleanup,
+        max_frames_override=max_frames_override,
     )
     return _start_subprocess_python(code, cwd=pipeline.day_dir)
 
@@ -348,6 +428,7 @@ def _start_night_pipeline(
     cnn_model_path: Path | None,
     force_tests: bool,
     force_no_cleanup: bool,
+    max_frames_override: int | None,
 ) -> subprocess.Popen:
     code = _night_pipeline_code(
         video_path,
@@ -355,6 +436,7 @@ def _start_night_pipeline(
         cnn_model_path=cnn_model_path,
         force_tests=force_tests,
         force_no_cleanup=force_no_cleanup,
+        max_frames_override=max_frames_override,
     )
     return _start_subprocess_python(code, cwd=pipeline.night_dir)
 
@@ -497,6 +579,8 @@ def main() -> int:
                 failures.append((video, 2))
                 continue
 
+            max_frames_override = _max_frames_override_from_gt(video, route=route, out_base=out_base)
+
             if bool(args.dry_run):
                 continue
 
@@ -514,6 +598,7 @@ def main() -> int:
                         cnn_model_path=night_cnn_model,
                         force_tests=force_tests,
                         force_no_cleanup=force_no_cleanup,
+                        max_frames_override=max_frames_override,
                     )
                     night_cleanup_done = True
                 else:
@@ -526,6 +611,7 @@ def main() -> int:
                         patch_model_path=day_patch_model,
                         force_tests=force_tests,
                         force_no_cleanup=force_no_cleanup,
+                        max_frames_override=max_frames_override,
                     )
                     day_cleanup_done = True
             except Exception as exc:
