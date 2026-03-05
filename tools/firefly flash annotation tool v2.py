@@ -11,8 +11,7 @@ Usage notes
   • Left / Right arrows: move to previous / next frame.
   • Space: undo last box on the current frame.
   • Click: add a 10×10 box, snapped to the brightest spot near the click.
-  • Hover: shows R,G,B and luminance of the brightest pixel in a 10×10 patch
-    centred on the cursor.
+  • Hover: shows luminance of the brightest pixel in the 10×10 annotation box.
 
 CSV format
   Columns: x, y, w, h, frame
@@ -425,11 +424,11 @@ def show_frame() -> None:
 
 # ───────── hover helper ─────────
 def hover_readout(event) -> None:
-    """Show R,G,B and luminance of brightest pixel in 10×10 patch."""
+    """Show brightest-pixel luminance for the snapped 10×10 annotation box."""
     total = int(state.get("total_frames") or 0)
     if total <= 0 or not state.get("video_path"):
         return
-    s = state["scale"]
+    s = float(state["scale"])
     ox, oy = int(event.x / s), int(event.y / s)
     frame = state["current_np"]
     if frame is None:
@@ -438,25 +437,29 @@ def hover_readout(event) -> None:
     if not (0 <= ox < w and 0 <= oy < h):
         return
 
+    gray = state.get("current_gray")
+    if gray is None:
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        state["current_gray"] = gray
+
+    # Snap to the same brightest point the click path uses.
+    bx, by = find_nearest_brightest(gray, ox, oy)
+    state["cursor_center"] = (bx, by)
+
+    # Use exactly the same grayscale/max logic as the night pipeline's
+    # brightest-pixel guard (max over patch in cv2 grayscale space).
     half = BOX_SIZE // 2
-    x0, y0 = max(ox - half, 0), max(oy - half, 0)
-    x1, y1 = min(ox + half, w - 1), min(oy + half, h - 1)
-    patch = frame[y0 : y1 + 1, x0 : x1 + 1]  # RGB
-
-    if patch.size == 0:
+    x0 = max(int(bx) - half, 0)
+    y0 = max(int(by) - half, 0)
+    x1 = min(x0 + int(BOX_SIZE), w)
+    y1 = min(y0 + int(BOX_SIZE), h)
+    patch_gray = gray[y0:y1, x0:x1]
+    if patch_gray.size == 0:
         return
+    intensity = int(patch_gray.max())
 
-    lumin = (
-        0.299 * patch[:, :, 0]
-        + 0.587 * patch[:, :, 1]
-        + 0.114 * patch[:, :, 2]
-    )
-    idx = np.unravel_index(np.argmax(lumin), lumin.shape)
-    r, g, b = patch[idx]
-    intensity = int(round(lumin[idx]))
-
-    # Create or update hover label
-    text = f"{r},{g},{b}  {intensity}"
+    # Create or update hover label (luminance only).
+    text = f"lum={intensity}"
     if state["hover_id"] is None:
         state["hover_id"] = canvas.create_text(
             event.x + 10,
@@ -469,19 +472,6 @@ def hover_readout(event) -> None:
     else:
         canvas.coords(state["hover_id"], event.x + 10, event.y + 10)
         canvas.itemconfig(state["hover_id"], text=text)
-
-    # Create or update transparent box cursor showing where the annotation
-    # box will actually land (after brightest-pixel snapping).
-    gray = state.get("current_gray")
-    if gray is None:
-        frame = state["current_np"]
-        if frame is None:
-            return
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        state["current_gray"] = gray
-
-    bx, by = find_nearest_brightest(gray, ox, oy)
-    state["cursor_center"] = (bx, by)
 
     s = state["scale"]
     cx_disp = bx * s
