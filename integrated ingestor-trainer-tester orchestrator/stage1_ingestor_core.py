@@ -35,6 +35,7 @@ import os
 import random
 import re
 import shutil
+import time
 import zlib
 from dataclasses import dataclass
 from datetime import datetime
@@ -133,6 +134,12 @@ AUTO_BACKGROUND_MAX_PATCHES_PER_FRAME: int = 10
 AUTO_BACKGROUND_MAX_FRAME_SAMPLES: int = 5000  # safety cap to avoid infinite loops
 AUTO_BACKGROUND_SEED: int = 1337
 AUTO_BACKGROUND_FALLBACK_RANDOM_CENTERS: bool = True  # if SBD finds 0 blobs in a frame, sample random centers
+
+# Safety/performance: blob detection can be extremely slow on high-res frames (e.g. 4K).
+# If a single-frame blob detection call exceeds this threshold, we will disable blob detection
+# for the rest of the video and fall back to random centers only (if enabled).
+AUTO_BACKGROUND_BLOB_DETECT_SLOW_FRAME_SECONDS: float = 2.0
+AUTO_BACKGROUND_BLOB_DETECT_DISABLE_AFTER_SLOW_FRAMES: int = 1
 
 # Blob detector + preprocessing knobs for background sampling
 # Mirrors tools/v3 daytime pipeline negative patch generator.py defaults.
@@ -515,6 +522,10 @@ def _auto_generate_background_train_annotations(
     out: List[Annotation] = []
     seen: Set[Tuple[int, int, int]] = set()  # (t,x,y)
     sampled = 0
+    blob_detection_enabled = True
+    slow_frames = 0
+    slow_s = float(AUTO_BACKGROUND_BLOB_DETECT_SLOW_FRAME_SECONDS)
+    disable_after = max(1, int(AUTO_BACKGROUND_BLOB_DETECT_DISABLE_AFTER_SLOW_FRAMES))
 
     pbar = (
         tqdm(total=int(n_needed), desc=f"[bg] {video_path.stem}", unit="patch", dynamic_ncols=True)
@@ -531,10 +542,24 @@ def _auto_generate_background_train_annotations(
         if not ok or frame_bgr is None:
             continue
 
-        centers = bpg.find_blob_centers(frame_bgr, blob_cfg=blob_cfg, pre_cfg=pre_cfg)
+        centers = []
+        if blob_detection_enabled:
+            t0 = time.time()
+            centers = bpg.find_blob_centers(frame_bgr, blob_cfg=blob_cfg, pre_cfg=pre_cfg)
+            dt = float(time.time() - t0)
+            if slow_s > 0.0 and dt >= slow_s:
+                slow_frames += 1
+                if slow_frames >= disable_after and bool(AUTO_BACKGROUND_FALLBACK_RANDOM_CENTERS):
+                    blob_detection_enabled = False
+                    print(
+                        "[bg] INFO: blob detection is slow; disabling blob detector and using random centers only:",
+                        f"dt={dt:.2f}s threshold={slow_s:.2f}s slow_frames={slow_frames}/{disable_after}",
+                    )
         if centers:
-            rng.shuffle(centers)
-            centers = centers[:max_per_frame]
+            if len(centers) > max_per_frame:
+                centers = rng.sample(centers, k=max_per_frame)
+            else:
+                rng.shuffle(centers)
         else:
             if not AUTO_BACKGROUND_FALLBACK_RANDOM_CENTERS:
                 continue

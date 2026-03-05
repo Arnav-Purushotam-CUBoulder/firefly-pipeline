@@ -16,6 +16,7 @@ log size realistic.
 """
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -61,6 +62,11 @@ AUTO_BACKGROUND_MAX_PATCHES_PER_FRAME: int = 10
 AUTO_BACKGROUND_MAX_FRAME_SAMPLES: int = 5000
 AUTO_BACKGROUND_SEED: int = 1337
 AUTO_BACKGROUND_FALLBACK_RANDOM_CENTERS: bool = True
+
+# Safety/performance: blob detection can be very slow on high-res videos. If it is too slow,
+# stage1_ingestor_core will disable blob detection and fall back to random centers only.
+AUTO_BACKGROUND_BLOB_DETECT_SLOW_FRAME_SECONDS: float = 2.0
+AUTO_BACKGROUND_BLOB_DETECT_DISABLE_AFTER_SLOW_FRAMES: int = 1
 
 AUTO_BACKGROUND_SBD_MIN_AREA_PX: float = 0.5
 AUTO_BACKGROUND_SBD_MAX_AREA_SCALE: float = 1.0
@@ -178,6 +184,40 @@ def _iter_species_dirs(raw_root: Path) -> List[Path]:
     return dirs
 
 
+def _dir_has_any_files(d: Path) -> bool:
+    """
+    Return True if directory tree contains at least one regular file.
+    Used to ignore placeholder/empty species folders.
+    """
+    d = Path(d)
+    try:
+        if not d.exists() or (not d.is_dir()):
+            return False
+    except Exception:
+        return False
+
+    try:
+        stack = [d]
+        while stack:
+            cur = stack.pop()
+            try:
+                with os.scandir(cur) as it:
+                    for e in it:
+                        try:
+                            if e.is_file(follow_symlinks=False):
+                                return True
+                            if e.is_dir(follow_symlinks=False):
+                                stack.append(Path(e.path))
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+    except Exception:
+        # If we can't scan, assume there might be data and let downstream discovery decide.
+        return True
+    return False
+
+
 def _species_already_ingested(*, data_root: Path, species_token: str) -> bool:
     import orchestrator as orch  # local import (same folder)
 
@@ -217,6 +257,8 @@ def _scaler_overrides() -> Dict[str, Any]:
         "AUTO_BACKGROUND_MAX_FRAME_SAMPLES": int(AUTO_BACKGROUND_MAX_FRAME_SAMPLES),
         "AUTO_BACKGROUND_SEED": int(AUTO_BACKGROUND_SEED),
         "AUTO_BACKGROUND_FALLBACK_RANDOM_CENTERS": bool(AUTO_BACKGROUND_FALLBACK_RANDOM_CENTERS),
+        "AUTO_BACKGROUND_BLOB_DETECT_SLOW_FRAME_SECONDS": float(AUTO_BACKGROUND_BLOB_DETECT_SLOW_FRAME_SECONDS),
+        "AUTO_BACKGROUND_BLOB_DETECT_DISABLE_AFTER_SLOW_FRAMES": int(AUTO_BACKGROUND_BLOB_DETECT_DISABLE_AFTER_SLOW_FRAMES),
         "AUTO_BACKGROUND_SBD_MIN_AREA_PX": float(AUTO_BACKGROUND_SBD_MIN_AREA_PX),
         "AUTO_BACKGROUND_SBD_MAX_AREA_SCALE": float(AUTO_BACKGROUND_SBD_MAX_AREA_SCALE),
         "AUTO_BACKGROUND_SBD_MIN_DIST": float(AUTO_BACKGROUND_SBD_MIN_DIST),
@@ -489,6 +531,10 @@ def main(argv: List[str] | None = None) -> int:
     skipped: List[str] = []
 
     for sp_dir in raw_species_dirs:
+        if not _dir_has_any_files(sp_dir):
+            skipped.append(f"Skipping raw species dir {sp_dir.name!r}: raw species dir is empty")
+            continue
+
         try:
             video_type, base_species_name = _parse_video_type_and_base_species_name(sp_dir.name)
             token = _normalize_species_token(sp_dir.name, base_name=base_species_name)

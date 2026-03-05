@@ -18,9 +18,9 @@ models sequentially.
 Expected dataset layout (per species)
 ------------------------------------
 <datasets_dir>/<species>/<version>/final dataset/
-  train/{firefly,background}/*.png
-  val/{firefly,background}/*.png
-  test/{firefly,background}/*.png
+  train/{background,firefly}/*.png
+  val/{background,firefly}/*.png
+  test/{background,firefly}/*.png
 
 The script auto-discovers species under --datasets-dir (or <root>/datasets or
 <root> as a fallback) and picks the newest "final dataset" per species.
@@ -41,9 +41,40 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-DEFAULT_CLASS_NAMES = ("firefly", "background")
+# Keep class index mapping aligned with legacy pipelines:
+#   background -> 0, firefly -> 1
+DEFAULT_CLASS_NAMES = ("background", "firefly")
 DEFAULT_FINAL_DATASET_DIRNAME = "final dataset"
 SPLITS = ("train", "val", "test")
+
+
+class RandomRotate90:
+    """Picklable 0/90/180/270° rotation for DataLoader worker processes."""
+
+    def __call__(self, img):  # noqa: ANN001
+        # PIL.Image.Image.rotate preserves input size unless expand=True.
+        return img.rotate(random.choice([0, 90, 180, 270]))
+
+
+class ImagePathDataset:
+    """Picklable map-style dataset of (image_path, label)."""
+
+    def __init__(self, samples: Sequence[Tuple[Path, int, str]], tfm):  # noqa: ANN001
+        self.samples = list(samples)
+        self.tfm = tfm
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, i: int):  # noqa: ANN001
+        p, y, _sp = self.samples[i]
+        from PIL import Image  # type: ignore
+
+        with Image.open(p) as im:  # type: ignore[attr-defined]
+            im = im.convert("RGB")
+        if self.tfm is not None:
+            im = self.tfm(im)
+        return im, int(y)
 
 
 def _now() -> str:
@@ -399,18 +430,13 @@ def _train_one_job(
     import torch
     import torch.nn as nn
     import torch.optim as optim
-    from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+    from torch.utils.data import DataLoader, WeightedRandomSampler
     from torchvision import models, transforms
-    import torchvision.transforms.functional as F
 
     try:
-        from PIL import Image  # type: ignore
+        from PIL import Image  # type: ignore  # noqa: F401
     except Exception as e:
         raise RuntimeError(f"Pillow is required to train (PIL import failed): {e}") from e
-
-    class RandomRotate90:
-        def __call__(self, img):  # noqa: ANN001
-            return F.rotate(img, random.choice([0, 90, 180, 270]))
 
     def build_resnet(name: str, num_classes: int = 2) -> nn.Module:
         resnet_fns = {
@@ -427,22 +453,6 @@ def _train_one_job(
         nn.init.xavier_uniform_(net.fc.weight)
         nn.init.zeros_(net.fc.bias)
         return net
-
-    class ImagePathDataset(Dataset):
-        def __init__(self, samples: Sequence[Tuple[Path, int, str]], tfm):  # noqa: ANN001
-            self.samples = list(samples)
-            self.tfm = tfm
-
-        def __len__(self) -> int:
-            return len(self.samples)
-
-        def __getitem__(self, i: int):  # noqa: ANN001
-            p, y, _sp = self.samples[i]
-            with Image.open(p) as im:  # type: ignore[attr-defined]
-                im = im.convert("RGB")
-            if self.tfm is not None:
-                im = self.tfm(im)
-            return im, int(y)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = out_dir / "checkpoints"
@@ -852,6 +862,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Optional output dir (defaults to <root>/outputs).",
     )
     ap.add_argument("--gpus", type=int, default=1, help="How many GPUs to use concurrently (default: 1).")
+    ap.add_argument(
+        "--allow-gpu-oversubscribe",
+        action="store_true",
+        help=(
+            "Allow more concurrent workers than visible GPUs by round-robin assigning workers to GPUs. "
+            "Useful for local experiments (e.g., 2 trainings on 1 GPU), but may OOM or be slower."
+        ),
+    )
     ap.add_argument("--dry-run", action="store_true", help="Print discovered species/jobs/GPU info and exit.")
     ap.add_argument("--list-jobs", action="store_true", help="List planned jobs (and their indices) and exit.")
     ap.add_argument("--job", type=str, default="", help="Run only a single job by name (use --list-jobs).")
@@ -915,10 +933,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("[main] WARNING: requested GPUs but CUDA not available; running on CPU sequentially.")
         worker_gpus: List[Optional[int]] = [None]
     else:
-        use = min(requested_gpus, visible_gpu_count) if requested_gpus > 0 else 1
-        if requested_gpus > visible_gpu_count:
-            print(f"[main] WARNING: requested {requested_gpus} GPU(s) but only {visible_gpu_count} visible; using {use}.")
-        worker_gpus = list(range(use))
+        desired_workers = requested_gpus if requested_gpus > 0 else 1
+        if desired_workers <= visible_gpu_count:
+            worker_gpus = list(range(desired_workers))
+        else:
+            if bool(args.allow_gpu_oversubscribe):
+                worker_gpus = [int(i % visible_gpu_count) for i in range(desired_workers)]
+                print(
+                    f"[main] WARNING: requested {desired_workers} worker(s) but only {visible_gpu_count} GPU(s) visible; "
+                    f"oversubscribing GPUs (round-robin) → {worker_gpus}"
+                )
+            else:
+                worker_gpus = list(range(visible_gpu_count))
+                print(
+                    f"[main] WARNING: requested {desired_workers} GPU(s) but only {visible_gpu_count} visible; "
+                    f"using {visible_gpu_count}."
+                )
 
     # discover species
     species_dirs = _discover_species_dirs(datasets_dir)

@@ -28,11 +28,15 @@ NIGHT_OUTPUT_SUBDIR: str = "night_time_pipeline"
 FORCE_ALL_FRAMES: bool = True           # overrides MAX_FRAMES -> None
 FORCE_START_FROM_FRAME_0: bool = True  # overrides start/offset params -> 0 when present
 
-# Average brightness (0–255) computed from the first BRIGHTNESS_NUM_FRAMES frames.
-# brightness < threshold  -> night pipeline
-# brightness >= threshold -> day pipeline
-BRIGHTNESS_THRESHOLD: float = 10.0
-BRIGHTNESS_NUM_FRAMES: int = 10
+# Route selection (brightness routing is disabled).
+# Priority:
+#   1) --route-override (CLI)
+#   2) day/night tokens in the video path
+#   3) ROUTE_DEFAULT unless REQUIRE_EXPLICIT_ROUTE=True
+ROUTE_NAME_HINT_DAY_TOKENS: tuple[str, ...] = ("day", "daytime", "day_time")
+ROUTE_NAME_HINT_NIGHT_TOKENS: tuple[str, ...] = ("night", "nighttime", "night_time")
+ROUTE_DEFAULT: str = "night"
+REQUIRE_EXPLICIT_ROUTE: bool = False
 
 # Folder ingestion behavior
 RECURSIVE: bool = False
@@ -96,35 +100,36 @@ def _iter_videos(input_path: Path, *, recursive: bool) -> list[Path]:
     return sorted(vids)
 
 
-def _avg_brightness_first_frames(video_path: Path, *, num_frames: int) -> float:
-    try:
-        import cv2  # type: ignore
-    except Exception as exc:  # pragma: no cover
+_ROUTE_WARNED_DEFAULT_DIRS: set[str] = set()
+
+
+def _route_hint_from_video_path(video_path: Path) -> str | None:
+    token_src = str(video_path).lower()
+    has_day = any(tok in token_src for tok in ROUTE_NAME_HINT_DAY_TOKENS)
+    has_night = any(tok in token_src for tok in ROUTE_NAME_HINT_NIGHT_TOKENS)
+    if has_day and has_night:
+        raise RuntimeError(f"Conflicting day/night tokens in video path: {video_path}")
+    if has_day:
+        return "day"
+    if has_night:
+        return "night"
+    return None
+
+
+def _infer_route_for_video(video_path: Path) -> str:
+    hint = _route_hint_from_video_path(video_path)
+    if hint is not None:
+        return hint
+    if REQUIRE_EXPLICIT_ROUTE:
         raise RuntimeError(
-            "OpenCV is required for brightness routing. Install `opencv-python` (or ensure cv2 is importable)."
-        ) from exc
-
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
-
-    brightness_vals: list[float] = []
-    try:
-        for _ in range(max(1, int(num_frames))):
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if frame is None:
-                continue
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            brightness_vals.append(float(gray.mean()))
-    finally:
-        cap.release()
-
-    if not brightness_vals:
-        raise RuntimeError(f"Could not read any frames from: {video_path}")
-
-    return sum(brightness_vals) / len(brightness_vals)
+            f"No route tokens found in video path: {video_path}. "
+            "Pass --route-override or rename path to include day/night token."
+        )
+    key = str(video_path.parent)
+    if key not in _ROUTE_WARNED_DEFAULT_DIRS:
+        print(f"[gateway] WARNING: route unresolved for {video_path}; defaulting to '{ROUTE_DEFAULT}'.")
+        _ROUTE_WARNED_DEFAULT_DIRS.add(key)
+    return str(ROUTE_DEFAULT).strip().lower()
 
 
 def _run_subprocess_python(code: str, *, cwd: Path) -> int:
@@ -355,7 +360,7 @@ def _start_night_pipeline(
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Routes videos to day/night pipelines based on brightness.")
+    p = argparse.ArgumentParser(description="Routes videos to day/night pipelines (name-based + optional override).")
     p.add_argument("--input", type=str, default=str(INPUT_PATH) if INPUT_PATH else "", help="Video file or folder.")
     p.add_argument(
         "--output-root",
@@ -363,8 +368,25 @@ def _parse_args() -> argparse.Namespace:
         default=str(OUTPUT_ROOT) if OUTPUT_ROOT else "",
         help="Base output folder for pipeline outputs (written into day/night subfolders).",
     )
-    p.add_argument("--threshold", type=float, default=float(BRIGHTNESS_THRESHOLD), help="Brightness threshold (0–255).")
-    p.add_argument("--frames", type=int, default=int(BRIGHTNESS_NUM_FRAMES), help="Frames to sample for brightness.")
+    p.add_argument(
+        "--route-override",
+        type=str,
+        choices=["day", "night"],
+        default="",
+        help="Force all input videos to this route; disables auto route inference.",
+    )
+    p.add_argument(
+        "--threshold",
+        type=float,
+        default=10.0,
+        help="Deprecated and ignored (brightness routing disabled).",
+    )
+    p.add_argument(
+        "--frames",
+        type=int,
+        default=10,
+        help="Deprecated and ignored (brightness routing disabled).",
+    )
     p.add_argument(
         "--day-patch-model",
         type=str,
@@ -457,18 +479,23 @@ def main() -> int:
             raise SystemExit(f"--night-cnn-model not found: {night_cnn_model}")
 
     force_tests = bool(getattr(args, "force_tests", False))
+    route_override = str(getattr(args, "route_override", "") or "").strip().lower() or None
+    if route_override is not None and route_override not in {"day", "night"}:
+        raise SystemExit("--route-override must be one of: day, night")
 
     try:
         for video in videos:
             try:
-                b = _avg_brightness_first_frames(video, num_frames=int(args.frames))
+                if route_override is not None:
+                    route = route_override
+                    print(f"[gateway] {video.name}  route_override={route}")
+                else:
+                    route = _infer_route_for_video(video)
+                    print(f"[gateway] {video.name}  route_from_name={route}")
             except Exception as exc:
-                print(f"[gateway] ERROR reading {video}: {exc}")
+                print(f"[gateway] ERROR routing {video}: {exc}")
                 failures.append((video, 2))
                 continue
-
-            route = "night" if b < float(args.threshold) else "day"
-            print(f"[gateway] {video.name}  brightness={b:.2f}  ->  {route}")
 
             if bool(args.dry_run):
                 continue

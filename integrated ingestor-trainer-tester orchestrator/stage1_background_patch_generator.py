@@ -32,6 +32,12 @@ class BlobDetectorConfig:
     max_area_scale: float = 1.0  # fraction of frame area allowed (<=0 => no upper bound)
     min_dist_px: float = 0.25
     min_repeat: int = 1
+    # Performance knobs:
+    # SimpleBlobDetector thresholds from min_threshold..max_threshold in steps of threshold_step.
+    # Smaller steps are slower on high-res frames.
+    min_threshold: int = 0
+    max_threshold: int = 255
+    threshold_step: int = 10
 
 
 @dataclass(frozen=True)
@@ -47,6 +53,14 @@ class PreprocessConfig:
     use_dog: bool = False
     dog_sigma1: float = 0.8
     dog_sigma2: float = 1.6
+    # Downscale frames before blob detection (speeds up large videos a lot).
+    # None disables downscaling.
+    downscale_max_dim: int | None = 960
+
+
+# Best-effort caches (avoid re-creating OpenCV objects per frame)
+_DETECTOR_CACHE: dict[tuple, object] = {}
+_CLAHE_CACHE: dict[tuple, object] = {}
 
 
 def _make_blob_detector(*, cfg: BlobDetectorConfig, frame_w: int, frame_h: int):
@@ -65,9 +79,9 @@ def _make_blob_detector(*, cfg: BlobDetectorConfig, frame_w: int, frame_h: int):
     p.filterByConvexity = False
     p.filterByInertia = False
 
-    p.minThreshold = 0
-    p.maxThreshold = 255
-    p.thresholdStep = 1
+    p.minThreshold = int(cfg.min_threshold)
+    p.maxThreshold = int(cfg.max_threshold)
+    p.thresholdStep = max(1, int(cfg.threshold_step))
     p.minRepeatability = int(cfg.min_repeat)
     p.minDistBetweenBlobs = float(cfg.min_dist_px)
     return cv2.SimpleBlobDetector_create(p)
@@ -76,7 +90,11 @@ def _make_blob_detector(*, cfg: BlobDetectorConfig, frame_w: int, frame_h: int):
 def _preprocess(gray_u8: np.ndarray, *, cfg: PreprocessConfig) -> np.ndarray:
     inp = gray_u8
     if cfg.use_clahe:
-        clahe = cv2.createCLAHE(clipLimit=float(cfg.clahe_clip), tileGridSize=tuple(cfg.clahe_tile))
+        key = (float(cfg.clahe_clip), int(cfg.clahe_tile[0]), int(cfg.clahe_tile[1]))
+        clahe = _CLAHE_CACHE.get(key)
+        if clahe is None:
+            clahe = cv2.createCLAHE(clipLimit=float(cfg.clahe_clip), tileGridSize=tuple(cfg.clahe_tile))
+            _CLAHE_CACHE[key] = clahe
         inp = clahe.apply(inp)
     if cfg.use_tophat:
         ksize = int(cfg.tophat_ksize)
@@ -103,12 +121,44 @@ def find_blob_centers(
     if h <= 0 or w <= 0:
         return []
 
+    scale = 1.0
+    max_dim = pre_cfg.downscale_max_dim
+    if max_dim is not None:
+        try:
+            max_dim_i = int(max_dim)
+        except Exception:
+            max_dim_i = 0
+        if max_dim_i > 0 and max(h, w) > max_dim_i:
+            scale = float(max_dim_i) / float(max(h, w))
+            nh = max(1, int(round(float(h) * scale)))
+            nw = max(1, int(round(float(w) * scale)))
+            frame_bgr = cv2.resize(frame_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+            h, w = frame_bgr.shape[:2]
+
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     proc = _preprocess(gray, cfg=pre_cfg)
-    detector = _make_blob_detector(cfg=blob_cfg, frame_w=w, frame_h=h)
+
+    det_key = (
+        float(blob_cfg.min_area_px),
+        float(blob_cfg.max_area_scale),
+        float(blob_cfg.min_dist_px),
+        int(blob_cfg.min_repeat),
+        int(blob_cfg.min_threshold),
+        int(blob_cfg.max_threshold),
+        int(blob_cfg.threshold_step),
+        int(w),
+        int(h),
+    )
+    detector = _DETECTOR_CACHE.get(det_key)
+    if detector is None:
+        detector = _make_blob_detector(cfg=blob_cfg, frame_w=w, frame_h=h)
+        _DETECTOR_CACHE[det_key] = detector
+
     keypoints = detector.detect(proc)
     centers: List[Tuple[int, int]] = []
     for kp in keypoints:
         cx, cy = kp.pt
+        if scale != 1.0:
+            cx, cy = (float(cx) / scale), (float(cy) / scale)
         centers.append((int(round(cx)), int(round(cy))))
     return centers

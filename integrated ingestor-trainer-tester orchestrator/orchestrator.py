@@ -102,6 +102,11 @@ AUTO_BACKGROUND_MAX_FRAME_SAMPLES: int = 5000
 AUTO_BACKGROUND_SEED: int = 1337
 AUTO_BACKGROUND_FALLBACK_RANDOM_CENTERS: bool = True
 
+# Safety/performance: blob detection can be very slow on high-res videos. If it is too slow,
+# stage1_ingestor_core will disable blob detection and fall back to random centers only.
+AUTO_BACKGROUND_BLOB_DETECT_SLOW_FRAME_SECONDS: float = 2.0
+AUTO_BACKGROUND_BLOB_DETECT_DISABLE_AFTER_SLOW_FRAMES: int = 1
+
 AUTO_BACKGROUND_SBD_MIN_AREA_PX: float = 0.5
 AUTO_BACKGROUND_SBD_MAX_AREA_SCALE: float = 1.0
 AUTO_BACKGROUND_SBD_MIN_DIST: float = 0.25
@@ -229,11 +234,72 @@ MODEL_ZOO_VIDEO_REGISTRY_SNAPSHOT_PREFIX = "video_registry"
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".ppm", ".pgm"}
 
+# -----------------------------------------------------------------------------
+# Change log exit/error tracking (so atexit can record real failures)
+# -----------------------------------------------------------------------------
+
+_CODEX_CHANGELOG_RUN: ChangeLogRun | None = None
+_CODEX_CHANGELOG_EXC_INFO: tuple[type[BaseException] | None, BaseException | None, Any | None] = (None, None, None)
+
+
+def _codex_set_changelog_exc_info(
+    exc_type: type[BaseException] | None,
+    exc: BaseException | None,
+    tb: Any | None,
+) -> None:
+    global _CODEX_CHANGELOG_EXC_INFO
+    _CODEX_CHANGELOG_EXC_INFO = (exc_type, exc, tb)
+
+
+def _codex_close_changelog() -> None:
+    run = _CODEX_CHANGELOG_RUN
+    if run is None:
+        return
+    exc_type, exc, tb = _CODEX_CHANGELOG_EXC_INFO
+    try:
+        run.__exit__(exc_type, exc, tb)
+    except Exception:
+        return
+
 
 def _count_images_in_dir(d: Path) -> int:
     if not d.exists():
         return 0
     return sum(1 for p in d.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+
+
+def _dir_has_any_files(d: Path) -> bool:
+    """
+    Return True if directory tree contains at least one regular file.
+    Used to ignore placeholder/empty observed dirs.
+    """
+    d = Path(d)
+    try:
+        if not d.exists() or (not d.is_dir()):
+            return False
+    except Exception:
+        return False
+
+    try:
+        stack = [d]
+        while stack:
+            cur = stack.pop()
+            try:
+                with os.scandir(cur) as it:
+                    for e in it:
+                        try:
+                            if e.is_file(follow_symlinks=False):
+                                return True
+                            if e.is_dir(follow_symlinks=False):
+                                stack.append(Path(e.path))
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+    except Exception:
+        # If we can't scan, assume there might be data and let stage1 discovery decide.
+        return True
+    return False
 
 def _infer_repo_layout(this_file: Path) -> Tuple[Path, Path]:
     """
@@ -1607,6 +1673,7 @@ def _run_gateway(
     max_concurrent: int,
     force_tests: bool,
     dry_run: bool,
+    route_override: str | None = None,
 ) -> None:
     cmd = [
         sys.executable,
@@ -1628,6 +1695,8 @@ def _run_gateway(
         cmd += ["--night-cnn-model", str(night_cnn_model)]
     if force_tests:
         cmd.append("--force-tests")
+    if route_override is not None:
+        cmd += ["--route-override", str(route_override)]
 
     if dry_run:
         print("[dry-run] Would run gateway:", " ".join(cmd))
@@ -1965,6 +2034,9 @@ def main() -> int:
     if not observed_dir_arg:
         raise SystemExit("Pass --observed-dir (or set OBSERVED_DATA_DIR at top of file).")
     observed_dir = Path(observed_dir_arg).expanduser().resolve()
+    if observed_dir.exists() and observed_dir.is_dir() and (not _dir_has_any_files(observed_dir)):
+        print(f"[orchestrator] Nothing to do: observed_dir is empty: {observed_dir}")
+        return 0
 
     video_type = str(args.type_of_video or TYPE_OF_VIDEO)
     try:
@@ -2023,11 +2095,13 @@ def main() -> int:
             cfg = SnapshotConfig(root=root, scopes=scopes)
             changelog_run = ChangeLogRun(cfg=cfg, log_path=log_path, meta=changelog_meta, enabled=True)
             changelog_run.__enter__()
+            global _CODEX_CHANGELOG_RUN
+            _CODEX_CHANGELOG_RUN = changelog_run
             print(f"[orchestrator] Change log → {log_path}")
             try:
                 import atexit
 
-                atexit.register(changelog_run.__exit__, None, None, None)
+                atexit.register(_codex_close_changelog)
             except Exception:
                 pass
         except Exception:
@@ -2174,36 +2248,6 @@ def main() -> int:
     if skip_test:
         print("[orchestrator] Skipping Stage 3 testing (--skip-test).")
 
-    # Ingestion metadata for downstream incremental runs (stored in the centralized change log).
-    if not skip_ingest:
-        try:
-            ingested_pairs_meta: List[Dict[str, Any]] = []
-            for p in train_pairs:
-                ingested_pairs_meta.append(
-                    {
-                        "species_token": str(species_name),
-                        "video_name": str(p.video_name),
-                        "video_path": str(p.video_path),
-                        "firefly_csv": str(p.firefly_csv),
-                        "background_csv": str(p.background_csv) if p.background_csv else None,
-                        "split": "train",
-                    }
-                )
-            for p in val_pairs:
-                ingested_pairs_meta.append(
-                    {
-                        "species_token": str(species_name),
-                        "video_name": str(p.video_name),
-                        "video_path": str(p.video_path),
-                        "firefly_csv": str(p.firefly_csv),
-                        "background_csv": str(p.background_csv) if p.background_csv else None,
-                        "split": "validation",
-                    }
-                )
-            changelog_meta["ingested_pairs"] = ingested_pairs_meta
-        except Exception:
-            pass
-
     zoo = _ensure_model_zoo_scaffold(model_root)
     results_history_dir = zoo["results_history_dir"]
     legacy_results_history_file = zoo["legacy_results_history_file"]
@@ -2254,6 +2298,8 @@ def main() -> int:
             "AUTO_BACKGROUND_MAX_FRAME_SAMPLES": int(AUTO_BACKGROUND_MAX_FRAME_SAMPLES),
             "AUTO_BACKGROUND_SEED": int(AUTO_BACKGROUND_SEED),
             "AUTO_BACKGROUND_FALLBACK_RANDOM_CENTERS": bool(AUTO_BACKGROUND_FALLBACK_RANDOM_CENTERS),
+            "AUTO_BACKGROUND_BLOB_DETECT_SLOW_FRAME_SECONDS": float(AUTO_BACKGROUND_BLOB_DETECT_SLOW_FRAME_SECONDS),
+            "AUTO_BACKGROUND_BLOB_DETECT_DISABLE_AFTER_SLOW_FRAMES": int(AUTO_BACKGROUND_BLOB_DETECT_DISABLE_AFTER_SLOW_FRAMES),
             # SBD + preprocessing
             "AUTO_BACKGROUND_SBD_MIN_AREA_PX": float(AUTO_BACKGROUND_SBD_MIN_AREA_PX),
             "AUTO_BACKGROUND_SBD_MAX_AREA_SCALE": float(AUTO_BACKGROUND_SBD_MAX_AREA_SCALE),
@@ -2400,6 +2446,38 @@ def main() -> int:
         raise SystemExit(f"Integrated dataset version not found under: {integrated_root}")
     if single_ver is None:
         raise SystemExit(f"Single-species dataset version not found under: {single_root}")
+
+    # Ingestion metadata for downstream incremental runs (stored in the centralized change log).
+    # NOTE: This is written only after Stage 1 has completed successfully, so downstream
+    # automation can treat it as "ingested" truth even if later stages fail.
+    if not skip_ingest:
+        try:
+            ingested_pairs_meta: List[Dict[str, Any]] = []
+            for p in train_pairs:
+                ingested_pairs_meta.append(
+                    {
+                        "species_token": str(species_name),
+                        "video_name": str(p.video_name),
+                        "video_path": str(p.video_path),
+                        "firefly_csv": str(p.firefly_csv),
+                        "background_csv": str(p.background_csv) if p.background_csv else None,
+                        "split": "train",
+                    }
+                )
+            for p in val_pairs:
+                ingested_pairs_meta.append(
+                    {
+                        "species_token": str(species_name),
+                        "video_name": str(p.video_name),
+                        "video_path": str(p.video_path),
+                        "firefly_csv": str(p.firefly_csv),
+                        "background_csv": str(p.background_csv) if p.background_csv else None,
+                        "split": "validation",
+                    }
+                )
+            changelog_meta["ingested_pairs"] = ingested_pairs_meta
+        except Exception:
+            pass
 
     dataset_time_dir = "day_time_dataset" if time_of_day == "day_time" else "night_time_dataset"
     global_data_dir = integrated_ver / dataset_time_dir / "final dataset"
@@ -3344,4 +3422,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit as e:
+        # Treat non-zero / message exits as failures for the changelog record.
+        if e.code not in (None, 0):
+            _codex_set_changelog_exc_info(*sys.exc_info())
+        raise
+    except BaseException:
+        _codex_set_changelog_exc_info(*sys.exc_info())
+        raise

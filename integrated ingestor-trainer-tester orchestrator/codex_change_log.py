@@ -516,12 +516,17 @@ def build_ingestion_index(log_path: Path) -> Dict[str, Dict[str, Dict[str, Any]]
       ]
 
     Returns a dict keyed by species_token (or species_name), then video_name.
+
+    Notes
+    -----
+    - We intentionally do NOT discard records where `had_error=true`. In the integrated orchestrator,
+      Stage 1 ingestion may succeed even if later stages (train/test) fail; those ingested videos
+      should still be considered ingested to prevent duplicate re-ingestion.
     """
     out: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for rec in iter_change_log_records(log_path):
         try:
-            if bool(rec.get("had_error")):
-                continue
+            had_error = bool(rec.get("had_error"))
             meta = rec.get("meta")
             if not isinstance(meta, dict):
                 continue
@@ -562,7 +567,7 @@ def build_ingestion_index(log_path: Path) -> Dict[str, Dict[str, Dict[str, Any]]
                 if not species_token or not video_name:
                     continue
 
-                info: Dict[str, Any] = {"timestamp": ts, "actor": actor}
+                info: Dict[str, Any] = {"timestamp": ts, "actor": actor, "had_error": bool(had_error)}
                 split = payload.get("split")
                 if split is not None:
                     info["split"] = split

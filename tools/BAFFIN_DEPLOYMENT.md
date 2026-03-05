@@ -72,13 +72,15 @@ module unload <pkg>
 
 They show an example Python module: `module load python/3.14.2`.
 
+Note: for ML/PyTorch workflows, you must use a Python version that PyTorch provides wheels for (commonly 3.10/3.11/3.12). The docs show `python/3.14.2` as an example module, but if `pip install torch ...` fails with “No matching distribution found”, switch to an older Python module and recreate your venv.
+
 ## Python virtual environments
 
 From the “Virtual Environments: Python” PDF:
 
 1) Start an **interactive** Slurm session (don’t build envs on login nodes).
 
-2) Load a Python module:
+2) Load a Python module (pick a version compatible with your packages; PyTorch usually requires 3.10–3.12):
 
 ```bash
 module load python/3.14.2
