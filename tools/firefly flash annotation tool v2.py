@@ -40,11 +40,12 @@ def _basename(p: str | Path) -> str:
 # ───────── global paths ─────────
 # Keep these pointing near your data; auto-load only if the paths exist.
 DEFAULT_VIDEO_PATH = (
-    '/Users/arnavps/Desktop/RA inference data/v3 daytime pipeline inference data/20240606_cam1_GS010064/original videos/20240606_cam1_GS010064.mp4'
+    '/Users/arnavps/Desktop/annotations corrections data/carolinus annotations corrections data/GS080005_s2607ic.mp4'
 )
 DEFAULT_CSV_FILE = (
-    '/Users/arnavps/Desktop/RA inference data/v3 daytime pipeline inference data/20240606_cam1_GS010064/ground truth csv/gt_20240606_cam1_GS010064.csv'
+    '/Users/arnavps/Desktop/annotations corrections data/carolinus annotations corrections data/Photinus_carolinus_s2607ic_2022_06_07_peleg-group-1_Fireflies_Citizen_Science_2022_tnc_20220607_OH_Pc_--_done_TNC_Ohio_GOPro_220607_Camera_1_4k_GS080005_s2607ic.csv'
 )
+DEFAULT_START_FRAME = None  # Set to a 0-based frame index to open there by default.
 
 BOX_SIZE = 10       # also used as hover patch size
 SEARCH_RADIUS = 30  # radius (in pixels) around click for brightest search
@@ -178,13 +179,17 @@ def load_video(p: str | Path) -> None:
 
     boxes = _load_boxes_from_csv()
 
-    # Choose start frame: first frame without any boxes, or last frame if all have boxes
-    start = 0
-    if total > 0:
-        start = next(
-            (i for i in range(total) if not boxes.get(i)),
-            total - 1,
-        )
+    # If configured, honor the requested default start frame; otherwise keep
+    # the existing behavior of jumping to the first unannotated frame.
+    if DEFAULT_START_FRAME is not None:
+        start = max(0, min(int(DEFAULT_START_FRAME), total - 1))
+    else:
+        start = 0
+        if total > 0:
+            start = next(
+                (i for i in range(total) if not boxes.get(i)),
+                total - 1,
+            )
 
     state.update(
         video_path=p,
