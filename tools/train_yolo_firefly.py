@@ -28,9 +28,12 @@ except Exception as e:  # pragma: no cover
 
 # ===================== Globals (edit these) =====================
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+YOLO_OUTPUT_ROOT = SCRIPT_DIR / "yolo_train_output_data"
+
 # Path to dataset root OR YAML (YOLOv8 format). If DATA_YAML is None,
 # the script expects to find 'data.yaml' inside DATASET_ROOT.
-DATASET_ROOT: Path | None = Path("/Users/arnavps/Downloads/streaks.v3i.yolov8")
+DATASET_ROOT: Path | None = None
 DATA_YAML: Path | None = None  # e.g., Path("/path/to/dataset/data.yaml")
 
 # Choose model family and size. Examples:
@@ -50,11 +53,11 @@ LR0 = 0.01  # initial learning rate; None to use default
 WEIGHT_DECAY = 0.0005
 
 # Where Ultralytics will put the run (project/name)
-PROJECT_DIR = Path("/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/background subtraction detection method/actual background subtraction code/forresti, fixing FPs and box overlap/Proof of concept code/test1/pyrallis_exp/raw long exposure exp/yolo train output data/runs_firefly")
+PROJECT_DIR = YOLO_OUTPUT_ROOT / "runs_firefly"
 RUN_NAME = f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 # Export a copy of the best weights to this path after training
-EXPORT_BEST_TO = Path("/Users/arnavps/Desktop/RA info/New Deep Learning project/TESTING_CODE/background subtraction detection method/actual background subtraction code/forresti, fixing FPs and box overlap/Proof of concept code/test1/pyrallis_exp/raw long exposure exp/yolo train output data/best models folder/v1_best_firefly_yolo.pt")
+EXPORT_BEST_TO = YOLO_OUTPUT_ROOT / "best_models" / "best_firefly_yolo.pt"
 
 # If True, delete previous run directory with same RUN_NAME before training
 CLEAR_EXISTING_RUN = False
