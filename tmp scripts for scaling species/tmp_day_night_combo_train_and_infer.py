@@ -54,6 +54,7 @@ RAW_VIDEOS_ROOT: Path = Path("/mnt/Samsung_SSD_2TB/integrated prototype raw vide
 RUNS_ROOT: Path = Path("/mnt/Samsung_SSD_2TB/temp to delete/firefly_patch_training_local_run")
 RUN_NAME_PREFIX: str = "tmp_day_night_combo_train_and_infer"
 FINAL_RESULTS_FILENAME: str = "final_results.csv"
+VIDEO_CATALOG_FILENAME: str = "tmp_scaling_species_training_inference_catalog.json"
 
 # -----------------------------------------------------------------------------
 # Run Component Switches (edit these first)
@@ -69,13 +70,32 @@ RUN_MODEL_TRAINING: bool = False
 # 3) Baseline methods (Lab + Raphael)
 # Set this True to run only baseline methods if day/night pipeline toggles below
 # are both False.
-RUN_BASELINE_METHODS_INFERENCE: bool = True
-RUN_LAB_BASELINE: bool = True
-RUN_RAPHAEL_BASELINE: bool = True
+RUN_BASELINE_METHODS_INFERENCE: bool = False
+RUN_LAB_BASELINE: bool = False
+RUN_RAPHAEL_BASELINE: bool = False
 
 # 4) Your pipeline inference (split by route)
 RUN_DAY_PIPELINE_INFERENCE: bool = False
 RUN_NIGHT_PIPELINE_INFERENCE: bool = True
+RUN_GLOBAL_MODEL_INFERENCE: bool = True
+RUN_LEAVEOUT_MODEL_INFERENCE: bool = False
+
+# Per-route species inference switches.
+# Only species with True are evaluated from the cataloged inference-only videos.
+# These switches are route-specific to make the day/night split explicit.
+DAY_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
+    "bicellonycha-wickershamorum": True,
+    "photinus-acuminatus": True,
+    "photuris-bethaniensis": True,
+}
+
+NIGHT_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
+    "forresti": False,
+    "frontalis": False,
+    "photinus-carolinus": False,
+    "photinus-knulli": True,
+    "tremulans": False,
+}
 
 # Optional explicit model root when RUN_MODEL_TRAINING=False.
 # Expected layout:
@@ -569,6 +589,196 @@ def _discover_training_sources_by_route() -> Dict[str, List[SourceSpec]]:
     return out
 
 
+def _read_video_stems_from_patch_locations(csv_path: Path) -> List[str]:
+    if not csv_path.exists():
+        return []
+    out: set[str] = set()
+    with csv_path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            return []
+        cols = {str(c).strip().lower(): c for c in reader.fieldnames}
+        vn_col = cols.get("video_name")
+        if not vn_col:
+            return []
+        for row in reader:
+            stem = _normalize_video_stem(row.get(vn_col))
+            if stem:
+                out.add(stem)
+    return sorted(out)
+
+
+def _collect_training_video_stems_for_source(source: SourceSpec) -> Dict[str, Any]:
+    version_dir = Path(source.path).resolve().parent
+    csv_paths = sorted(version_dir.glob("patch_locations*.csv"))
+    stems: set[str] = set()
+    used_csvs: List[str] = []
+    for csv_path in csv_paths:
+        csv_stems = _read_video_stems_from_patch_locations(csv_path)
+        if not csv_stems:
+            continue
+        stems.update(csv_stems)
+        used_csvs.append(str(csv_path))
+    return {
+        "species_name": source.species_name,
+        "route": source.route,
+        "dataset_version_dir": str(version_dir),
+        "patch_location_csvs": used_csvs,
+        "video_stems": sorted(stems),
+    }
+
+
+def _build_training_inference_catalog(
+    *,
+    raw_root: Path,
+    known_species: Sequence[str],
+    sources_by_route: Dict[str, List[SourceSpec]],
+) -> Dict[str, Any]:
+    species_training_stems: Dict[str, set[str]] = {}
+    source_records: List[Dict[str, Any]] = []
+    for route_name in ("day", "night"):
+        for source in list(sources_by_route.get(route_name) or []):
+            rec = _collect_training_video_stems_for_source(source)
+            source_records.append(rec)
+            stems = species_training_stems.setdefault(source.species_name, set())
+            stems.update(str(s) for s in rec.get("video_stems") or [])
+
+    all_training_stems = {stem for stems in species_training_stems.values() for stem in stems}
+    catalog_entries: List[Dict[str, str]] = []
+    matched_training_stems: Dict[str, set[str]] = {sp: set() for sp in species_training_stems}
+
+    for vp in _iter_video_files(raw_root):
+        species_name = _infer_species_from_path(vp, known_species)
+        route = _route_for_item(
+            species_name=species_name,
+            video_stem=vp.stem,
+            text_for_hint=str(vp),
+        )
+        stem = vp.stem
+        is_training = False
+        if species_name and stem in species_training_stems.get(species_name, set()):
+            is_training = True
+            matched_training_stems.setdefault(species_name, set()).add(stem)
+        elif stem in all_training_stems:
+            is_training = True
+
+        catalog_entries.append(
+            {
+                "video_path": str(vp),
+                "video_name": str(vp.name),
+                "video_stem": str(stem),
+                "species_name": str(species_name or ""),
+                "route": str(route),
+                "category": ("training" if is_training else "inference"),
+            }
+        )
+
+    by_species: Dict[str, Dict[str, Any]] = {}
+    for species_name, stems in species_training_stems.items():
+        training_entries = [
+            e for e in catalog_entries if e.get("species_name") == species_name and e.get("category") == "training"
+        ]
+        inference_entries = [
+            e for e in catalog_entries if e.get("species_name") == species_name and e.get("category") == "inference"
+        ]
+        by_species[species_name] = {
+            "training_video_stems_from_dataset": sorted(stems),
+            "matched_training_video_paths": sorted(e["video_path"] for e in training_entries),
+            "inference_video_paths": sorted(e["video_path"] for e in inference_entries),
+            "n_training_videos": int(len(training_entries)),
+            "n_inference_videos": int(len(inference_entries)),
+            "unmatched_training_video_stems": sorted(stems - matched_training_stems.get(species_name, set())),
+        }
+
+    by_route: Dict[str, Dict[str, int]] = {
+        "day": {"training": 0, "inference": 0},
+        "night": {"training": 0, "inference": 0},
+    }
+    for entry in catalog_entries:
+        route = str(entry.get("route") or "")
+        category = str(entry.get("category") or "")
+        if route in by_route and category in by_route[route]:
+            by_route[route][category] += 1
+
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "raw_videos_root": str(raw_root),
+        "catalog_path": str(raw_root / VIDEO_CATALOG_FILENAME),
+        "sources": source_records,
+        "summary": {
+            "n_total_videos": int(len(catalog_entries)),
+            "n_training_videos": int(sum(1 for e in catalog_entries if e["category"] == "training")),
+            "n_inference_videos": int(sum(1 for e in catalog_entries if e["category"] == "inference")),
+            "by_route": by_route,
+        },
+        "by_species": by_species,
+        "videos": sorted(catalog_entries, key=lambda d: (d["category"], d["route"], d["species_name"], d["video_name"])),
+    }
+
+
+def _write_training_inference_catalog(raw_root: Path, catalog: Dict[str, Any], *, dry_run: bool) -> Path:
+    out_path = raw_root / VIDEO_CATALOG_FILENAME
+    if not dry_run:
+        out_path.write_text(json.dumps(catalog, indent=2))
+    return out_path
+
+
+def _enabled_inference_species_by_route(
+    *,
+    day_species_switches: Optional[Dict[str, bool]],
+    night_species_switches: Optional[Dict[str, bool]],
+) -> Dict[str, set[str]]:
+    out: Dict[str, set[str]] = {"day": set(), "night": set()}
+    for route_name, switches in (
+        ("day", day_species_switches),
+        ("night", night_species_switches),
+    ):
+        if not switches:
+            continue
+        vals = {_slug(str(k)) for k, v in switches.items() if bool(v) and str(k or "").strip()}
+        vals.discard("")
+        out[route_name] = vals
+    return out
+
+
+def _discover_inference_videos_from_catalog(
+    catalog: Dict[str, Any],
+    *,
+    day_species_switches: Optional[Dict[str, bool]] = None,
+    night_species_switches: Optional[Dict[str, bool]] = None,
+) -> List[RoutedVideo]:
+    allowed_by_route = _enabled_inference_species_by_route(
+        day_species_switches=day_species_switches,
+        night_species_switches=night_species_switches,
+    )
+    matched_by_route: Dict[str, set[str]] = {"day": set(), "night": set()}
+    out: List[RoutedVideo] = []
+    for entry in list(catalog.get("videos") or []):
+        if str(entry.get("category") or "") != "inference":
+            continue
+        video_path = Path(str(entry.get("video_path") or "")).expanduser()
+        if not video_path.exists():
+            continue
+        route = _normalize_route(str(entry.get("route") or ""))
+        species_name = str(entry.get("species_name") or "").strip() or None
+        species_slug = _slug(species_name or "")
+        allowed = allowed_by_route.get(route, set())
+        if species_slug not in allowed:
+            continue
+        matched_by_route.setdefault(route, set()).add(species_slug)
+        out.append(RoutedVideo(video_path=video_path, route=route, species_name=species_name))
+
+    for route_name in ("day", "night"):
+        missing = sorted(allowed_by_route.get(route_name, set()) - matched_by_route.get(route_name, set()))
+        if missing:
+            print(
+                f"[tmp-run] WARNING: enabled {route_name} inference species not found in catalog inference set: {missing}"
+            )
+    if not out:
+        raise RuntimeError("No inference videos found in training/inference catalog.")
+    return out
+
+
 def _build_combined_dataset(*, dst_final_dataset_dir: Path, sources: Sequence[SourceSpec], dry_run: bool) -> Dict[str, Any]:
     if not dry_run:
         for split in SPLITS:
@@ -1041,25 +1251,42 @@ def _train_models_for_route(
     return models, dataset_summaries, training_metrics
 
 
-def _expected_model_keys_for_sources(sources: Sequence[SourceSpec]) -> List[str]:
+def _expected_model_keys_for_sources(
+    sources: Sequence[SourceSpec],
+    *,
+    include_global: bool = True,
+    include_leaveout: bool = True,
+) -> List[str]:
     all_species = sorted({s.species_name for s in sources})
-    keys: List[str] = ["global_all_species"]
-    for species in all_species:
-        # Match _train_models_for_route: leaveout model exists only if at least
-        # one other species remains in the route-specific training pool.
-        if any(s.species_name != species for s in sources):
-            keys.append(f"leaveout_{species}")
+    keys: List[str] = []
+    if include_global:
+        keys.append("global_all_species")
+    if include_leaveout:
+        for species in all_species:
+            # Match _train_models_for_route: leaveout model exists only if at least
+            # one other species remains in the route-specific training pool.
+            if any(s.species_name != species for s in sources):
+                keys.append(f"leaveout_{species}")
     return keys
 
 
 def _model_root_has_required_models(
-    *, model_root: Path, sources_by_route: Dict[str, List[SourceSpec]], dry_run: bool
+    *,
+    model_root: Path,
+    sources_by_route: Dict[str, List[SourceSpec]],
+    dry_run: bool,
+    include_global: bool = True,
+    include_leaveout: bool = True,
 ) -> bool:
     for route in ("day", "night"):
         srcs = sources_by_route.get(route) or []
         if not srcs:
             continue
-        for mk in _expected_model_keys_for_sources(srcs):
+        for mk in _expected_model_keys_for_sources(
+            srcs,
+            include_global=include_global,
+            include_leaveout=include_leaveout,
+        ):
             ckpt = model_root / route / f"{mk}.pt"
             if (not dry_run) and (not ckpt.exists()):
                 return False
@@ -1067,7 +1294,13 @@ def _model_root_has_required_models(
 
 
 def _auto_discover_pretrained_model_root(
-    *, runs_root: Path, current_run_root: Path, sources_by_route: Dict[str, List[SourceSpec]], dry_run: bool
+    *,
+    runs_root: Path,
+    current_run_root: Path,
+    sources_by_route: Dict[str, List[SourceSpec]],
+    dry_run: bool,
+    include_global: bool = True,
+    include_leaveout: bool = True,
 ) -> Optional[Path]:
     candidates: List[Path] = []
     for run_dir in sorted(
@@ -1083,7 +1316,13 @@ def _auto_discover_pretrained_model_root(
         candidates.append(mroot)
 
     for mroot in candidates:
-        if _model_root_has_required_models(model_root=mroot, sources_by_route=sources_by_route, dry_run=dry_run):
+        if _model_root_has_required_models(
+            model_root=mroot,
+            sources_by_route=sources_by_route,
+            dry_run=dry_run,
+            include_global=include_global,
+            include_leaveout=include_leaveout,
+        ):
             return mroot
     return None
 
@@ -1094,13 +1333,19 @@ def _load_models_for_route(
     sources: Sequence[SourceSpec],
     model_root: Path,
     dry_run: bool,
+    include_global: bool = True,
+    include_leaveout: bool = True,
 ) -> Dict[str, ModelSpec]:
     models: Dict[str, ModelSpec] = {}
     if not sources:
         return models
 
     missing: List[Path] = []
-    for model_key in _expected_model_keys_for_sources(sources):
+    for model_key in _expected_model_keys_for_sources(
+        sources,
+        include_global=include_global,
+        include_leaveout=include_leaveout,
+    ):
         ckpt = model_root / route / f"{model_key}.pt"
         if (not dry_run) and (not ckpt.exists()):
             missing.append(ckpt)
@@ -1149,6 +1394,7 @@ def _run_gateway_for_video(
     """
     day_root = out_root / "day_pipeline_v3"
     night_root = out_root / "night_time_pipeline"
+    max_frames_for_video = _video_max_frames_from_gt(video)
     stage_day = day_root / "stage5 validation" / video.video_name
     stage_night = night_root / "stage9 validation" / video.video_name
 
@@ -1190,6 +1436,7 @@ def _run_gateway_for_video(
         str(model_path),
         "--night-cnn-model",
         str(model_path),
+        *(["--max-frames", str(int(max_frames_for_video))] if max_frames_for_video is not None else []),
         "--threshold",
         str(float(GATEWAY_BRIGHTNESS_THRESHOLD)),
         "--frames",
@@ -1299,7 +1546,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         for r, enabled in (("day", bool(RUN_DAY_PIPELINE_INFERENCE)), ("night", bool(RUN_NIGHT_PIPELINE_INFERENCE)))
         if enabled
     ]
-    run_any_pipeline = bool(enabled_pipeline_routes)
+    run_global_model_inference = bool(RUN_GLOBAL_MODEL_INFERENCE)
+    run_leaveout_model_inference = bool(RUN_LEAVEOUT_MODEL_INFERENCE)
+    run_any_pipeline_models = bool(run_global_model_inference or run_leaveout_model_inference)
+    if enabled_pipeline_routes and (not run_any_pipeline_models):
+        print(
+            "[tmp-run] WARNING: pipeline routes are enabled but both "
+            "RUN_GLOBAL_MODEL_INFERENCE and RUN_LEAVEOUT_MODEL_INFERENCE are False; "
+            "disabling pipeline inference."
+        )
+    run_any_pipeline = bool(enabled_pipeline_routes) and run_any_pipeline_models
 
     print(
         f"[tmp-run] baselines: run={run_baselines} lab={run_lab_baseline} "
@@ -1307,14 +1563,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(
         f"[tmp-run] pipeline inference: day={bool(RUN_DAY_PIPELINE_INFERENCE)} "
-        f"night={bool(RUN_NIGHT_PIPELINE_INFERENCE)}"
+        f"night={bool(RUN_NIGHT_PIPELINE_INFERENCE)} "
+        f"global={run_global_model_inference} leaveout={run_leaveout_model_inference}"
     )
+    print(f"[tmp-run] day_inference_species_switches={DAY_INFERENCE_SPECIES_SWITCHES}")
+    print(f"[tmp-run] night_inference_species_switches={NIGHT_INFERENCE_SPECIES_SWITCHES}")
     print("[tmp-run] ingestion stage: disabled (using existing ingested datasets)")
     print(f"[tmp-run] run_model_training={bool(RUN_MODEL_TRAINING)}")
     if (not run_baselines) and (not run_any_pipeline) and (not bool(RUN_MODEL_TRAINING)):
         raise SystemExit(
             "Nothing to run: RUN_MODEL_TRAINING=False, RUN_BASELINE_METHODS_INFERENCE=False, "
-            "RUN_DAY_PIPELINE_INFERENCE=False, RUN_NIGHT_PIPELINE_INFERENCE=False."
+            "RUN_DAY_PIPELINE_INFERENCE=False, RUN_NIGHT_PIPELINE_INFERENCE=False, "
+            "or both pipeline model-scope toggles are False."
         )
 
     sources_by_route = _discover_training_sources_by_route()
@@ -1363,6 +1623,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 current_run_root=run_root,
                 sources_by_route=sources_for_model_lookup,
                 dry_run=dry_run,
+                include_global=run_global_model_inference,
+                include_leaveout=run_leaveout_model_inference,
             )
             if resolved_model_root is None:
                 raise SystemExit(
@@ -1381,6 +1643,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sources=srcs,
                 model_root=model_root,
                 dry_run=dry_run,
+                include_global=run_global_model_inference,
+                include_leaveout=run_leaveout_model_inference,
             )
     else:
         print("[tmp-run] model prep skipped (training disabled and both day/night pipeline inference toggles are off).")
@@ -1388,7 +1652,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     known_species = sorted(
         set(list(ROUTE_BY_SPECIES.keys()) + [s.species_name for vv in sources_by_route.values() for s in vv])
     )
-    routed_videos = _discover_inference_videos(raw_videos_root, known_species)
+    video_catalog = _build_training_inference_catalog(
+        raw_root=raw_videos_root,
+        known_species=known_species,
+        sources_by_route=sources_by_route,
+    )
+    video_catalog_path = _write_training_inference_catalog(raw_videos_root, video_catalog, dry_run=dry_run)
+    catalog_summary = dict(video_catalog.get("summary") or {})
+    print(f"[tmp-run] video catalog: {video_catalog_path}")
+    print(
+        "[tmp-run] video split catalog:"
+        f" training={catalog_summary.get('n_training_videos', 0)}"
+        f" inference={catalog_summary.get('n_inference_videos', 0)}"
+    )
+    for route_name in ("day", "night"):
+        route_counts = dict((catalog_summary.get("by_route") or {}).get(route_name) or {})
+        print(
+            f"  - {route_name}:"
+            f" training={int(route_counts.get('training', 0))}"
+            f" inference={int(route_counts.get('inference', 0))}"
+        )
+
+    routed_videos = _discover_inference_videos_from_catalog(
+        video_catalog,
+        day_species_switches=DAY_INFERENCE_SPECIES_SWITCHES,
+        night_species_switches=NIGHT_INFERENCE_SPECIES_SWITCHES,
+    )
 
     max_videos = int(args.max_videos or 0)
     if max_videos > 0:
@@ -1527,107 +1816,47 @@ def main(argv: Sequence[str] | None = None) -> int:
         videos_by_route.setdefault(v.route, []).append(v)
 
     # Global model on all videos in each route.
-    for route_name in ("day", "night"):
-        if route_name not in enabled_pipeline_routes:
-            print(f"[eval][global] route={route_name} disabled by run toggle; skipping route.")
-            continue
-        route_videos = videos_by_route.get(route_name) or []
-        if not route_videos:
-            continue
-
-        route_models = models_by_route.get(route_name) or {}
-        global_model = route_models.get("global_all_species")
-        if global_model is None:
-            print(f"[eval][global] WARNING: missing global model for route={route_name}; skipping route.")
-            for vid in route_videos:
-                lab_metrics, lab_path, raphael_metrics, raphael_path = _baseline_fields(vid.video_key)
-                _record_row(
-                    {
-                        "run_id": run_id,
-                        "route": route_name,
-                        "species_name": vid.species_name,
-                        "video_name": vid.video_name,
-                        "eval_type": "global",
-                        "model_used": "global_all_species",
-                        "results": f"ERROR: no trained model for route={route_name}",
-                        "inference_output_path": "",
-                        "lab_results": lab_metrics,
-                        "lab_output_path": lab_path,
-                        "raphael_results": raphael_metrics,
-                        "raphael_output_path": raphael_path,
-                        "gt_source": str(vid.gt_source or ""),
-                        "gt_rows": str(int(len(vid.gt_rows))),
-                        "gt_max_t": str(vid.gt_max_t if vid.gt_max_t is not None else ""),
-                    }
-                )
-            continue
-
-        print(f"[eval] global model route={route_name}: {global_model.ckpt_path}")
-        for i, vid in enumerate(route_videos, start=1):
-            out_root = inference_root / "pipelines" / f"{route_name}_videos" / global_model.model_key / vid.video_key
-            log_path = logs_dir / f"gateway__{route_name}__{global_model.model_key}__{vid.video_key}.log"
-            print(f"[eval][global][{route_name}] {i}/{len(route_videos)} {vid.species_name} :: {vid.video_path.name}")
-
-            if dry_run:
-                metrics = {"error": "dry_run"}
-            else:
-                try:
-                    _, metrics = _run_gateway_for_video(
-                        out_root=out_root,
-                        video=vid,
-                        model_path=global_model.ckpt_path,
-                        log_path=log_path,
-                        dry_run=bool(dry_run),
-                    )
-                except Exception as e:
-                    metrics = {"error": str(e)}
-
-            lab_metrics, lab_path, raphael_metrics, raphael_path = _baseline_fields(vid.video_key)
-            _record_row(
-                {
-                    "run_id": run_id,
-                    "route": route_name,
-                    "species_name": vid.species_name,
-                    "video_name": vid.video_name,
-                    "eval_type": "global",
-                    "model_used": global_model.model_key,
-                    "results": _metrics_str(metrics),
-                    "inference_output_path": str(out_root),
-                    "lab_results": lab_metrics,
-                    "lab_output_path": lab_path,
-                    "raphael_results": raphael_metrics,
-                    "raphael_output_path": raphael_path,
-                    "gt_source": str(vid.gt_source or ""),
-                    "gt_rows": str(int(len(vid.gt_rows))),
-                    "gt_max_t": str(vid.gt_max_t if vid.gt_max_t is not None else ""),
-                }
-            )
-
-    # Leaveout models on their left-out species videos (within same route only).
-    for route_name in ("day", "night"):
-        if route_name not in enabled_pipeline_routes:
-            print(f"[eval][leaveout] route={route_name} disabled by run toggle; skipping route.")
-            continue
-        route_videos = videos_by_route.get(route_name) or []
-        if not route_videos:
-            continue
-
-        route_models = models_by_route.get(route_name) or {}
-        leaveout_models = [m for m in route_models.values() if str(m.model_key).startswith("leaveout_")]
-        leaveout_models.sort(key=lambda m: m.model_key)
-
-        for lm in leaveout_models:
-            left_species = str(lm.leaveout_species or "")
-            sel = [v for v in route_videos if v.species_name == left_species]
-            if not sel:
-                print(f"[eval][leaveout] WARNING: no route={route_name} videos for species={left_species} ({lm.model_key})")
+    if run_global_model_inference:
+        for route_name in ("day", "night"):
+            if route_name not in enabled_pipeline_routes:
+                print(f"[eval][global] route={route_name} disabled by run toggle; skipping route.")
+                continue
+            route_videos = videos_by_route.get(route_name) or []
+            if not route_videos:
                 continue
 
-            print(f"[eval] leaveout model {lm.model_key} route={route_name} species={left_species} (n_videos={len(sel)})")
-            for i, vid in enumerate(sel, start=1):
-                out_root = inference_root / "pipelines" / f"{route_name}_videos" / lm.model_key / vid.video_key
-                log_path = logs_dir / f"gateway__{route_name}__{lm.model_key}__{vid.video_key}.log"
-                print(f"[eval][{lm.model_key}][{route_name}] {i}/{len(sel)} {vid.video_path.name}")
+            route_models = models_by_route.get(route_name) or {}
+            global_model = route_models.get("global_all_species")
+            if global_model is None:
+                print(f"[eval][global] WARNING: missing global model for route={route_name}; skipping route.")
+                for vid in route_videos:
+                    lab_metrics, lab_path, raphael_metrics, raphael_path = _baseline_fields(vid.video_key)
+                    _record_row(
+                        {
+                            "run_id": run_id,
+                            "route": route_name,
+                            "species_name": vid.species_name,
+                            "video_name": vid.video_name,
+                            "eval_type": "global",
+                            "model_used": "global_all_species",
+                            "results": f"ERROR: no trained model for route={route_name}",
+                            "inference_output_path": "",
+                            "lab_results": lab_metrics,
+                            "lab_output_path": lab_path,
+                            "raphael_results": raphael_metrics,
+                            "raphael_output_path": raphael_path,
+                            "gt_source": str(vid.gt_source or ""),
+                            "gt_rows": str(int(len(vid.gt_rows))),
+                            "gt_max_t": str(vid.gt_max_t if vid.gt_max_t is not None else ""),
+                        }
+                    )
+                continue
+
+            print(f"[eval] global model route={route_name}: {global_model.ckpt_path}")
+            for i, vid in enumerate(route_videos, start=1):
+                out_root = inference_root / "pipelines" / f"{route_name}_videos" / global_model.model_key / vid.video_key
+                log_path = logs_dir / f"gateway__{route_name}__{global_model.model_key}__{vid.video_key}.log"
+                print(f"[eval][global][{route_name}] {i}/{len(route_videos)} {vid.species_name} :: {vid.video_path.name}")
 
                 if dry_run:
                     metrics = {"error": "dry_run"}
@@ -1636,7 +1865,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         _, metrics = _run_gateway_for_video(
                             out_root=out_root,
                             video=vid,
-                            model_path=lm.ckpt_path,
+                            model_path=global_model.ckpt_path,
                             log_path=log_path,
                             dry_run=bool(dry_run),
                         )
@@ -1650,8 +1879,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "route": route_name,
                         "species_name": vid.species_name,
                         "video_name": vid.video_name,
-                        "eval_type": "leaveout",
-                        "model_used": lm.model_key,
+                        "eval_type": "global",
+                        "model_used": global_model.model_key,
                         "results": _metrics_str(metrics),
                         "inference_output_path": str(out_root),
                         "lab_results": lab_metrics,
@@ -1663,6 +1892,72 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "gt_max_t": str(vid.gt_max_t if vid.gt_max_t is not None else ""),
                     }
                 )
+    else:
+        print("[eval][global] disabled by RUN_GLOBAL_MODEL_INFERENCE=False; skipping global-model inference.")
+
+    # Leaveout models on their left-out species videos (within same route only).
+    if run_leaveout_model_inference:
+        for route_name in ("day", "night"):
+            if route_name not in enabled_pipeline_routes:
+                print(f"[eval][leaveout] route={route_name} disabled by run toggle; skipping route.")
+                continue
+            route_videos = videos_by_route.get(route_name) or []
+            if not route_videos:
+                continue
+
+            route_models = models_by_route.get(route_name) or {}
+            leaveout_models = [m for m in route_models.values() if str(m.model_key).startswith("leaveout_")]
+            leaveout_models.sort(key=lambda m: m.model_key)
+
+            for lm in leaveout_models:
+                left_species = str(lm.leaveout_species or "")
+                sel = [v for v in route_videos if v.species_name == left_species]
+                if not sel:
+                    print(f"[eval][leaveout] WARNING: no route={route_name} videos for species={left_species} ({lm.model_key})")
+                    continue
+
+                print(f"[eval] leaveout model {lm.model_key} route={route_name} species={left_species} (n_videos={len(sel)})")
+                for i, vid in enumerate(sel, start=1):
+                    out_root = inference_root / "pipelines" / f"{route_name}_videos" / lm.model_key / vid.video_key
+                    log_path = logs_dir / f"gateway__{route_name}__{lm.model_key}__{vid.video_key}.log"
+                    print(f"[eval][{lm.model_key}][{route_name}] {i}/{len(sel)} {vid.video_path.name}")
+
+                    if dry_run:
+                        metrics = {"error": "dry_run"}
+                    else:
+                        try:
+                            _, metrics = _run_gateway_for_video(
+                                out_root=out_root,
+                                video=vid,
+                                model_path=lm.ckpt_path,
+                                log_path=log_path,
+                                dry_run=bool(dry_run),
+                            )
+                        except Exception as e:
+                            metrics = {"error": str(e)}
+
+                    lab_metrics, lab_path, raphael_metrics, raphael_path = _baseline_fields(vid.video_key)
+                    _record_row(
+                        {
+                            "run_id": run_id,
+                            "route": route_name,
+                            "species_name": vid.species_name,
+                            "video_name": vid.video_name,
+                            "eval_type": "leaveout",
+                            "model_used": lm.model_key,
+                            "results": _metrics_str(metrics),
+                            "inference_output_path": str(out_root),
+                            "lab_results": lab_metrics,
+                            "lab_output_path": lab_path,
+                            "raphael_results": raphael_metrics,
+                            "raphael_output_path": raphael_path,
+                            "gt_source": str(vid.gt_source or ""),
+                            "gt_rows": str(int(len(vid.gt_rows))),
+                            "gt_max_t": str(vid.gt_max_t if vid.gt_max_t is not None else ""),
+                        }
+                    )
+    else:
+        print("[eval][leaveout] disabled by RUN_LEAVEOUT_MODEL_INFERENCE=False; skipping leaveout-model inference.")
 
     record: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -1671,6 +1966,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "paths": {
             "run_root": str(run_root),
             "raw_videos_root": str(raw_videos_root),
+            "video_catalog": str(video_catalog_path),
             "combined_dataset_root": str(combined_dataset_root),
             "model_root": str(model_root),
             "inference_root": str(inference_root),
@@ -1695,6 +1991,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "pipeline_inference": {
             "day_enabled": bool(RUN_DAY_PIPELINE_INFERENCE),
             "night_enabled": bool(RUN_NIGHT_PIPELINE_INFERENCE),
+            "global_enabled": bool(run_global_model_inference),
+            "leaveout_enabled": bool(run_leaveout_model_inference),
+            "day_species_switches": dict(DAY_INFERENCE_SPECIES_SWITCHES),
+            "night_species_switches": dict(NIGHT_INFERENCE_SPECIES_SWITCHES),
         },
         "model_training": {
             "run_model_training": bool(RUN_MODEL_TRAINING),
@@ -1705,6 +2005,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             r: [{"species": s.species_name, "path": str(s.path)} for s in srcs]
             for r, srcs in sources_by_route.items()
         },
+        "training_inference_catalog_summary": catalog_summary,
         "dataset_summaries": dataset_summaries,
         "training_metrics": training_metrics,
         "models_by_route": {

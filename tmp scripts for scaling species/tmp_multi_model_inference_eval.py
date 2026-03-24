@@ -517,6 +517,7 @@ def _run_gateway_for_video(
     # If outputs already exist and look valid, reuse them (resume-friendly).
     day_root = out_root / "day_pipeline_v3"
     night_root = out_root / "night_time_pipeline"
+    max_frames_for_video = _video_max_frames_from_gt(video)
     stage_day = day_root / "stage5 validation" / video.video_path.stem
     stage_night = night_root / "stage9 validation" / video.video_path.stem
     if stage_day.exists():
@@ -552,6 +553,7 @@ def _run_gateway_for_video(
         str(model_path),
         "--night-cnn-model",
         str(model_path),
+        *(["--max-frames", str(int(max_frames_for_video))] if max_frames_for_video is not None else []),
     ]
     if bool(FORCE_GATEWAY_TESTS):
         cmd.append("--force-tests")

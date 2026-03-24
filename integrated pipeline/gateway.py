@@ -493,6 +493,15 @@ def _parse_args() -> argparse.Namespace:
         default=int(MAX_CONCURRENT_VIDEOS),
         help="Max number of videos to process concurrently.",
     )
+    p.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help=(
+            "Optional explicit frame bound. When set, pipelines run up to this many frames "
+            "(typically last_annotated_t + 1). If omitted, gateway falls back to GT CSV discovery."
+        ),
+    )
     p.add_argument("--recursive", action="store_true", default=bool(RECURSIVE), help="Recurse into subfolders.")
     p.add_argument("--dry-run", action="store_true", default=bool(DRY_RUN), help="Only print routing decisions.")
     return p.parse_args()
@@ -579,7 +588,15 @@ def main() -> int:
                 failures.append((video, 2))
                 continue
 
-            max_frames_override = _max_frames_override_from_gt(video, route=route, out_base=out_base)
+            explicit_max_frames = getattr(args, "max_frames", None)
+            if explicit_max_frames is not None:
+                max_frames_override = int(explicit_max_frames)
+                print(
+                    f"[gateway] {video.name}  explicit_max_frames={max_frames_override} "
+                    "(from --max-frames)"
+                )
+            else:
+                max_frames_override = _max_frames_override_from_gt(video, route=route, out_base=out_base)
 
             if bool(args.dry_run):
                 continue
