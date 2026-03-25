@@ -10,6 +10,7 @@ Requires: pip install ultralytics>=8.0.0
 
 from __future__ import annotations
 from pathlib import Path
+import json
 import shutil
 import sys
 from datetime import datetime
@@ -28,13 +29,23 @@ except Exception as e:  # pragma: no cover
 
 # ===================== Globals (edit these) =====================
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-YOLO_OUTPUT_ROOT = SCRIPT_DIR / "yolo_train_output_data"
+TRAIN_DATE_TAG = datetime.now().strftime("%Y%m%d")
+YOLO_ROOT = Path("/mnt/Samsung_SSD_2TB/integrated prototype data/v3 daytime YOLO model data")
+DATASET_ROOT: Path | None = YOLO_ROOT / "dataset" / "global YOLO daytime dataset folder" / "global YOLO daytime dataset folder"
+DATA_YAML: Path | None = None  # If None, DATASET_ROOT/data.yaml will be used.
+SPECIES_SOURCE_FOLDERS_FALLBACK = [
+    "Bicellonycha_wickershamorum",
+    "Photinus_acuminatus",
+    "Photuris_bethaniensis",
+    "pyrallis_gopro",
+]
+RUN_OUTPUT_ROOT = YOLO_ROOT / TRAIN_DATE_TAG
+MODELS_OUTPUT_ROOT = YOLO_ROOT / "models" / TRAIN_DATE_TAG
+MANIFEST_PATH = MODELS_OUTPUT_ROOT / "training_manifest.json"
 
 # Path to dataset root OR YAML (YOLOv8 format). If DATA_YAML is None,
 # the script expects to find 'data.yaml' inside DATASET_ROOT.
-DATASET_ROOT: Path | None = None
-DATA_YAML: Path | None = None  # e.g., Path("/path/to/dataset/data.yaml")
+# DATASET_ROOT and DATA_YAML are set above.
 
 # Choose model family and size. Examples:
 #   YOLOv8:  'yolov8n.pt', 'yolov8s.pt', 'yolov8m.pt', 'yolov8l.pt', 'yolov8x.pt'
@@ -53,11 +64,11 @@ LR0 = 0.01  # initial learning rate; None to use default
 WEIGHT_DECAY = 0.0005
 
 # Where Ultralytics will put the run (project/name)
-PROJECT_DIR = YOLO_OUTPUT_ROOT / "runs_firefly"
+PROJECT_DIR = RUN_OUTPUT_ROOT / "runs_firefly"
 RUN_NAME = f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 # Export a copy of the best weights to this path after training
-EXPORT_BEST_TO = YOLO_OUTPUT_ROOT / "best_models" / "best_firefly_yolo.pt"
+EXPORT_BEST_TO = MODELS_OUTPUT_ROOT / "best_firefly_yolo.pt"
 
 # If True, delete previous run directory with same RUN_NAME before training
 CLEAR_EXISTING_RUN = False
@@ -79,8 +90,35 @@ def _ensure_valid_paths():
         DATA_YAML = Path(DATASET_ROOT) / "data.yaml"
     if not Path(DATA_YAML).exists():
         raise FileNotFoundError(f"DATA_YAML not found: {DATA_YAML}")
-    pd = Path(PROJECT_DIR)
-    pd.mkdir(parents=True, exist_ok=True)
+    Path(PROJECT_DIR).mkdir(parents=True, exist_ok=True)
+    Path(EXPORT_BEST_TO).parent.mkdir(parents=True, exist_ok=True)
+
+
+def _collect_species_source_folders() -> list[str]:
+    return list(SPECIES_SOURCE_FOLDERS_FALLBACK)
+
+
+def _write_training_manifest(*, best_pt: Path, data_yaml_fixed: Path, train_args: dict, species_folders: list[str]) -> None:
+    save_dir = Path(PROJECT_DIR) / RUN_NAME
+    manifest = {
+        "train_date_tag": TRAIN_DATE_TAG,
+        "generated_at": datetime.now().isoformat(),
+        "dataset_root": str(Path(DATASET_ROOT) if DATASET_ROOT is not None else ""),
+        "data_yaml": str(Path(DATA_YAML) if DATA_YAML is not None else ""),
+        "data_yaml_fixed": str(data_yaml_fixed),
+        "species_source_folders": species_folders,
+        "n_species": len(species_folders),
+        "project_dir": str(PROJECT_DIR),
+        "run_name": RUN_NAME,
+        "run_dir": str(save_dir),
+        "best_model_source": str(best_pt),
+        "best_model_export": str(EXPORT_BEST_TO),
+        "model_weights_init": str(MODEL_WEIGHTS),
+        "train_args": train_args,
+    }
+    MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"Wrote training manifest → {MANIFEST_PATH}")
 
 
 def _maybe_clear_existing_run():
@@ -264,6 +302,7 @@ def _prepare_data_yaml(orig_yaml: Path, out_dir: Path, dataset_root: Path | None
 def main():
     _ensure_valid_paths()
     _maybe_clear_existing_run()
+    species_folders = _collect_species_source_folders()
 
     model = YOLO(MODEL_WEIGHTS)
 
@@ -301,6 +340,9 @@ def main():
     print("Starting training with args:")
     for k, v in train_args.items():
         print(f"  {k}: {v}")
+    print("Species source folders:")
+    for name in species_folders:
+        print(f"  {name}")
 
     results = model.train(**train_args)
     # Access to results is not guaranteed across versions; rely on files
@@ -312,6 +354,12 @@ def main():
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(best_pt, dest)
     print(f"Copied best weights → {dest}")
+    _write_training_manifest(
+        best_pt=best_pt,
+        data_yaml_fixed=data_yaml_fixed,
+        train_args=train_args,
+        species_folders=species_folders,
+    )
 
 
 if __name__ == "__main__":
