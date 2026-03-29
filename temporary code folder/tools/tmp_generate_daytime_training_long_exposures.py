@@ -2,15 +2,15 @@
 from __future__ import annotations
 
 """
-Generate day-pipeline-v3 long-exposure images for day-time training videos only.
+Generate day-pipeline-v3 long-exposure images for Photinus greeni day-time
+training videos only.
 
 This script reuses the exact Stage 1 implementation from:
   day time pipeline v3 (yolo + patch classifier ensemble)/stage1_long_exposure.py
 
-The hardcoded video list below was derived from the integrated-prototype
-`batch_exports/*_day_time__*` folders, with the held-out validation/inference
-videos removed. That means this script processes only the raw videos that fed
-day-time training, not the videos reserved for inference/evaluation.
+The training/inference split is loaded from the persistent raw-video catalog at
+SPLIT_CATALOG_PATH, and only the training half is processed here so long-
+exposure annotation data does not mix training and held-out inference clips.
 """
 
 import argparse
@@ -34,83 +34,16 @@ DAY_PIPELINE_STAGE1_PATH: Path = DAY_PIPELINE_DIR / "stage1_long_exposure.py"
 
 # Save long-exposure PNGs directly under this folder, grouped by video stem.
 OUTPUT_ROOT: Path = Path(
-    "/mnt/Samsung_SSD_2TB/integrated prototype data/YOLO day time pipeline long exposure training data"
+    "/mnt/Samsung_SSD_2TB/integrated prototype data/YOLO day time pipeline long exposure training data/day_Photinus greeni"
 )
 
 # If True, skip an entire video when its output folder already contains PNGs.
 SKIP_VIDEOS_WITH_EXISTING_OUTPUTS: bool = True
 
-# These were excluded because they are the held-out validation/inference videos.
-EXCLUDED_VALIDATION_VIDEO_STEMS: List[str] = [
-    "Bicellonycha_wickershamorum_s2617bw_2022_06_17_peleg-group-1_Fireflies_Citizen_Science_2022_tnc_20220617_MSR_MS_N_--_done_MS_Ranch_220617_Camera_1_NE_4k_GS090010_s2617bw",
-    "Bicellonycha_wickershamorum_s2618bw_2022_06_18_peleg-group-1_Fireflies_Citizen_Science_2022_tnc_20220618_MSR_MS_S_--_done_MS_Ranch_220618_Camera_1_SW_4k_GS010013_s2618bw",
-    "Photinus_acuminatus_s2607ia_2022_06_07_peleg-group-1_Fireflies_Citizen_Science_2022_xerces_20220607_gp1_4k_GS040009_s2607ia",
-    "Photuris_bethaniensis_s2705ub_2022_07_05_peleg-group-1_Fireflies_Citizen_Science_2022_dnrec_20220705_DFWJuly52022Swale402_4k_GS050012_s2705ub",
-]
-
-# Training-only day-time raw videos.
-TRAINING_DAY_VIDEO_PATHS: List[Path] = [
-    Path(
-        "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/day_Bicellonycha wickershamorum/"
-        "Bicellonycha_wickershamorum_s2617bw_2022_06_17_peleg-group-1_Fireflies_Citizen_Science_2022_tnc_20220617_MSR_MS_N_--_done_MS_Ranch_220617_Camera_1_NE_4k_GS010010_s2617bw.mp4"
-    ),
-    Path(
-        "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/day_Bicellonycha wickershamorum/"
-        "Bicellonycha_wickershamorum_s2617bw_2022_06_17_peleg-group-1_Fireflies_Citizen_Science_2022_tnc_20220617_MSR_MS_N_--_done_MS_Ranch_220617_Camera_1_NE_4k_GS020010_s2617bw.mp4"
-    ),
-    Path(
-        "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/day_Bicellonycha wickershamorum/"
-        "Bicellonycha_wickershamorum_s2617bw_2022_06_17_peleg-group-1_Fireflies_Citizen_Science_2022_tnc_20220617_MSR_MS_N_--_done_MS_Ranch_220617_Camera_1_NE_4k_GS030010_s2617bw.mp4"
-    ),
-    Path(
-        "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/day_Bicellonycha wickershamorum/"
-        "Bicellonycha_wickershamorum_s2617bw_2022_06_17_peleg-group-1_Fireflies_Citizen_Science_2022_tnc_20220617_MSR_MS_N_--_done_MS_Ranch_220617_Camera_1_NE_4k_GS040010_s2617bw.mp4"
-    ),
-    Path(
-        "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/day_Bicellonycha wickershamorum/"
-        "Bicellonycha_wickershamorum_s2617bw_2022_06_17_peleg-group-1_Fireflies_Citizen_Science_2022_tnc_20220617_MSR_MS_N_--_done_MS_Ranch_220617_Camera_1_NE_4k_GS050010_s2617bw.mp4"
-    ),
-    Path(
-        "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/day_Bicellonycha wickershamorum/"
-        "Bicellonycha_wickershamorum_s2617bw_2022_06_17_peleg-group-1_Fireflies_Citizen_Science_2022_tnc_20220617_MSR_MS_N_--_done_MS_Ranch_220617_Camera_1_NE_4k_GS060010_s2617bw.mp4"
-    ),
-    Path(
-        "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/day_Bicellonycha wickershamorum/"
-        "Bicellonycha_wickershamorum_s2617bw_2022_06_17_peleg-group-1_Fireflies_Citizen_Science_2022_tnc_20220617_MSR_MS_N_--_done_MS_Ranch_220617_Camera_1_NE_4k_GS070010_s2617bw.mp4"
-    ),
-    Path(
-        "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/day_Bicellonycha wickershamorum/"
-        "Bicellonycha_wickershamorum_s2617bw_2022_06_17_peleg-group-1_Fireflies_Citizen_Science_2022_tnc_20220617_MSR_MS_N_--_done_MS_Ranch_220617_Camera_1_NE_4k_GS080010_s2617bw.mp4"
-    ),
-    Path(
-        "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/day_Photinus acuminatus/"
-        "Photinus_acuminatus_s2607ia_2022_06_07_peleg-group-1_Fireflies_Citizen_Science_2022_xerces_20220607_gp1_4k_GS010009_s2607ia.mp4"
-    ),
-    Path(
-        "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/day_Photinus acuminatus/"
-        "Photinus_acuminatus_s2607ia_2022_06_07_peleg-group-1_Fireflies_Citizen_Science_2022_xerces_20220607_gp1_4k_GS020009_s2607ia.mp4"
-    ),
-    Path(
-        "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/day_Photinus acuminatus/"
-        "Photinus_acuminatus_s2607ia_2022_06_07_peleg-group-1_Fireflies_Citizen_Science_2022_xerces_20220607_gp1_4k_GS030009_s2607ia.mp4"
-    ),
-    Path(
-        "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/day_Photuris bethaniensis/"
-        "Photuris_bethaniensis_s2705ub_2022_07_05_peleg-group-1_Fireflies_Citizen_Science_2022_dnrec_20220705_DFWJuly52022Swale402_4k_GS010012_s2705ub.mp4"
-    ),
-    Path(
-        "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/day_Photuris bethaniensis/"
-        "Photuris_bethaniensis_s2705ub_2022_07_05_peleg-group-1_Fireflies_Citizen_Science_2022_dnrec_20220705_DFWJuly52022Swale402_4k_GS020012_s2705ub.mp4"
-    ),
-    Path(
-        "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/day_Photuris bethaniensis/"
-        "Photuris_bethaniensis_s2705ub_2022_07_05_peleg-group-1_Fireflies_Citizen_Science_2022_dnrec_20220705_DFWJuly52022Swale402_4k_GS030012_s2705ub.mp4"
-    ),
-    Path(
-        "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/day_Photuris bethaniensis/"
-        "Photuris_bethaniensis_s2705ub_2022_07_05_peleg-group-1_Fireflies_Citizen_Science_2022_dnrec_20220705_DFWJuly52022Swale402_4k_GS040012_s2705ub.mp4"
-    ),
-]
+RAW_SPECIES_DIR: Path = Path(
+    "/mnt/Samsung_SSD_2TB/integrated prototype raw videos/day_Photinus greeni"
+)
+SPLIT_CATALOG_PATH: Path = RAW_SPECIES_DIR / "train_inference_split_catalog.json"
 
 
 def _load_day_pipeline_modules() -> Tuple[ModuleType, ModuleType, ModuleType | None]:
@@ -156,11 +89,38 @@ def _existing_png_count(video_path: Path) -> int:
     return sum(1 for _ in out_dir.glob("*.png"))
 
 
-def _validate_video_list() -> None:
-    missing = [p for p in TRAINING_DAY_VIDEO_PATHS if not p.exists()]
+def _load_split_catalog() -> Dict[str, Any]:
+    if not SPLIT_CATALOG_PATH.exists():
+        raise FileNotFoundError(SPLIT_CATALOG_PATH)
+    data = json.loads(SPLIT_CATALOG_PATH.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected dict JSON in {SPLIT_CATALOG_PATH}")
+    return data
+
+
+def _training_video_paths_from_catalog(catalog: Dict[str, Any]) -> List[Path]:
+    videos: List[Path] = []
+    for item in list(catalog.get("training_videos") or []):
+        p = Path(str(item.get("video_path") or "")).expanduser()
+        if p:
+            videos.append(p)
+    return videos
+
+
+def _inference_video_stems_from_catalog(catalog: Dict[str, Any]) -> List[str]:
+    stems: List[str] = []
+    for item in list(catalog.get("inference_videos") or []):
+        name = str(item.get("video_name") or "").strip()
+        if name:
+            stems.append(Path(name).stem)
+    return stems
+
+
+def _validate_video_list(video_paths: List[Path]) -> None:
+    missing = [p for p in video_paths if not p.exists()]
     if missing:
         raise FileNotFoundError(
-            "Missing hardcoded training videos:\n" + "\n".join(str(p) for p in missing)
+            "Missing configured training videos:\n" + "\n".join(str(p) for p in missing)
         )
 
 
@@ -189,8 +149,12 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
-    _validate_video_list()
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    split_catalog = _load_split_catalog()
+    training_video_paths = _training_video_paths_from_catalog(split_catalog)
+    inference_video_stems = _inference_video_stems_from_catalog(split_catalog)
+    _validate_video_list(training_video_paths)
+    if not args.dry_run:
+        OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
     params_mod, stage1_mod, original_params = _load_day_pipeline_modules()
     try:
@@ -200,14 +164,15 @@ def main() -> int:
         long_exposure_mode = getattr(params_mod, "LONG_EXPOSURE_MODE", None)
         max_frames = getattr(params_mod, "MAX_FRAMES", None)
 
-        videos = list(TRAINING_DAY_VIDEO_PATHS)
+        videos = list(training_video_paths)
         if args.limit is not None:
             videos = videos[: max(0, int(args.limit))]
 
         print(f"[config] output_root={OUTPUT_ROOT}")
+        print(f"[config] split_catalog={SPLIT_CATALOG_PATH}")
         print(f"[config] mode={long_exposure_mode} interval_frames={interval_frames} max_frames={max_frames}")
         print(f"[config] skip_existing={SKIP_VIDEOS_WITH_EXISTING_OUTPUTS and not args.rerun_existing}")
-        print(f"[config] excluded_validation_videos={len(EXCLUDED_VALIDATION_VIDEO_STEMS)}")
+        print(f"[config] heldout_inference_videos={len(inference_video_stems)}")
         print(f"[config] training_videos={len(videos)}")
 
         summary: List[Dict[str, Any]] = []
@@ -253,6 +218,10 @@ def main() -> int:
                 }
             )
 
+        if args.dry_run:
+            print("[done] dry-run complete; no files were generated.")
+            return 0
+
         manifest = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "output_root": str(OUTPUT_ROOT),
@@ -261,7 +230,8 @@ def main() -> int:
             "long_exposure_mode": long_exposure_mode,
             "interval_frames": interval_frames,
             "max_frames": max_frames,
-            "excluded_validation_video_stems": EXCLUDED_VALIDATION_VIDEO_STEMS,
+            "split_catalog_path": str(SPLIT_CATALOG_PATH),
+            "heldout_inference_video_stems": inference_video_stems,
             "training_day_video_paths": [str(p) for p in videos],
             "results": summary,
         }

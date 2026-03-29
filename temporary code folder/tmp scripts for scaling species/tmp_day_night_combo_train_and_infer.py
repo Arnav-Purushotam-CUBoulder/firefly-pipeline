@@ -66,6 +66,10 @@ RUN_INGESTION_FROM_SCRATCH: bool = False
 
 # 2) Model training
 RUN_MODEL_TRAINING: bool = False
+RUN_DAY_MODEL_TRAINING: bool = False
+RUN_NIGHT_MODEL_TRAINING: bool = False
+TRAIN_GLOBAL_MODELS: bool = False
+TRAIN_LEAVEOUT_MODELS: bool = False
 
 # 3) Baseline methods (Lab + Raphael)
 # Set this True to run only baseline methods if day/night pipeline toggles below
@@ -75,8 +79,8 @@ RUN_LAB_BASELINE: bool = False
 RUN_RAPHAEL_BASELINE: bool = False
 
 # 4) Your pipeline inference (split by route)
-RUN_DAY_PIPELINE_INFERENCE: bool = False
-RUN_NIGHT_PIPELINE_INFERENCE: bool = True
+RUN_DAY_PIPELINE_INFERENCE: bool = True
+RUN_NIGHT_PIPELINE_INFERENCE: bool = False
 RUN_GLOBAL_MODEL_INFERENCE: bool = True
 RUN_LEAVEOUT_MODEL_INFERENCE: bool = False
 
@@ -86,6 +90,7 @@ RUN_LEAVEOUT_MODEL_INFERENCE: bool = False
 DAY_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
     "bicellonycha-wickershamorum": True,
     "photinus-acuminatus": True,
+    "photinus-greeni": False,
     "photuris-bethaniensis": True,
 }
 
@@ -93,7 +98,7 @@ NIGHT_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
     "forresti": False,
     "frontalis": False,
     "photinus-carolinus": False,
-    "photinus-knulli": True,
+    "photinus-knulli": False,
     "tremulans": False,
 }
 
@@ -113,13 +118,14 @@ REQUIRE_GT_FOR_INFERENCE: bool = True
 
 # Route assignment by species token.
 ROUTE_BY_SPECIES: Dict[str, str] = {
-    "bicellonycha-wickershamorum": "night",
+    "bicellonycha-wickershamorum": "day",
     "forresti": "night",
     "frontalis": "night",
     "photinus-acuminatus": "day",
     "photinus-carolinus": "night",
+    "photinus-greeni": "day",
     "photinus-knulli": "night",
-    "photuris-bethaniensis": "night",
+    "photuris-bethaniensis": "day",
     "tremulans": "night",
 }
 
@@ -673,8 +679,15 @@ def _build_training_inference_catalog(
             }
         )
 
+    all_species_in_catalog = {
+        str(entry.get("species_name") or "").strip()
+        for entry in catalog_entries
+        if str(entry.get("species_name") or "").strip()
+    }
+
     by_species: Dict[str, Dict[str, Any]] = {}
-    for species_name, stems in species_training_stems.items():
+    for species_name in sorted(set(species_training_stems) | all_species_in_catalog):
+        stems = species_training_stems.get(species_name, set())
         training_entries = [
             e for e in catalog_entries if e.get("species_name") == species_name and e.get("category") == "training"
         ]
@@ -1190,6 +1203,8 @@ def _train_models_for_route(
     sources: Sequence[SourceSpec],
     combined_dataset_root: Path,
     model_root: Path,
+    include_global: bool,
+    include_leaveout: bool,
     dry_run: bool,
 ) -> tuple[Dict[str, ModelSpec], Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     models: Dict[str, ModelSpec] = {}
@@ -1201,13 +1216,18 @@ def _train_models_for_route(
 
     all_species = sorted({s.species_name for s in sources})
     jobs: List[Tuple[str, Optional[str], List[SourceSpec]]] = []
-    jobs.append(("global_all_species", None, list(sources)))
+    if include_global:
+        jobs.append(("global_all_species", None, list(sources)))
 
-    for species in all_species:
-        keep = [s for s in sources if s.species_name != species]
-        if not keep:
-            continue
-        jobs.append((f"leaveout_{species}", species, keep))
+    if include_leaveout:
+        for species in all_species:
+            keep = [s for s in sources if s.species_name != species]
+            if not keep:
+                continue
+            jobs.append((f"leaveout_{species}", species, keep))
+
+    if not jobs:
+        return models, dataset_summaries, training_metrics
 
     for model_key, leaveout_species, job_sources in jobs:
         dst_final = combined_dataset_root / route / model_key / "final dataset"
@@ -1566,6 +1586,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"night={bool(RUN_NIGHT_PIPELINE_INFERENCE)} "
         f"global={run_global_model_inference} leaveout={run_leaveout_model_inference}"
     )
+    print(
+        f"[tmp-run] model training: run={bool(RUN_MODEL_TRAINING)} "
+        f"day={bool(RUN_DAY_MODEL_TRAINING)} night={bool(RUN_NIGHT_MODEL_TRAINING)} "
+        f"global={bool(TRAIN_GLOBAL_MODELS)} leaveout={bool(TRAIN_LEAVEOUT_MODELS)}"
+    )
     print(f"[tmp-run] day_inference_species_switches={DAY_INFERENCE_SPECIES_SWITCHES}")
     print(f"[tmp-run] night_inference_species_switches={NIGHT_INFERENCE_SPECIES_SWITCHES}")
     print("[tmp-run] ingestion stage: disabled (using existing ingested datasets)")
@@ -1590,7 +1615,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     training_metrics: Dict[str, Dict[str, Dict[str, Any]]] = {"day": {}, "night": {}}
 
     if bool(RUN_MODEL_TRAINING):
+        enabled_training_routes = [
+            r
+            for r, enabled in (("day", bool(RUN_DAY_MODEL_TRAINING)), ("night", bool(RUN_NIGHT_MODEL_TRAINING)))
+            if enabled
+        ]
+        if not enabled_training_routes:
+            print("[tmp-run] WARNING: RUN_MODEL_TRAINING=True but both RUN_DAY_MODEL_TRAINING and RUN_NIGHT_MODEL_TRAINING are False; skipping model training.")
+        if not bool(TRAIN_GLOBAL_MODELS) and not bool(TRAIN_LEAVEOUT_MODELS):
+            print("[tmp-run] WARNING: RUN_MODEL_TRAINING=True but both TRAIN_GLOBAL_MODELS and TRAIN_LEAVEOUT_MODELS are False; skipping model training.")
         for route in ("day", "night"):
+            if route not in enabled_training_routes:
+                print(f"[tmp-run] model training disabled for route={route}; skipping.")
+                continue
             srcs = sources_by_route.get(route) or []
             if not srcs:
                 print(f"[tmp-run] WARNING: no training sources for route={route}; skipping model training.")
@@ -1601,6 +1638,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sources=srcs,
                 combined_dataset_root=combined_dataset_root,
                 model_root=model_root,
+                include_global=bool(TRAIN_GLOBAL_MODELS),
+                include_leaveout=bool(TRAIN_LEAVEOUT_MODELS),
                 dry_run=dry_run,
             )
             models_by_route[route] = route_models
@@ -1998,6 +2037,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "model_training": {
             "run_model_training": bool(RUN_MODEL_TRAINING),
+            "day_enabled": bool(RUN_DAY_MODEL_TRAINING),
+            "night_enabled": bool(RUN_NIGHT_MODEL_TRAINING),
+            "global_enabled": bool(TRAIN_GLOBAL_MODELS),
+            "leaveout_enabled": bool(TRAIN_LEAVEOUT_MODELS),
             "reuse_existing_if_present": bool(REUSE_EXISTING_MODELS_IF_PRESENT),
             "pretrained_models_root": str(PRETRAINED_MODELS_ROOT) if PRETRAINED_MODELS_ROOT is not None else "",
         },

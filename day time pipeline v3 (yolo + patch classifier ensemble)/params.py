@@ -72,7 +72,7 @@ TRAILS_OVERLAY_ALPHA: float = 0.70
 # Local model directory for this v3 pipeline.
 MODEL_DIR: Path = Path(__file__).resolve().parent / "v3 day time pipeline models"
 # Path to trained YOLO weights (.pt)
-YOLO_MODEL_WEIGHTS: Path = MODEL_DIR / "yolo_best.pt"
+YOLO_MODEL_WEIGHTS: Path = Path("/mnt/Samsung_SSD_2TB/integrated prototype data/v3 daytime YOLO model data/models/20260324/best_firefly_yolo.pt")
 
 # Inference params
 # - YOLO_IMG_SIZE: None → auto from input image size (max(H,W))

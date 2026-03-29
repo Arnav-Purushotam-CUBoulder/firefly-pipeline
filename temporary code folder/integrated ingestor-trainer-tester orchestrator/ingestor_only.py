@@ -16,6 +16,7 @@ log size realistic.
 """
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -49,6 +50,14 @@ DATA_SUBDIR: str = "patch training datasets and pipeline validation data"
 # Ingestion settings
 TRAIN_PAIR_FRACTION: float = 0.8
 ONE_DATASET_VERSION_PER_BATCH: bool = True
+
+# Optional per-species explicit split catalog.
+# If a raw species folder contains this JSON file, training/inference clips can
+# be selected explicitly instead of using TRAIN_PAIR_FRACTION over all pairs.
+SPLIT_CATALOG_FILENAME: str = "train_inference_split_catalog.json"
+USE_SPLIT_CATALOG_IF_PRESENT: bool = True
+INGEST_TRAINING_VIDEOS_FROM_SPLIT_CATALOG: bool = True
+INGEST_INFERENCE_VIDEOS_FROM_SPLIT_CATALOG_TO_VALIDATION: bool = False
 
 # Stage1_ingestor_core config (overrides passed into stage1_ingestor_core)
 AUTO_LOAD_SIBLING_CLASS_CSV: bool = True
@@ -218,6 +227,81 @@ def _dir_has_any_files(d: Path) -> bool:
     return False
 
 
+def _video_stem_from_catalog_item(item: Dict[str, Any]) -> str:
+    name = str(item.get("video_name") or "").strip()
+    if name:
+        return Path(name).stem
+    path = str(item.get("video_path") or "").strip()
+    if path:
+        return Path(path).stem
+    return ""
+
+
+def _load_split_catalog(raw_species_dir: Path) -> Dict[str, Any] | None:
+    if not bool(USE_SPLIT_CATALOG_IF_PRESENT):
+        return None
+    p = raw_species_dir / str(SPLIT_CATALOG_FILENAME)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except Exception as e:
+        raise SystemExit(f"Failed to parse split catalog {p}: {e}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"Invalid split catalog {p}: expected JSON object")
+    return data
+
+
+def _pairs_from_split_catalog(
+    *,
+    pairs: Sequence[stage1_ingestor.ObservedPair],
+    split_catalog: Dict[str, Any],
+) -> Tuple[List[stage1_ingestor.ObservedPair], List[stage1_ingestor.ObservedPair]]:
+    pair_by_stem: Dict[str, stage1_ingestor.ObservedPair] = {}
+    for p in pairs:
+        pair_by_stem[str(p.video_name)] = p
+        pair_by_stem[str(p.video_path.stem)] = p
+    train_stems: List[str] = []
+    val_stems: List[str] = []
+
+    if bool(INGEST_TRAINING_VIDEOS_FROM_SPLIT_CATALOG):
+        for item in list(split_catalog.get("training_videos") or []):
+            stem = _video_stem_from_catalog_item(item)
+            if stem:
+                train_stems.append(stem)
+
+    if bool(INGEST_INFERENCE_VIDEOS_FROM_SPLIT_CATALOG_TO_VALIDATION):
+        for item in list(split_catalog.get("inference_videos") or []):
+            stem = _video_stem_from_catalog_item(item)
+            if stem:
+                val_stems.append(stem)
+
+    missing = [s for s in sorted(set(train_stems + val_stems)) if s not in pair_by_stem]
+    if missing:
+        raise SystemExit(
+            "Split catalog references videos not present as discovered mp4/csv pairs:\n"
+            + "\n".join(f"  - {m}" for m in missing)
+        )
+
+    train_pairs = [pair_by_stem[s] for s in train_stems]
+    val_pairs = [pair_by_stem[s] for s in val_stems]
+
+    overlap = sorted({p.video_name for p in train_pairs} & {p.video_name for p in val_pairs})
+    if overlap:
+        raise SystemExit(
+            "Split catalog has overlap between training and inference selections:\n"
+            + "\n".join(f"  - {name}" for name in overlap)
+        )
+
+    if (not train_pairs) and (not val_pairs):
+        raise SystemExit(
+            f"Split catalog selected no videos. "
+            f"Check {SPLIT_CATALOG_FILENAME} and the INGEST_*_FROM_SPLIT_CATALOG toggles."
+        )
+
+    return train_pairs, val_pairs
+
+
 def _species_already_ingested(*, data_root: Path, species_token: str) -> bool:
     import orchestrator as orch  # local import (same folder)
 
@@ -283,6 +367,8 @@ def _ingest_one_species(
     species_token: str,
     time_of_day: str,
     pairs: Sequence[stage1_ingestor.ObservedPair],
+    train_pairs_override: Sequence[stage1_ingestor.ObservedPair] | None,
+    val_pairs_override: Sequence[stage1_ingestor.ObservedPair] | None,
     dry_run: bool,
 ) -> Dict[str, Any]:
     import orchestrator as orch  # local import (same folder)
@@ -294,13 +380,22 @@ def _ingest_one_species(
     pairs = list(pairs)
     if not pairs:
         raise SystemExit(f"No pairs to ingest for species={species_token} dir={raw_species_dir}")
-    train_pairs, val_pairs = stage1_ingestor.split_pairs_train_vs_val(pairs, train_fraction=float(TRAIN_PAIR_FRACTION))
+    if train_pairs_override is not None or val_pairs_override is not None:
+        train_pairs = list(train_pairs_override or [])
+        val_pairs = list(val_pairs_override or [])
+    else:
+        train_pairs, val_pairs = stage1_ingestor.split_pairs_train_vs_val(pairs, train_fraction=float(TRAIN_PAIR_FRACTION))
 
     print(
         "[ingestor-only] Discovered pairs:",
         f"species={species_token} time_of_day={time_of_day} dir={raw_species_dir} "
         f"total={len(pairs)} train={len(train_pairs)} val={len(val_pairs)}",
     )
+    if train_pairs_override is not None or val_pairs_override is not None:
+        print(
+            f"[ingestor-only] Using explicit split from {raw_species_dir / str(SPLIT_CATALOG_FILENAME)} "
+            f"(train={len(train_pairs)} val={len(val_pairs)})"
+        )
 
     if AUTO_SYNC_VALIDATION_VIDEOS_STORE and val_pairs:
         orch._sync_validation_videos_for_pairs(  # type: ignore[attr-defined]
@@ -557,7 +652,25 @@ def main(argv: List[str] | None = None) -> int:
             continue
 
         already_ingested = set(ingestion_index.get(token, {}).keys())
-        pairs_to_ingest = [p for p in pairs if str(p.video_name) not in already_ingested]
+        split_catalog = _load_split_catalog(sp_dir)
+        explicit_train_pairs: List[stage1_ingestor.ObservedPair] | None = None
+        explicit_val_pairs: List[stage1_ingestor.ObservedPair] | None = None
+        if split_catalog is not None:
+            try:
+                explicit_train_pairs, explicit_val_pairs = _pairs_from_split_catalog(
+                    pairs=pairs,
+                    split_catalog=split_catalog,
+                )
+            except SystemExit as e:
+                skipped.append(f"Skipping {sp_dir.name!r} -> {token}: split catalog failed: {e}")
+                continue
+
+            explicit_train_pairs = [p for p in explicit_train_pairs if str(p.video_name) not in already_ingested]
+            explicit_val_pairs = [p for p in explicit_val_pairs if str(p.video_name) not in already_ingested]
+            pairs_to_ingest = list(explicit_train_pairs) + list(explicit_val_pairs)
+        else:
+            pairs_to_ingest = [p for p in pairs if str(p.video_name) not in already_ingested]
+
         if not pairs_to_ingest:
             skipped.append(f"Skipping {sp_dir.name!r} -> {token}: all {len(pairs)} video(s) already ingested")
             continue
@@ -570,6 +683,9 @@ def main(argv: List[str] | None = None) -> int:
                 "pairs_total": int(len(pairs)),
                 "pairs_to_ingest": list(pairs_to_ingest),
                 "already_ingested_video_names": sorted(already_ingested),
+                "split_catalog_path": str(sp_dir / str(SPLIT_CATALOG_FILENAME)) if split_catalog is not None else None,
+                "explicit_train_pairs": list(explicit_train_pairs or []),
+                "explicit_val_pairs": list(explicit_val_pairs or []),
             }
         )
 
@@ -587,6 +703,11 @@ def main(argv: List[str] | None = None) -> int:
         print(
             f"  - {sp_dir.name} -> {token} ({time_of_day}): ingest_videos={len(c['pairs_to_ingest'])}/{int(c['pairs_total'])} total",
         )
+        if c.get("split_catalog_path"):
+            print(
+                f"      explicit split catalog: train={len(c.get('explicit_train_pairs') or [])} "
+                f"val={len(c.get('explicit_val_pairs') or [])}"
+            )
 
     results: List[Dict[str, Any]] = []
     for c in candidates:
@@ -595,6 +716,8 @@ def main(argv: List[str] | None = None) -> int:
         time_of_day = str(c.get("time_of_day") or "")
         pairs_to_ingest = list(c["pairs_to_ingest"])
         already_ingested_names = list(c.get("already_ingested_video_names") or [])
+        explicit_train_pairs = list(c.get("explicit_train_pairs") or [])
+        explicit_val_pairs = list(c.get("explicit_val_pairs") or [])
 
         print(f"\n[ingestor-only] === Ingesting {sp_dir.name} -> {token} ({time_of_day}) ===")
         print(
@@ -615,6 +738,7 @@ def main(argv: List[str] | None = None) -> int:
             "raw_pairs_total": int(c["pairs_total"]),
             "raw_pairs_to_ingest": int(len(pairs_to_ingest)),
             "raw_pairs_already_ingested": int(len(already_ingested_names)),
+            "split_catalog_path": c.get("split_catalog_path"),
             # NOTE: we intentionally do not inline all existing ingested history here; only what we ingest now.
         }
 
@@ -628,6 +752,8 @@ def main(argv: List[str] | None = None) -> int:
                     species_token=token,
                     time_of_day=str(time_of_day),
                     pairs=pairs_to_ingest,
+                    train_pairs_override=explicit_train_pairs if c.get("split_catalog_path") else None,
+                    val_pairs_override=explicit_val_pairs if c.get("split_catalog_path") else None,
                     dry_run=dry_run,
                 )
                 meta["ingested_pairs"] = list(out.get("ingested_pairs") or [])
