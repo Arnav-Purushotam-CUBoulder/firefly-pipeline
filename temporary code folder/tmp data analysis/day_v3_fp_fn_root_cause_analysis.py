@@ -470,6 +470,7 @@ def analyze_run(run_root: Path, output_dir: Path, dist_px: float = 10.0, selecte
                     "stage2_box_w": None if stage2_box is None else stage2_box.w,
                     "stage2_box_h": None if stage2_box is None else stage2_box.h,
                     "nearest_stage3_dist_px": stage3_10_dist,
+                    "nearest_stage3_traj_id": None if stage3_10 is None else stage3_10.traj_id,
                     "nearest_stage3_conf": None if stage3_10 is None else stage3_10.conf,
                     "nearest_stage3_traj_size": None if stage3_10 is None else stage3_10.traj_size,
                     "nearest_stage3_traj_motion_xy": None if stage3_10 is None else stage3_10.traj_motion_xy,

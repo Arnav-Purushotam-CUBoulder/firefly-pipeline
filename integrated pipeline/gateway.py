@@ -50,9 +50,11 @@ DRY_RUN: bool = False
 MAX_CONCURRENT_VIDEOS: int = 2
 
 # Optional model overrides (passed into the pipelines; only applied when set).
-# - For day pipeline: overrides params.PATCH_MODEL_PATH (+ STAGE5_MODEL_PATH for FN scoring).
+# - For day pipeline: overrides params.PATCH_MODEL_PATH (+ STAGE5_MODEL_PATH for FN scoring)
+#   and params.YOLO_MODEL_WEIGHTS.
 # - For night pipeline: overrides pipeline_params.CNN_MODEL_PATH (+ STAGE9_MODEL_PATH).
 DAY_PATCH_MODEL_PATH: str | Path = ""
+DAY_YOLO_MODEL_PATH: str | Path = ""
 NIGHT_CNN_MODEL_PATH: str | Path = ""
 
 # If True, force pipeline validation/test stages on (Stage5+ for day, Stage9+ for night).
@@ -212,6 +214,7 @@ def _day_pipeline_code(
     *,
     output_root: Path | None,
     patch_model_path: Path | None,
+    day_yolo_model_path: Path | None,
     force_tests: bool,
     force_no_cleanup: bool,
     max_frames_override: int | None,
@@ -222,6 +225,7 @@ def _day_pipeline_code(
             "import params",
             f"output_root = Path({repr(str(output_root))}).expanduser().resolve() if {output_root is not None} else None",
             f"patch_model_path = Path({repr(str(patch_model_path))}).expanduser().resolve() if {patch_model_path is not None} else None",
+            f"day_yolo_model_path = Path({repr(str(day_yolo_model_path))}).expanduser().resolve() if {day_yolo_model_path is not None} else None",
             f"force_tests = {bool(force_tests)}",
             f"force_no_cleanup = {bool(force_no_cleanup)}",
             f"force_all_frames = {bool(FORCE_ALL_FRAMES)}",
@@ -246,6 +250,8 @@ def _day_pipeline_code(
             "    params.PATCH_MODEL_PATH = patch_model_path",
             "    if hasattr(params, 'STAGE5_MODEL_PATH'):",
             "        params.STAGE5_MODEL_PATH = patch_model_path",
+            "if day_yolo_model_path is not None:",
+            "    params.YOLO_MODEL_WEIGHTS = day_yolo_model_path",
             "if max_frames_override is not None:",
             "    params.MAX_FRAMES = int(max_frames_override)",
             "elif force_all_frames:",
@@ -363,6 +369,7 @@ def _run_day_pipeline(
     pipeline: PipelinePaths,
     output_root: Path | None,
     patch_model_path: Path | None,
+    day_yolo_model_path: Path | None,
     force_tests: bool,
     force_no_cleanup: bool,
     max_frames_override: int | None,
@@ -371,6 +378,7 @@ def _run_day_pipeline(
         video_path,
         output_root=output_root,
         patch_model_path=patch_model_path,
+        day_yolo_model_path=day_yolo_model_path,
         force_tests=force_tests,
         force_no_cleanup=force_no_cleanup,
         max_frames_override=max_frames_override,
@@ -405,6 +413,7 @@ def _start_day_pipeline(
     pipeline: PipelinePaths,
     output_root: Path | None,
     patch_model_path: Path | None,
+    day_yolo_model_path: Path | None,
     force_tests: bool,
     force_no_cleanup: bool,
     max_frames_override: int | None,
@@ -413,6 +422,7 @@ def _start_day_pipeline(
         video_path,
         output_root=output_root,
         patch_model_path=patch_model_path,
+        day_yolo_model_path=day_yolo_model_path,
         force_tests=force_tests,
         force_no_cleanup=force_no_cleanup,
         max_frames_override=max_frames_override,
@@ -474,6 +484,12 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=str(DAY_PATCH_MODEL_PATH) if DAY_PATCH_MODEL_PATH else "",
         help="Override day pipeline patch model (.pt) path.",
+    )
+    p.add_argument(
+        "--day-yolo-model",
+        type=str,
+        default=str(DAY_YOLO_MODEL_PATH) if DAY_YOLO_MODEL_PATH else "",
+        help="Override day pipeline YOLO model (.pt) path.",
     )
     p.add_argument(
         "--night-cnn-model",
@@ -563,6 +579,12 @@ def main() -> int:
         if not day_patch_model.exists():
             raise SystemExit(f"--day-patch-model not found: {day_patch_model}")
 
+    day_yolo_model: Path | None = None
+    if getattr(args, "day_yolo_model", ""):
+        day_yolo_model = Path(str(args.day_yolo_model)).expanduser().resolve()
+        if not day_yolo_model.exists():
+            raise SystemExit(f"--day-yolo-model not found: {day_yolo_model}")
+
     night_cnn_model: Path | None = None
     if getattr(args, "night_cnn_model", ""):
         night_cnn_model = Path(str(args.night_cnn_model)).expanduser().resolve()
@@ -626,6 +648,7 @@ def main() -> int:
                         pipeline=pipeline,
                         output_root=day_root,
                         patch_model_path=day_patch_model,
+                        day_yolo_model_path=day_yolo_model,
                         force_tests=force_tests,
                         force_no_cleanup=force_no_cleanup,
                         max_frames_override=max_frames_override,

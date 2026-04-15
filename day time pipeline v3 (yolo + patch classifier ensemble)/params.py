@@ -148,15 +148,19 @@ STAGE3_1_TRAJECTORY_INTENSITY_SVG_NAME: str = "stage3_1_trajectory_intensity_cur
 # Also write a second SVG containing only trajectories whose intensity curve
 # range (max(sum)-min(sum)) is at least this threshold.
 STAGE3_1_PLOT_TRAJECTORY_INTENSITY_HIGHVAR: bool = True
-STAGE3_1_TRAJECTORY_INTENSITY_HIGHVAR_MIN_RANGE: int = 3000
+# Historical Pyrallis GoPro-tuned values for FN-sensitive Stage 3.1 gating:
+#   STAGE3_1_TRAJECTORY_INTENSITY_HIGHVAR_MIN_RANGE = 3000
+#   STAGE3_1_HILL_MIN_UP_STEPS = 2
+#   STAGE3_1_HILL_MIN_DOWN_STEPS = 2
+STAGE3_1_TRAJECTORY_INTENSITY_HIGHVAR_MIN_RANGE: int = 2000
 STAGE3_1_TRAJECTORY_INTENSITY_HIGHVAR_SVG_NAME: str = "stage3_1_trajectory_intensity_curves_highvar.svg"
-STAGE3_1_EXPORT_HIGHVAR_TRAJECTORY_CROPS: bool = True
+STAGE3_1_EXPORT_HIGHVAR_TRAJECTORY_CROPS: bool = False
 STAGE3_1_HIGHVAR_TRAJECTORY_CROPS_DIRNAME: str = "stage3_1_highvar_trajectory_crops"
 # "Firefly-flash-like" hill filter: curve rises then falls (unimodal-ish).
 STAGE3_1_HIGHVAR_REQUIRE_HILL_SHAPE: bool = True
 STAGE3_1_HILL_SMOOTH_WINDOW: int = 1              # 1 disables smoothing
-STAGE3_1_HILL_MIN_UP_STEPS: int = 2               # min positive steps before peak
-STAGE3_1_HILL_MIN_DOWN_STEPS: int = 2             # min negative steps after peak
+STAGE3_1_HILL_MIN_UP_STEPS: int = 1               # min positive steps before peak
+STAGE3_1_HILL_MIN_DOWN_STEPS: int = 1             # min negative steps after peak
 STAGE3_1_HILL_MIN_MONOTONIC_FRAC: float = 0.60    # before/after peak sign consistency
 STAGE3_1_HILL_PEAK_POS_MIN_FRAC: float = 0.0     # peak not too close to start
 STAGE3_1_HILL_PEAK_POS_MAX_FRAC: float = 1.0     # peak not too close to end
@@ -170,7 +174,7 @@ STAGE3_1_HIGHVAR_VIDEO_NAME: str = "stage3_1_highvar_trajectories.mp4"
 RUN_STAGE3_2: bool = True
 STAGE3_2_DIRNAME: str = "stage3_2"
 STAGE3_2_GAUSSIAN_SIGMA: float = 1.0   # 0 => plain intensity centroid
-STAGE3_2_SAVE_ANNOTATED_CROPS: bool = True
+STAGE3_2_SAVE_ANNOTATED_CROPS: bool = False
 STAGE3_2_MARK_CENTROID_RED_PIXEL: bool = True
 # Stage 3.2 export for downstream 3D reconstruction:
 # one CSV per video with columns exactly: x,y,t
@@ -183,9 +187,9 @@ STAGE3_2_XYT_EXPORT_DIR: Path = ROOT / "stage3_2 xyt for 3d reconstruction"
 # These stages are implemented inside this v3 pipeline folder.
 RUN_STAGE5_VALIDATE: bool = True
 RUN_STAGE6_OVERLAY: bool = True
-RUN_STAGE7_FN_ANALYSIS: bool = True
-RUN_STAGE8_FP_ANALYSIS: bool = True
-RUN_STAGE9_DETECTION_SUMMARY: bool = True
+RUN_STAGE7_FN_ANALYSIS: bool = False
+RUN_STAGE8_FP_ANALYSIS: bool = False
+RUN_STAGE9_DETECTION_SUMMARY: bool = False
 
 # Test output directories (under ROOT)
 # - Stage 5 writes per-video folders under STAGE5_DIR/<video_stem>/.

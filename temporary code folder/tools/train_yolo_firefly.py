@@ -36,6 +36,7 @@ DATA_YAML: Path | None = None  # If None, DATASET_ROOT/data.yaml will be used.
 SPECIES_SOURCE_FOLDERS_FALLBACK = [
     "Bicellonycha_wickershamorum",
     "Photinus_acuminatus",
+    "day_Photinus greeni",
     "Photuris_bethaniensis",
     "pyrallis_gopro",
 ]

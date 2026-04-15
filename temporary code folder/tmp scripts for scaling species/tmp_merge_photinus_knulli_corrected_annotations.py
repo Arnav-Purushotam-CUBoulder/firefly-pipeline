@@ -53,12 +53,12 @@ class MergeTarget:
 # Edit only this block for future runs.
 # ---------------------------------------------------------------------------
 
-RAW_DIR = Path("/mnt/Samsung_SSD_2TB/integrated prototype raw videos/night_Photinus Knulli")
+RAW_DIR = Path("/mnt/Samsung_SSD_2TB/integrated prototype raw videos/night_Photinus carolinus")
 CORRECTED_SUBDIR_NAME = "corrected"
 CORRECTED_DIR = RAW_DIR / CORRECTED_SUBDIR_NAME
 
 ROOT_CSV_SUFFIX = ".csv"
-CORRECTED_FILE_SUFFIX = ".firefly.csv"
+CORRECTED_FILE_SUFFIX = ".csv"
 VIDEO_EXTENSIONS: Tuple[str, ...] = (".mp4", ".avi", ".mov", ".mkv")
 
 # Optional filter. Use basenames without any suffixes. Example:

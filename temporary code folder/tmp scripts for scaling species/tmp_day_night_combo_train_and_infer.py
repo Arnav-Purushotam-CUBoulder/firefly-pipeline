@@ -21,6 +21,7 @@ import argparse
 import csv
 import hashlib
 import json
+import importlib.util
 import os
 import re
 import shlex
@@ -88,10 +89,10 @@ RUN_LEAVEOUT_MODEL_INFERENCE: bool = False
 # Only species with True are evaluated from the cataloged inference-only videos.
 # These switches are route-specific to make the day/night split explicit.
 DAY_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
-    "bicellonycha-wickershamorum": True,
-    "photinus-acuminatus": True,
-    "photinus-greeni": False,
-    "photuris-bethaniensis": True,
+    "bicellonycha-wickershamorum": False,
+    "photinus-acuminatus": False,
+    "photinus-greeni": True,
+    "photuris-bethaniensis": False,
 }
 
 NIGHT_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
@@ -102,15 +103,28 @@ NIGHT_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
     "tremulans": False,
 }
 
-# Optional explicit model root when RUN_MODEL_TRAINING=False.
-# Expected layout:
-#   <root>/day/global_all_species.pt
-#   <root>/day/leaveout_<species>.pt
-#   <root>/night/global_all_species.pt
-#   <root>/night/leaveout_<species>.pt
-# If unset/None, the script auto-discovers the newest prior run under RUNS_ROOT
-# that has all required model files for discovered species/routes.
-PRETRAINED_MODELS_ROOT: Optional[Path] = None
+# Pretrained model selection when RUN_MODEL_TRAINING=False.
+# If True, the script auto-discovers the newest compatible trained artifact
+# for that model family and uses it. If False, it uses the manual path below.
+AUTO_DISCOVER_LATEST_DAY_MODEL_ROOT: bool = True
+AUTO_DISCOVER_LATEST_NIGHT_MODEL_ROOT: bool = True
+AUTO_DISCOVER_LATEST_DAY_YOLO_MODEL: bool = True
+
+# Manual fallback paths used when the corresponding auto-discovery switch is
+# False. The day/night paths should point to the route-specific directory that
+# contains global_all_species.pt plus any leaveout_*.pt files for that route.
+DAY_PRETRAINED_MODEL_ROOT: Path = Path(
+    "/mnt/Samsung_SSD_2TB/temp to delete/firefly_patch_training_local_run/"
+    "tmp_day_night_combo_train_and_infer__20260328__004250/models/day"
+)
+NIGHT_PRETRAINED_MODEL_ROOT: Path = Path(
+    "/mnt/Samsung_SSD_2TB/temp to delete/firefly_patch_training_local_run/"
+    "tmp_day_night_combo_train_and_infer__20260305__163237/models/night"
+)
+DAY_YOLO_MODEL_WEIGHTS: Path = Path(
+    "/mnt/Samsung_SSD_2TB/integrated prototype data/v3 daytime YOLO model data/"
+    "models/20260324/best_firefly_yolo.pt"
+)
 
 # Evaluation safeguard: require per-video GT and cap processing to the last
 # annotated frame in that GT.
@@ -1290,34 +1304,31 @@ def _expected_model_keys_for_sources(
     return keys
 
 
-def _model_root_has_required_models(
+def _route_model_dir_has_required_models(
     *,
-    model_root: Path,
-    sources_by_route: Dict[str, List[SourceSpec]],
+    route_model_dir: Path,
+    sources: Sequence[SourceSpec],
     dry_run: bool,
     include_global: bool = True,
     include_leaveout: bool = True,
 ) -> bool:
-    for route in ("day", "night"):
-        srcs = sources_by_route.get(route) or []
-        if not srcs:
-            continue
-        for mk in _expected_model_keys_for_sources(
-            srcs,
-            include_global=include_global,
-            include_leaveout=include_leaveout,
-        ):
-            ckpt = model_root / route / f"{mk}.pt"
-            if (not dry_run) and (not ckpt.exists()):
-                return False
+    for mk in _expected_model_keys_for_sources(
+        sources,
+        include_global=include_global,
+        include_leaveout=include_leaveout,
+    ):
+        ckpt = route_model_dir / f"{mk}.pt"
+        if not ckpt.exists():
+            return False
     return True
 
 
-def _auto_discover_pretrained_model_root(
+def _auto_discover_latest_route_model_dir(
     *,
+    route: str,
     runs_root: Path,
     current_run_root: Path,
-    sources_by_route: Dict[str, List[SourceSpec]],
+    sources: Sequence[SourceSpec],
     dry_run: bool,
     include_global: bool = True,
     include_leaveout: bool = True,
@@ -1330,20 +1341,42 @@ def _auto_discover_pretrained_model_root(
     ):
         if run_dir.resolve() == current_run_root.resolve():
             continue
-        mroot = run_dir / "models"
-        if not mroot.exists() and (not dry_run):
+        route_model_dir = run_dir / "models" / route
+        if not route_model_dir.exists():
             continue
-        candidates.append(mroot)
+        candidates.append(route_model_dir)
 
-    for mroot in candidates:
-        if _model_root_has_required_models(
-            model_root=mroot,
-            sources_by_route=sources_by_route,
+    for route_model_dir in candidates:
+        if _route_model_dir_has_required_models(
+            route_model_dir=route_model_dir,
+            sources=sources,
             dry_run=dry_run,
             include_global=include_global,
             include_leaveout=include_leaveout,
         ):
-            return mroot
+            return route_model_dir
+    return None
+
+
+def _auto_discover_latest_day_yolo_model(manual_yolo_path: Path, *, dry_run: bool) -> Optional[Path]:
+    yolo_path = Path(str(manual_yolo_path)).expanduser()
+    models_root = yolo_path.parent.parent
+    if not models_root.exists():
+        return None
+
+    dated_dirs = sorted(
+        [
+            p
+            for p in models_root.iterdir()
+            if p.is_dir() and re.fullmatch(r"\d{8}", p.name)
+        ],
+        key=lambda p: p.name,
+        reverse=True,
+    )
+    for model_dir in dated_dirs:
+        candidate = model_dir / yolo_path.name
+        if dry_run or candidate.exists():
+            return candidate
     return None
 
 
@@ -1351,7 +1384,7 @@ def _load_models_for_route(
     *,
     route: str,
     sources: Sequence[SourceSpec],
-    model_root: Path,
+    route_model_dir: Path,
     dry_run: bool,
     include_global: bool = True,
     include_leaveout: bool = True,
@@ -1366,8 +1399,8 @@ def _load_models_for_route(
         include_global=include_global,
         include_leaveout=include_leaveout,
     ):
-        ckpt = model_root / route / f"{model_key}.pt"
-        if (not dry_run) and (not ckpt.exists()):
+        ckpt = route_model_dir / f"{model_key}.pt"
+        if not ckpt.exists():
             missing.append(ckpt)
             continue
         leaveout_species = model_key[len("leaveout_") :] if model_key.startswith("leaveout_") else None
@@ -1383,10 +1416,73 @@ def _load_models_for_route(
         raise SystemExit(
             "RUN_MODEL_TRAINING=False but required model files are missing:\n"
             f"{missing_txt}\n"
-            "Either enable RUN_MODEL_TRAINING=True or point PRETRAINED_MODELS_ROOT to a complete model set."
+            f"Either enable RUN_MODEL_TRAINING=True or point the manual {route} model root "
+            "to a complete route-specific model directory."
         )
 
     return models
+
+
+def _resolve_manual_path(path_value: Path, *, label: str, dry_run: bool) -> Path:
+    resolved = Path(str(path_value)).expanduser().resolve()
+    if not resolved.exists():
+        raise SystemExit(f"{label} does not exist: {resolved}")
+    return resolved
+
+
+def _resolve_route_model_dir(
+    *,
+    route: str,
+    auto_discover: bool,
+    manual_root: Path,
+    runs_root: Path,
+    current_run_root: Path,
+    sources: Sequence[SourceSpec],
+    dry_run: bool,
+    include_global: bool,
+    include_leaveout: bool,
+) -> tuple[Path, str]:
+    if auto_discover:
+        resolved = _auto_discover_latest_route_model_dir(
+            route=route,
+            runs_root=runs_root,
+            current_run_root=current_run_root,
+            sources=sources,
+            dry_run=dry_run,
+            include_global=include_global,
+            include_leaveout=include_leaveout,
+        )
+        if resolved is None:
+            raise SystemExit(
+                f"RUN_MODEL_TRAINING=False and auto-discovery could not find a compatible latest "
+                f"{route} model directory under {runs_root}.\n"
+                f"Turn AUTO_DISCOVER_LATEST_{route.upper()}_MODEL_ROOT off and set the manual "
+                f"{route} model root, or enable RUN_MODEL_TRAINING=True."
+            )
+        return resolved, "auto"
+
+    return _resolve_manual_path(
+        manual_root,
+        label=f"manual {route} model root",
+        dry_run=dry_run,
+    ), "manual"
+
+
+def _resolve_day_yolo_model_path(*, auto_discover: bool, manual_path: Path, dry_run: bool) -> tuple[Path, str]:
+    if auto_discover:
+        resolved = _auto_discover_latest_day_yolo_model(manual_path, dry_run=dry_run)
+        if resolved is None:
+            raise SystemExit(
+                "Auto-discovery could not find a latest day YOLO checkpoint.\n"
+                "Turn AUTO_DISCOVER_LATEST_DAY_YOLO_MODEL off and set DAY_YOLO_MODEL_WEIGHTS manually."
+            )
+        return resolved, "auto"
+
+    return _resolve_manual_path(
+        manual_path,
+        label="manual day YOLO model",
+        dry_run=dry_run,
+    ), "manual"
 
 
 def _has_thr_subdirs(dir_path: Path) -> bool:
@@ -1395,10 +1491,46 @@ def _has_thr_subdirs(dir_path: Path) -> bool:
     return any(p.is_dir() and p.name.startswith("thr_") for p in dir_path.iterdir())
 
 
+def _day_analysis_output_requirements() -> Tuple[bool, bool]:
+    params_path = _day_pipeline_dir() / "params.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_tmp_day_v3_params_requirements", params_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"unable to load spec for {params_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        need_stage7 = bool(getattr(module, "RUN_STAGE7_FN_ANALYSIS", True))
+        need_stage8 = bool(getattr(module, "RUN_STAGE8_FP_ANALYSIS", True))
+        return need_stage7, need_stage8
+    except Exception:
+        return True, True
+
+
+def _missing_day_analysis_outputs(day_root: Path, video_name: str) -> List[str]:
+    need_stage7, need_stage8 = _day_analysis_output_requirements()
+    missing: List[str] = []
+    if need_stage7:
+        stage7 = day_root / "stage7 fn analysis" / video_name
+        if not _has_thr_subdirs(stage7):
+            missing.append("stage7")
+    if need_stage8:
+        stage8 = day_root / "stage8 fp analysis" / video_name
+        if not _has_thr_subdirs(stage8):
+            missing.append("stage8")
+    return missing
+
+
 def _day_analysis_outputs_ready(day_root: Path, video_name: str) -> bool:
-    stage7 = day_root / "stage7 fn analysis" / video_name
-    stage8 = day_root / "stage8 fp analysis" / video_name
-    return _has_thr_subdirs(stage7) and _has_thr_subdirs(stage8)
+    return not _missing_day_analysis_outputs(day_root, video_name)
+
+
+def _format_day_analysis_missing_error(day_root: Path, video_name: str) -> str:
+    missing = _missing_day_analysis_outputs(day_root, video_name)
+    missing_str = "/".join(missing) if missing else "stage7/stage8"
+    return (
+        f"day validation exists but analysis outputs are incomplete for {video_name}: "
+        f"missing {missing_str} under {day_root}"
+    )
 
 
 def _run_gateway_for_video(
@@ -1406,6 +1538,7 @@ def _run_gateway_for_video(
     out_root: Path,
     video: EvalVideo,
     model_path: Path,
+    day_yolo_model_path: Optional[Path],
     log_path: Path,
     dry_run: bool,
 ) -> Tuple[str, Dict[str, Any]]:
@@ -1426,7 +1559,7 @@ def _run_gateway_for_video(
         if not m.get("error"):
             print(
                 f"[tmp-run][eval] cache incomplete for day video={video.video_name}: "
-                "stage5 exists but stage7/stage8 analysis missing; rerunning gateway."
+                f"{_format_day_analysis_missing_error(day_root, video.video_name)}; rerunning gateway."
             )
     if stage_night.exists():
         m = _parse_validation_metrics(stage_night)
@@ -1456,6 +1589,7 @@ def _run_gateway_for_video(
         str(model_path),
         "--night-cnn-model",
         str(model_path),
+        *(["--day-yolo-model", str(day_yolo_model_path)] if day_yolo_model_path is not None else []),
         *(["--max-frames", str(int(max_frames_for_video))] if max_frames_for_video is not None else []),
         "--threshold",
         str(float(GATEWAY_BRIGHTNESS_THRESHOLD)),
@@ -1472,12 +1606,7 @@ def _run_gateway_for_video(
         if (not m.get("error")) and _day_analysis_outputs_ready(day_root, video.video_name):
             return "day", m
         if not m.get("error"):
-            return "day", {
-                "error": (
-                    f"day validation exists but analysis outputs are incomplete for {video.video_name}: "
-                    f"missing stage7/stage8 under {day_root}"
-                )
-            }
+            return "day", {"error": _format_day_analysis_missing_error(day_root, video.video_name)}
         return "day", m
     if stage_night.exists():
         return "night", _parse_validation_metrics(stage_night)
@@ -1613,6 +1742,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     models_by_route: Dict[str, Dict[str, ModelSpec]] = {"day": {}, "night": {}}
     dataset_summaries: Dict[str, Dict[str, Dict[str, Any]]] = {"day": {}, "night": {}}
     training_metrics: Dict[str, Dict[str, Dict[str, Any]]] = {"day": {}, "night": {}}
+    resolved_pretrained_model_dirs: Dict[str, str] = {"day": "", "night": ""}
+    resolved_pretrained_model_sources: Dict[str, str] = {"day": "", "night": ""}
+    resolved_day_yolo_model: Optional[Path] = None
+    resolved_day_yolo_source: str = ""
+
+    if bool(RUN_DAY_PIPELINE_INFERENCE):
+        resolved_day_yolo_model, resolved_day_yolo_source = _resolve_day_yolo_model_path(
+            auto_discover=bool(AUTO_DISCOVER_LATEST_DAY_YOLO_MODEL),
+            manual_path=DAY_YOLO_MODEL_WEIGHTS,
+            dry_run=dry_run,
+        )
+        print(f"[tmp-run] day yolo model ({resolved_day_yolo_source}): {resolved_day_yolo_model}")
 
     if bool(RUN_MODEL_TRAINING):
         enabled_training_routes = [
@@ -1645,42 +1786,44 @@ def main(argv: Sequence[str] | None = None) -> int:
             models_by_route[route] = route_models
             dataset_summaries[route] = route_ds
             training_metrics[route] = route_metrics
+            resolved_pretrained_model_dirs[route] = str(model_root / route)
+            resolved_pretrained_model_sources[route] = "trained_this_run"
     elif run_any_pipeline:
-        sources_for_model_lookup: Dict[str, List[SourceSpec]] = {
-            "day": list(sources_by_route.get("day") or []) if "day" in enabled_pipeline_routes else [],
-            "night": list(sources_by_route.get("night") or []) if "night" in enabled_pipeline_routes else [],
-        }
-        explicit_model_root = PRETRAINED_MODELS_ROOT
-        resolved_model_root: Optional[Path] = None
-        if explicit_model_root is not None:
-            resolved_model_root = Path(str(explicit_model_root)).expanduser().resolve()
-            if (not dry_run) and (not resolved_model_root.exists()):
-                raise SystemExit(f"PRETRAINED_MODELS_ROOT does not exist: {resolved_model_root}")
-        else:
-            resolved_model_root = _auto_discover_pretrained_model_root(
-                runs_root=runs_root,
-                current_run_root=run_root,
-                sources_by_route=sources_for_model_lookup,
-                dry_run=dry_run,
-                include_global=run_global_model_inference,
-                include_leaveout=run_leaveout_model_inference,
-            )
-            if resolved_model_root is None:
-                raise SystemExit(
-                    "RUN_MODEL_TRAINING=False but no compatible pretrained model root was found.\n"
-                    "Set PRETRAINED_MODELS_ROOT to an existing models directory, or set RUN_MODEL_TRAINING=True."
-                )
-
-        model_root = resolved_model_root
-        print(f"[tmp-run] reusing pretrained models from: {model_root}")
         for route in enabled_pipeline_routes:
             srcs = sources_by_route.get(route) or []
             if not srcs:
                 continue
+            if route == "day":
+                route_model_dir, source_kind = _resolve_route_model_dir(
+                    route=route,
+                    auto_discover=bool(AUTO_DISCOVER_LATEST_DAY_MODEL_ROOT),
+                    manual_root=DAY_PRETRAINED_MODEL_ROOT,
+                    runs_root=runs_root,
+                    current_run_root=run_root,
+                    sources=srcs,
+                    dry_run=dry_run,
+                    include_global=run_global_model_inference,
+                    include_leaveout=run_leaveout_model_inference,
+                )
+            else:
+                route_model_dir, source_kind = _resolve_route_model_dir(
+                    route=route,
+                    auto_discover=bool(AUTO_DISCOVER_LATEST_NIGHT_MODEL_ROOT),
+                    manual_root=NIGHT_PRETRAINED_MODEL_ROOT,
+                    runs_root=runs_root,
+                    current_run_root=run_root,
+                    sources=srcs,
+                    dry_run=dry_run,
+                    include_global=run_global_model_inference,
+                    include_leaveout=run_leaveout_model_inference,
+                )
+            resolved_pretrained_model_dirs[route] = str(route_model_dir)
+            resolved_pretrained_model_sources[route] = source_kind
+            print(f"[tmp-run] {route} model root ({source_kind}): {route_model_dir}")
             models_by_route[route] = _load_models_for_route(
                 route=route,
                 sources=srcs,
-                model_root=model_root,
+                route_model_dir=route_model_dir,
                 dry_run=dry_run,
                 include_global=run_global_model_inference,
                 include_leaveout=run_leaveout_model_inference,
@@ -1905,6 +2048,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             out_root=out_root,
                             video=vid,
                             model_path=global_model.ckpt_path,
+                            day_yolo_model_path=resolved_day_yolo_model,
                             log_path=log_path,
                             dry_run=bool(dry_run),
                         )
@@ -1969,6 +2113,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 out_root=out_root,
                                 video=vid,
                                 model_path=lm.ckpt_path,
+                                day_yolo_model_path=resolved_day_yolo_model,
                                 log_path=log_path,
                                 dry_run=bool(dry_run),
                             )
@@ -2042,7 +2187,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             "global_enabled": bool(TRAIN_GLOBAL_MODELS),
             "leaveout_enabled": bool(TRAIN_LEAVEOUT_MODELS),
             "reuse_existing_if_present": bool(REUSE_EXISTING_MODELS_IF_PRESENT),
-            "pretrained_models_root": str(PRETRAINED_MODELS_ROOT) if PRETRAINED_MODELS_ROOT is not None else "",
+        },
+        "model_selection": {
+            "auto_discover_latest_day_model_root": bool(AUTO_DISCOVER_LATEST_DAY_MODEL_ROOT),
+            "auto_discover_latest_night_model_root": bool(AUTO_DISCOVER_LATEST_NIGHT_MODEL_ROOT),
+            "auto_discover_latest_day_yolo_model": bool(AUTO_DISCOVER_LATEST_DAY_YOLO_MODEL),
+            "manual_day_model_root": str(DAY_PRETRAINED_MODEL_ROOT),
+            "manual_night_model_root": str(NIGHT_PRETRAINED_MODEL_ROOT),
+            "manual_day_yolo_model_weights": str(DAY_YOLO_MODEL_WEIGHTS),
+            "resolved_day_model_root": str(resolved_pretrained_model_dirs.get("day") or ""),
+            "resolved_night_model_root": str(resolved_pretrained_model_dirs.get("night") or ""),
+            "resolved_day_model_root_source": str(resolved_pretrained_model_sources.get("day") or ""),
+            "resolved_night_model_root_source": str(resolved_pretrained_model_sources.get("night") or ""),
+            "resolved_day_yolo_model_weights": str(resolved_day_yolo_model or ""),
+            "resolved_day_yolo_model_source": str(resolved_day_yolo_source or ""),
         },
         "training_sources_by_route": {
             r: [{"species": s.species_name, "path": str(s.path)} for s in srcs]
@@ -2087,6 +2245,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("[tmp-run] done.")
     print(f"[tmp-run] final csv: {final_csv_path}")
     print("[tmp-run] models used:")
+    if resolved_day_yolo_model is not None:
+        print(f"  - day_yolo ({resolved_day_yolo_source}): {resolved_day_yolo_model}")
     for route in ("day", "night"):
         route_models = models_by_route.get(route) or {}
         if not route_models:
