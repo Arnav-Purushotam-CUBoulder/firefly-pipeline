@@ -24,11 +24,18 @@ import csv
 import math
 import re
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import params
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from video_rendering_defaults import normalize_video_bbox_thickness, resolve_video_render_size
 
 
 @dataclass
@@ -300,12 +307,14 @@ def _render_boxes_video(
 
     fps = float(getattr(params, "RENDER_FPS_HINT", None) or fps_src)
     codec = str(getattr(params, "RENDER_CODEC", "mp4v"))
+    out_w, out_h = resolve_video_render_size(W, H)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*codec)
-    writer = cv2.VideoWriter(str(out_path), fourcc, float(fps), (int(W), int(H)), isColor=True)
+    writer = cv2.VideoWriter(str(out_path), fourcc, float(fps), (int(out_w), int(out_h)), isColor=True)
     if not writer.isOpened():
         cap.release()
         raise RuntimeError(f"Could not open VideoWriter for {out_path}")
+    box_thickness = normalize_video_bbox_thickness(getattr(params, "OVERLAY_BOX_THICKNESS", None))
 
     t = 0
     try:
@@ -323,7 +332,7 @@ def _render_boxes_video(
                     y1 = y0 + int(h)
                     # selected=red, rejected=blue
                     color = (0, 0, 255) if is_selected else (255, 0, 0)
-                    cv2.rectangle(frame, (x0, y0), (x1, y1), color, 1, cv2.LINE_AA)
+                    cv2.rectangle(frame, (x0, y0), (x1, y1), color, box_thickness, cv2.LINE_AA)
             writer.write(frame)
             t += 1
     finally:

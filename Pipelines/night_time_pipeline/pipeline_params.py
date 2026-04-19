@@ -2,6 +2,16 @@
 """Centralized configuration values for the firefly detection pipeline."""
 
 from pathlib import Path
+import sys
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from video_rendering_defaults import (
+    ENFORCE_SOURCE_VIDEO_RESOLUTION,
+    VIDEO_RENDER_BBOX_THICKNESS_PX,
+)
 
 # Root & I/O locations
 ROOT = Path("/mnt/Samsung_SSD_2TB/temp to delete/night time pipeline inference output data")
@@ -20,7 +30,8 @@ DIR_STAGE14_OUT = ROOT / 'stage14 detection summaries'
 
 # Global knobs / flags
 MAX_FRAMES = None
-BBOX_THICKNESS = 1
+BBOX_THICKNESS = VIDEO_RENDER_BBOX_THICKNESS_PX
+RENDER_ENFORCE_SOURCE_VIDEO_RESOLUTION = ENFORCE_SOURCE_VIDEO_RESOLUTION
 DRAW_BACKGROUND_BOXES = True
 
 # Stage toggles
@@ -157,7 +168,7 @@ STAGE8_9_GAUSSIAN_SIGMA = STAGE8_GAUSSIAN_SIGMA
 
 # Stage 9 — validation vs ground truth
 GT_CSV_PATH = ROOT / 'ground truth' / 'gt.csv'
-GT_T_OFFSET = 4000
+GT_T_OFFSET = 0
 # Validate only at 10px to reduce compute + output size.
 DIST_THRESHOLDS_PX = [10.0]
 STAGE9_CROP_W = 10

@@ -10,9 +10,9 @@ What it does:
 3) Trains route-specific models:
    - 1 global model per route
    - 1 leaveout_<species> model per species in that route
-4) Runs legacy baselines (lab + Raphael) for each video.
-5) Runs gateway inference (day v3 / night pipeline) with the trained models.
-6) Appends each completed result row to CSV immediately (flush + fsync).
+4) Runs gateway inference (day v3 / night pipeline) with the trained models.
+5) Runs legacy baselines (lab + Raphael) for each video.
+6) Writes the final results CSV after all baseline/pipeline outputs are available.
 
 Routing uses folder/file/species names only (no brightness routing filter).
 """
@@ -262,7 +262,7 @@ RAPHAEL_BATCH_SIZE: int = 1000
 RAPHAEL_GAUSS_CROP_SIZE: int = 10
 RAPHAEL_DEVICE: str = "auto"
 
-# Stage5 validator settings for baselines (10px only to keep outputs smaller).
+# Baseline evaluation settings (10px only to keep outputs smaller).
 BASELINE_DIST_THRESHOLDS_PX: List[float] = [10.0]
 BASELINE_VALIDATE_CROP_W: int = 10
 BASELINE_VALIDATE_CROP_H: int = 10
@@ -487,8 +487,9 @@ def _baseline_scripts() -> Dict[str, Path]:
     base = _repo_root() / "tools for scaling species" / "legacy_baselines"
     lab = base / "nolan_mp4_to_predcsv.py"
     raphael = base / "raphael_oorb_detect_and_gauss.py"
+    match = base / "match_predictions_to_processed_gt.py"
     render = base / "render_baseline_predictions.py"
-    return {"lab": lab, "raphael": raphael, "render": render}
+    return {"lab": lab, "raphael": raphael, "match": match, "render": render}
 
 
 def _baseline_method_registry_key(method_key: str) -> str:
@@ -2247,45 +2248,44 @@ def _run_subprocess_logged(cmd: Sequence[str], *, cwd: Path, log_path: Path, dry
         subprocess.run(list(cmd), cwd=str(cwd), check=True, stdout=f, stderr=subprocess.STDOUT, env=env)
 
 
-def _run_stage5_validator(
+def _run_baseline_processed_gt_matcher(
     *,
+    route: str,
     orig_video_path: Path,
     pred_csv_path: Path,
-    gt_csv_path: Path,
+    processed_gt_csv_path: Path,
     max_frames: int | None,
     out_dir: Path,
     log_path: Path,
     dry_run: bool,
 ) -> None:
-    day_dir = _day_pipeline_dir()
-
-    # Prevent Stage5 validator from auto-searching for FN-scoring weights.
-    no_weights = out_dir / "__no_fn_scoring_weights__.pt"
-    max_frames_code = str(int(max_frames)) if max_frames is not None else "None"
-
-    code = "\n".join(
-        [
-            "from pathlib import Path",
-            "from stage5_validate import stage5_validate_against_gt",
-            "stage5_validate_against_gt(",
-            f"    orig_video_path=Path({repr(str(orig_video_path))}),",
-            f"    pred_csv_path=Path({repr(str(pred_csv_path))}),",
-            f"    gt_csv_path=Path({repr(str(gt_csv_path))}),",
-            f"    out_dir=Path({repr(str(out_dir))}),",
-            f"    dist_thresholds={list(float(x) for x in BASELINE_DIST_THRESHOLDS_PX)!r},",
-            f"    crop_w={int(BASELINE_VALIDATE_CROP_W)},",
-            f"    crop_h={int(BASELINE_VALIDATE_CROP_H)},",
-            "    gt_t_offset=0,",
-            f"    max_frames={max_frames_code},",
-            "    only_firefly_rows=True,",
-            "    show_per_frame=False,",
-            f"    model_path=Path({repr(str(no_weights))}),",
-            "    print_load_status=False,",
-            ")",
-        ]
-    )
-
-    _run_subprocess_logged([sys.executable, "-c", code], cwd=day_dir, log_path=log_path, dry_run=dry_run)
+    scripts = _baseline_scripts()
+    matcher_script = scripts["match"]
+    if not matcher_script.exists():
+        raise FileNotFoundError(f"baseline processed-GT matcher script not found: {matcher_script}")
+    cmd = [
+        sys.executable,
+        str(matcher_script),
+        "--route",
+        str(route),
+        "--video",
+        str(orig_video_path),
+        "--pred-csv",
+        str(pred_csv_path),
+        "--processed-gt-csv",
+        str(processed_gt_csv_path),
+        "--out-dir",
+        str(out_dir),
+        "--dist-thresholds",
+        *[str(float(x)) for x in BASELINE_DIST_THRESHOLDS_PX],
+        "--crop-w",
+        str(int(BASELINE_VALIDATE_CROP_W)),
+        "--crop-h",
+        str(int(BASELINE_VALIDATE_CROP_H)),
+    ]
+    if max_frames is not None:
+        cmd.extend(["--max-frames", str(int(max_frames))])
+    _run_subprocess_logged(cmd, cwd=_repo_root(), log_path=log_path, dry_run=dry_run)
 
 
 def _run_baseline_renderer(
@@ -2332,6 +2332,7 @@ def _run_baselines_for_video(
     *,
     run_root: Path,
     video: EvalVideo,
+    processed_gt_csv_path: Path,
     logs_dir: Path,
     run_lab: bool,
     run_raphael: bool,
@@ -2348,14 +2349,15 @@ def _run_baselines_for_video(
         gt_csv = out_root / "ground truth" / "gt.csv"
         pred_csv = out_root / "predictions.csv"
         rendered_video = out_root / BASELINE_RENDERED_VIDEO_FILENAME
-        stage5_dir = out_root / "stage5 validation" / video.video_name
+        validation_dir = out_root / "validation" / video.video_name
         if not dry_run:
             out_root.mkdir(parents=True, exist_ok=True)
             log_root.mkdir(parents=True, exist_ok=True)
-            _write_gt_csv(gt_csv, video.gt_rows)
+            gt_csv.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(processed_gt_csv_path, gt_csv)
 
-        if stage5_dir.exists():
-            metrics = _parse_validation_metrics(stage5_dir)
+        if validation_dir.exists():
+            metrics = _parse_validation_metrics(validation_dir)
         else:
             if not scripts["lab"].exists():
                 metrics = {"error": f"lab baseline script not found: {scripts['lab']}"}
@@ -2385,16 +2387,17 @@ def _run_baselines_for_video(
                         log_path=log_root / f"baseline_lab__{video.video_key}.log",
                         dry_run=dry_run,
                     )
-                    _run_stage5_validator(
+                    _run_baseline_processed_gt_matcher(
+                        route=video.route,
                         orig_video_path=video.video_path,
                         pred_csv_path=pred_csv,
-                        gt_csv_path=gt_csv,
+                        processed_gt_csv_path=gt_csv,
                         max_frames=max_frames_for_video,
-                        out_dir=stage5_dir,
-                        log_path=log_root / f"baseline_lab_stage5__{video.video_key}.log",
+                        out_dir=validation_dir,
+                        log_path=log_root / f"baseline_lab_match__{video.video_key}.log",
                         dry_run=dry_run,
                     )
-                    metrics = _parse_validation_metrics(stage5_dir)
+                    metrics = _parse_validation_metrics(validation_dir)
                 except Exception as e:
                     metrics = {"error": f"lab baseline failed: {e}"}
 
@@ -2428,14 +2431,15 @@ def _run_baselines_for_video(
         raw_csv = out_root / "raw.csv"
         gauss_csv = out_root / "gauss.csv"
         rendered_video = out_root / BASELINE_RENDERED_VIDEO_FILENAME
-        stage5_dir = out_root / "stage5 validation" / video.video_name
+        validation_dir = out_root / "validation" / video.video_name
         if not dry_run:
             out_root.mkdir(parents=True, exist_ok=True)
             log_root.mkdir(parents=True, exist_ok=True)
-            _write_gt_csv(gt_csv, video.gt_rows)
+            gt_csv.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(processed_gt_csv_path, gt_csv)
 
-        if stage5_dir.exists():
-            metrics = _parse_validation_metrics(stage5_dir)
+        if validation_dir.exists():
+            metrics = _parse_validation_metrics(validation_dir)
         else:
             model_path_str = str(RAPHAEL_MODEL_PATH or "").strip()
             model_ok = bool(model_path_str) and Path(model_path_str).expanduser().is_file()
@@ -2481,16 +2485,17 @@ def _run_baselines_for_video(
                         log_path=log_root / f"baseline_raphael__{video.video_key}.log",
                         dry_run=dry_run,
                     )
-                    _run_stage5_validator(
+                    _run_baseline_processed_gt_matcher(
+                        route=video.route,
                         orig_video_path=video.video_path,
                         pred_csv_path=pred_csv,
-                        gt_csv_path=gt_csv,
+                        processed_gt_csv_path=gt_csv,
                         max_frames=max_frames_for_video,
-                        out_dir=stage5_dir,
-                        log_path=log_root / f"baseline_raphael_stage5__{video.video_key}.log",
+                        out_dir=validation_dir,
+                        log_path=log_root / f"baseline_raphael_match__{video.video_key}.log",
                         dry_run=dry_run,
                     )
-                    metrics = _parse_validation_metrics(stage5_dir)
+                    metrics = _parse_validation_metrics(validation_dir)
                 except Exception as e:
                     metrics = {"error": f"raphael baseline failed: {e}"}
 
@@ -2534,6 +2539,24 @@ def _append_final_csv_row(path: Path, row: Dict[str, str]) -> None:
         w.writerow({k: (row.get(k) or "") for k in FINAL_RESULTS_FIELDNAMES})
         f.flush()
         os.fsync(f.fileno())
+
+
+def _write_final_csv(path: Path, rows: Sequence[Dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=FINAL_RESULTS_FIELDNAMES)
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: (row.get(k) or "") for k in FINAL_RESULTS_FIELDNAMES})
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _count_csv_data_rows(path: Path) -> int:
+    with path.open("r", newline="") as f:
+        r = csv.reader(f)
+        next(r, None)
+        return sum(1 for _ in r)
 
 
 def _read_json_if_exists(path: Path) -> Dict[str, Any]:
@@ -2854,7 +2877,7 @@ def _run_gateway_for_video(
     day_yolo_model_path: Optional[Path],
     log_path: Path,
     dry_run: bool,
-) -> Tuple[str, Dict[str, Any]]:
+) -> Tuple[str, Dict[str, Any], Optional[Path]]:
     """
     Returns: (route_used, validation_metrics)
     """
@@ -2864,11 +2887,30 @@ def _run_gateway_for_video(
     stage_day = day_root / "stage5 validation" / video.video_name
     stage_night = night_root / "stage9 validation" / video.video_name
 
+    def _processed_gt_from_output(route_name: str) -> Optional[Path]:
+        route_root = day_root if route_name == "day" else night_root
+        stage_root = stage_day if route_name == "day" else stage_night
+        candidates: List[Path] = []
+        csv_dir = route_root / "csv files"
+        if csv_dir.exists():
+            candidates.extend(sorted(csv_dir.glob("gt_norm_offset*.csv"), key=lambda p: p.stat().st_mtime, reverse=True))
+        if stage_root.exists():
+            candidates.extend(sorted(stage_root.glob("gt_norm_offset*.csv"), key=lambda p: p.stat().st_mtime, reverse=True))
+        seen: set[str] = set()
+        unique: List[Path] = []
+        for cand in candidates:
+            key = str(cand.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(cand)
+        return unique[0] if unique else None
+
     # Resume-friendly cache: reuse existing valid outputs.
     if stage_day.exists():
         m = _parse_validation_metrics(stage_day)
         if not m.get("error") and _day_analysis_outputs_ready(day_root, video.video_name):
-            return "day", m
+            return "day", m, _processed_gt_from_output("day")
         if not m.get("error"):
             print(
                 f"[tmp-run][eval] cache incomplete for day video={video.video_name}: "
@@ -2877,7 +2919,7 @@ def _run_gateway_for_video(
     if stage_night.exists():
         m = _parse_validation_metrics(stage_night)
         if not m.get("error"):
-            return "night", m
+            return "night", m, _processed_gt_from_output("night")
 
     if not dry_run:
         out_root.mkdir(parents=True, exist_ok=True)
@@ -2917,22 +2959,22 @@ def _run_gateway_for_video(
     if stage_day.exists():
         m = _parse_validation_metrics(stage_day)
         if (not m.get("error")) and _day_analysis_outputs_ready(day_root, video.video_name):
-            return "day", m
+            return "day", m, _processed_gt_from_output("day")
         if not m.get("error"):
-            return "day", {"error": _format_day_analysis_missing_error(day_root, video.video_name)}
-        return "day", m
+            return "day", {"error": _format_day_analysis_missing_error(day_root, video.video_name)}, _processed_gt_from_output("day")
+        return "day", m, _processed_gt_from_output("day")
     if stage_night.exists():
-        return "night", _parse_validation_metrics(stage_night)
+        return "night", _parse_validation_metrics(stage_night), _processed_gt_from_output("night")
 
     expected = stage_day if video.route == "day" else stage_night
-    return video.route, {"error": f"no validation outputs found (expected under: {expected})"}
+    return video.route, {"error": f"no validation outputs found (expected under: {expected})"}, None
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "Temporary runner: route-split global+leaveout training + baselines + gateway inference "
-            "with crash-safe CSV appends."
+            "with baselines matched against pipeline-processed GT."
         )
     )
     p.add_argument(
@@ -3356,75 +3398,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         return lab_metrics, lab_path, raphael_metrics, raphael_path
 
     if run_baselines:
-        print(f"[baselines] enabled={run_baselines}")
-        if not baseline_eval_videos:
-            print("[baselines] WARNING: no baseline-selected videos with GT were found; skipping baseline execution.")
-        lab_baseline_species = sorted({vid.species_name for vid in baseline_eval_videos if vid.video_key in lab_baseline_video_keys})
-        raphael_baseline_species = sorted({vid.species_name for vid in baseline_eval_videos if vid.video_key in raphael_baseline_video_keys})
-        if run_lab_baseline and lab_baseline_species:
-            _prepare_baseline_species_storage(
-                method_key="lab",
-                species_names=lab_baseline_species,
-                dry_run=dry_run,
-            )
-        if run_raphael_baseline and raphael_baseline_species:
-            _prepare_baseline_species_storage(
-                method_key="raphael",
-                species_names=raphael_baseline_species,
-                dry_run=dry_run,
-            )
-        for i, vid in enumerate(baseline_eval_videos, start=1):
-            print(f"[baselines] {i}/{len(baseline_eval_videos)} {vid.species_name} :: {vid.video_path.name} (route={vid.route})")
-            run_lab_for_video = vid.video_key in lab_baseline_video_keys
-            run_raphael_for_video = vid.video_key in raphael_baseline_video_keys
-            if not dry_run:
-                baseline_by_video_key[vid.video_key] = _run_baselines_for_video(
-                    run_root=run_root,
-                    video=vid,
-                    logs_dir=logs_dir,
-                    run_lab=run_lab_for_video,
-                    run_raphael=run_raphael_for_video,
-                    dry_run=bool(dry_run),
-                )
-            # Persist baseline progress immediately per video so crashes do not
-            # lose completed baseline results.
-            lab_metrics, lab_path, raphael_metrics, raphael_path = _baseline_fields(vid.video_key)
-            baseline_methods_used = []
-            if run_lab_for_video:
-                baseline_methods_used.append("lab")
-            if run_raphael_for_video:
-                baseline_methods_used.append("raphael")
-            _record_row(
-                {
-                    "run_id": run_id,
-                    "route": vid.route,
-                    "species_name": vid.species_name,
-                    "video_name": vid.video_name,
-                    "eval_type": "baseline",
-                    "model_used": "+".join(baseline_methods_used),
-                    "results": "",
-                    "inference_output_path": "",
-                    "lab_results": lab_metrics,
-                    "lab_output_path": lab_path,
-                    "raphael_results": raphael_metrics,
-                    "raphael_output_path": raphael_path,
-                    "gt_source": str(vid.gt_source or ""),
-                    "gt_rows": str(int(len(vid.gt_rows))),
-                    "gt_max_t": str(vid.gt_max_t if vid.gt_max_t is not None else ""),
-                }
-            )
-        if not dry_run:
-            _write_baseline_species_results_and_registry(
-                eval_videos=baseline_eval_videos,
-                baseline_by_video_key=baseline_by_video_key,
-                dry_run=dry_run,
-            )
-    if run_baselines and (not run_any_pipeline):
-        print("[eval] pipeline inference disabled; baseline rows already written.")
+        print("[baselines] deferred until after pipeline inference so baselines can reuse pipeline-processed GT.")
 
     videos_by_route: Dict[str, List[EvalVideo]] = {"day": [], "night": []}
     for v in eval_videos:
         videos_by_route.setdefault(v.route, []).append(v)
+
+    pipeline_eval_video_keys: set[str] = {
+        _short_key(str(rv.species_name or "unknown_species"), rv.video_path.stem)
+        for rv in pipeline_routed_videos
+    }
+    if run_baselines:
+        missing_pipeline_for_baselines = [
+            vid
+            for vid in baseline_eval_videos
+            if vid.video_key not in pipeline_eval_video_keys
+        ]
+        if missing_pipeline_for_baselines:
+            missing_desc = ", ".join(
+                sorted({f"{vid.route}:{vid.species_name}:{vid.video_name}" for vid in missing_pipeline_for_baselines})
+            )
+            raise SystemExit(
+                "Baselines now reuse pipeline-processed GT, so every baseline-selected video must also be "
+                f"selected for pipeline inference in the same run. Missing pipeline coverage for: {missing_desc}"
+            )
+
+    processed_gt_by_video_key: Dict[str, Dict[str, str]] = {}
 
     if bool(RUN_DAY_PIPELINE_INFERENCE) and bool(run_leaveout_model_inference) and not resolved_day_yolo_leaveout_models:
         required_leaveout_species = sorted({v.species_name for v in videos_by_route.get("day") or []})
@@ -3491,7 +3490,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     metrics = {"error": "dry_run"}
                 else:
                     try:
-                        _, metrics = _run_gateway_for_video(
+                        route_used, metrics, processed_gt_csv = _run_gateway_for_video(
                             out_root=out_root,
                             video=vid,
                             model_path=global_model.ckpt_path,
@@ -3499,6 +3498,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                             log_path=log_path,
                             dry_run=bool(dry_run),
                         )
+                        if processed_gt_csv is not None and vid.video_key not in processed_gt_by_video_key:
+                            processed_gt_by_video_key[vid.video_key] = {
+                                "route": str(route_used),
+                                "processed_gt_csv": str(processed_gt_csv),
+                                "pipeline_output_root": str(out_root),
+                                "processed_gt_rows": str(_count_csv_data_rows(processed_gt_csv)),
+                            }
                     except Exception as e:
                         metrics = {"error": str(e)}
 
@@ -3563,7 +3569,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         metrics = {"error": "dry_run"}
                     else:
                         try:
-                            _, metrics = _run_gateway_for_video(
+                            route_used, metrics, processed_gt_csv = _run_gateway_for_video(
                                 out_root=out_root,
                                 video=vid,
                                 model_path=lm.ckpt_path,
@@ -3571,6 +3577,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 log_path=log_path,
                                 dry_run=bool(dry_run),
                             )
+                            if processed_gt_csv is not None and vid.video_key not in processed_gt_by_video_key:
+                                processed_gt_by_video_key[vid.video_key] = {
+                                    "route": str(route_used),
+                                    "processed_gt_csv": str(processed_gt_csv),
+                                    "pipeline_output_root": str(out_root),
+                                    "processed_gt_rows": str(_count_csv_data_rows(processed_gt_csv)),
+                                }
                         except Exception as e:
                             metrics = {"error": str(e)}
 
@@ -3596,6 +3609,96 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
     else:
         print("[eval][leaveout] disabled by RUN_LEAVEOUT_MODEL_INFERENCE=False; skipping leaveout-model inference.")
+
+    if run_baselines:
+        print(f"[baselines] enabled={run_baselines}")
+        if not baseline_eval_videos:
+            print("[baselines] WARNING: no baseline-selected videos with GT were found; skipping baseline execution.")
+        lab_baseline_species = sorted({vid.species_name for vid in baseline_eval_videos if vid.video_key in lab_baseline_video_keys})
+        raphael_baseline_species = sorted({vid.species_name for vid in baseline_eval_videos if vid.video_key in raphael_baseline_video_keys})
+        if run_lab_baseline and lab_baseline_species:
+            _prepare_baseline_species_storage(
+                method_key="lab",
+                species_names=lab_baseline_species,
+                dry_run=dry_run,
+            )
+        if run_raphael_baseline and raphael_baseline_species:
+            _prepare_baseline_species_storage(
+                method_key="raphael",
+                species_names=raphael_baseline_species,
+                dry_run=dry_run,
+            )
+        for i, vid in enumerate(baseline_eval_videos, start=1):
+            print(f"[baselines] {i}/{len(baseline_eval_videos)} {vid.species_name} :: {vid.video_path.name} (route={vid.route})")
+            run_lab_for_video = vid.video_key in lab_baseline_video_keys
+            run_raphael_for_video = vid.video_key in raphael_baseline_video_keys
+            processed_gt_info = processed_gt_by_video_key.get(vid.video_key) or {}
+            processed_gt_csv_str = str(processed_gt_info.get("processed_gt_csv") or "")
+            if not processed_gt_csv_str:
+                baseline_by_video_key[vid.video_key] = {
+                    mk: {"metrics": {"error": "processed GT from pipeline inference was not found for this video"}, "out_root": "", "rendered_video": ""}
+                    for mk, enabled in (("lab", run_lab_for_video), ("raphael", run_raphael_for_video))
+                    if enabled
+                }
+            elif not dry_run:
+                baseline_by_video_key[vid.video_key] = _run_baselines_for_video(
+                    run_root=run_root,
+                    video=vid,
+                    processed_gt_csv_path=Path(processed_gt_csv_str),
+                    logs_dir=logs_dir,
+                    run_lab=run_lab_for_video,
+                    run_raphael=run_raphael_for_video,
+                    dry_run=bool(dry_run),
+                )
+            lab_metrics, lab_path, raphael_metrics, raphael_path = _baseline_fields(vid.video_key)
+            baseline_methods_used = []
+            if run_lab_for_video:
+                baseline_methods_used.append("lab")
+            if run_raphael_for_video:
+                baseline_methods_used.append("raphael")
+            _record_row(
+                {
+                    "run_id": run_id,
+                    "route": vid.route,
+                    "species_name": vid.species_name,
+                    "video_name": vid.video_name,
+                    "eval_type": "baseline",
+                    "model_used": "+".join(baseline_methods_used),
+                    "results": "",
+                    "inference_output_path": str(processed_gt_info.get("pipeline_output_root") or ""),
+                    "lab_results": lab_metrics,
+                    "lab_output_path": lab_path,
+                    "raphael_results": raphael_metrics,
+                    "raphael_output_path": raphael_path,
+                    "gt_source": str(processed_gt_csv_str or vid.gt_source or ""),
+                    "gt_rows": str(processed_gt_info.get("processed_gt_rows") or int(len(vid.gt_rows))),
+                    "gt_max_t": str(vid.gt_max_t if vid.gt_max_t is not None else ""),
+                }
+            )
+        if not dry_run:
+            _write_baseline_species_results_and_registry(
+                eval_videos=baseline_eval_videos,
+                baseline_by_video_key=baseline_by_video_key,
+                dry_run=dry_run,
+            )
+
+    if run_baselines:
+        for row in rows_out:
+            if str(row.get("eval_type") or "") not in {"global", "leaveout"}:
+                continue
+            video_key = _short_key(str(row.get("species_name") or "unknown_species"), str(row.get("video_name") or ""))
+            processed_gt_info = processed_gt_by_video_key.get(video_key) or {}
+            lab_metrics, lab_path, raphael_metrics, raphael_path = _baseline_fields(video_key)
+            row["lab_results"] = lab_metrics
+            row["lab_output_path"] = lab_path
+            row["raphael_results"] = raphael_metrics
+            row["raphael_output_path"] = raphael_path
+            if processed_gt_info:
+                row["gt_source"] = str(processed_gt_info.get("processed_gt_csv") or row.get("gt_source") or "")
+                row["gt_rows"] = str(processed_gt_info.get("processed_gt_rows") or row.get("gt_rows") or "")
+
+    if not dry_run:
+        _write_final_csv(final_csv_path, rows_out)
 
     record: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -3691,6 +3794,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "n_eval_videos": int(len(eval_videos)),
         "n_skipped_videos": int(len(skipped_videos)),
         "skipped_videos": skipped_videos,
+        "processed_gt_by_video_key": dict(processed_gt_by_video_key),
         "n_rows_written": int(len(rows_out)),
     }
 

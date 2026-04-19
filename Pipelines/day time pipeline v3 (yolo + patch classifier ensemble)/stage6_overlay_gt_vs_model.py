@@ -7,6 +7,12 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from video_rendering_defaults import normalize_video_bbox_thickness, resolve_video_render_size
+
 BAR_LEN = 50
 def _progress(i, total, tag=''):
     total = max(1, int(total or 1))
@@ -165,6 +171,7 @@ def _render_tp_fp_fn_video_for_thr(
     thickness: int,
     max_frames: Optional[int],
 ):
+    thickness = normalize_video_bbox_thickness(thickness)
     RED    = (0,0,255)
     GREEN  = (0,255,0)
     YELLOW = (0,255,255)
@@ -177,6 +184,7 @@ def _render_tp_fp_fn_video_for_thr(
     fps   = cap.get(cv2.CAP_PROP_FPS) or 25
     W     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out_w, out_h = resolve_video_render_size(W, H)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     _ensure_dir(out_dir)
 
@@ -184,7 +192,7 @@ def _render_tp_fp_fn_video_for_thr(
     safe_thr = _sanitize_thr_name(thr_name)
     legend = "LEGEND_TP=YELLOW_FP=RED_FN=GREEN"
     out_path = out_dir / f"{base}_tp_fp_fn_{safe_thr}__{legend}.mp4"
-    out  = cv2.VideoWriter(str(out_path), fourcc, fps, (W,H))
+    out  = cv2.VideoWriter(str(out_path), fourcc, fps, (out_w, out_h))
 
     # Read lists from fps.csv/tps.csv/fns.csv
     fps_by_t, tps_by_t, fns_by_t = _read_thr_partitions(thr_dir, max_frames)
@@ -219,6 +227,8 @@ def _render_tp_fp_fn_video_for_thr(
             x0,y0,w,h = _clamp_box(x0,y0,box_w,box_h,W,H)
             cv2.rectangle(frame, (x0,y0), (x0+w, y0+h), YELLOW, thickness)
 
+        if frame.shape[1] != out_w or frame.shape[0] != out_h:
+            frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
         out.write(frame)
         _progress(fr+1, limit, f"stage6-threshold-overlay:{thr_name}"); fr += 1
 
@@ -235,7 +245,7 @@ def overlay_gt_vs_model(
     pred_csv_path: Path,
     out_video_path: Path,
     gt_norm_csv_path: Optional[Path] = None,   # if None we try to auto-find a *_norm_offset*.csv in pred_csv_path.parent
-    thickness: int = 1,
+    thickness: int | None = None,
     gt_box_w: int = 10, gt_box_h: int = 10,    # GT boxes are fixed-size around (x,y)
     only_firefly_rows: bool = True,
     max_frames: Optional[int] = None,
@@ -267,6 +277,7 @@ def overlay_gt_vs_model(
 
     This stage expects that Stage 5 has run (for normalized GT and per-threshold CSVs).
     """
+    thickness = normalize_video_bbox_thickness(thickness)
     if stage5_dir_hint is None and stage6_dir_hint is not None:
         stage5_dir_hint = stage6_dir_hint
 
@@ -289,9 +300,10 @@ def overlay_gt_vs_model(
     fps   = cap.get(cv2.CAP_PROP_FPS) or 25
     W     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out_w, out_h = resolve_video_render_size(W, H)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     _ensure_dir(out_video_path.parent)
-    out  = cv2.VideoWriter(str(out_video_path), fourcc, fps, (W,H))
+    out  = cv2.VideoWriter(str(out_video_path), fourcc, fps, (out_w, out_h))
 
     # Colors in BGR
     RED     = (0,0,255)
@@ -342,6 +354,8 @@ def overlay_gt_vs_model(
         frame[only_green] = (0,255,0)
         frame[overlap_mask] = (0,255,255)
 
+        if frame.shape[1] != out_w or frame.shape[0] != out_h:
+            frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
         out.write(frame)
         _progress(fr+1, limit, 'stage6-overlay'); fr += 1
 

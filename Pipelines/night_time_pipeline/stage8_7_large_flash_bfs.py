@@ -27,6 +27,12 @@ from typing import Dict, List, Tuple, Optional, Sequence
 import cv2
 import numpy as np
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from video_rendering_defaults import normalize_video_bbox_thickness
+
 # ──────────────────────────────────────────────────────────────
 # Tiny progress bar (same style as your other stages)
 _BAR = 50
@@ -39,6 +45,8 @@ def _progress(i: int, total: int, tag: str = ''):
 
 def _ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
+
+_ANNOTATION_BOX_THICKNESS = normalize_video_bbox_thickness(None)
 
 # ──────────────────────────────────────────────────────────────
 # Orchestrator accessor so we can reuse global paths/params
@@ -533,10 +541,10 @@ def stage8_7_expand_large_fireflies(
 
             # 100x100 annotated context crop (new=green, old=red)
             annot = frame.copy()
-            cv2.rectangle(annot, (nx0, ny0), (nx0+ns-1, ny0+ns-1), (0,255,0), 2)
+            cv2.rectangle(annot, (nx0, ny0), (nx0+ns-1, ny0+ns-1), (0,255,0), _ANNOTATION_BOX_THICKNESS)
             for d in old_crops_data:
                 ox0, oy0, ow, oh = d['x0'], d['y0'], d['w'], d['h']
-                cv2.rectangle(annot, (ox0, oy0), (ox0+ow-1, oy0+oh-1), (0,0,255), 2)
+                cv2.rectangle(annot, (ox0, oy0), (ox0+ow-1, oy0+oh-1), (0,0,255), _ANNOTATION_BOX_THICKNESS)
 
             xs = [nx0, nx0+ns-1] + [d['x0'] for d in old_crops_data] + [d['x0']+d['w']-1 for d in old_crops_data]
             ys = [ny0, ny0+ns-1] + [d['y0'] for d in old_crops_data] + [d['y0']+d['h']-1 for d in old_crops_data]

@@ -11,10 +11,17 @@ rendered MP4 with all boxes drawn on the original frames.
 import csv
 from collections import defaultdict
 from pathlib import Path
+import sys
 
 import cv2
 
 import params
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from video_rendering_defaults import normalize_video_bbox_thickness, resolve_video_render_size
 
 
 def _progress(i: int, total: int, tag: str = "") -> None:
@@ -43,6 +50,7 @@ def _open_video(path: Path):
 
 def _make_writer(path: Path, w: int, h: int, fps: float, codec: str = "mp4v", is_color: bool = True):
     path.parent.mkdir(parents=True, exist_ok=True)
+    w, h = resolve_video_render_size(w, h)
     fourcc = cv2.VideoWriter_fourcc(*codec)
     writer = cv2.VideoWriter(str(path), fourcc, float(fps), (int(w), int(h)), isColor=is_color)
     if not writer.isOpened():
@@ -99,6 +107,7 @@ def run_for_video(video_path: Path) -> Path:
     max_frames = int(params.MAX_FRAMES) if (params.MAX_FRAMES is not None) else total
     fps = float(params.RENDER_FPS_HINT or fps_src)
     writer = _make_writer(out_path, W, H, fps, codec=params.RENDER_CODEC, is_color=True)
+    box_thickness = normalize_video_bbox_thickness(getattr(params, "OVERLAY_BOX_THICKNESS", None))
 
     t = 0
     try:
@@ -114,7 +123,7 @@ def run_for_video(video_path: Path) -> Path:
                     y1 = y0 + int(h)
                     # red = kept, blue = rejected
                     color = (255, 0, 0) if rejected else (0, 0, 255)
-                    cv2.rectangle(frame, (x0, y0), (x1, y1), color, 1, cv2.LINE_AA)
+                    cv2.rectangle(frame, (x0, y0), (x1, y1), color, box_thickness, cv2.LINE_AA)
             writer.write(frame)
             t += 1
             if t % 50 == 0:

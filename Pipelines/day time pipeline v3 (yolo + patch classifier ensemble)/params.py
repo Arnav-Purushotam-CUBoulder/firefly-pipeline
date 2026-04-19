@@ -9,7 +9,17 @@ own outputs under ROOT.
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from typing import List
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from video_rendering_defaults import (
+    ENFORCE_SOURCE_VIDEO_RESOLUTION,
+    VIDEO_RENDER_BBOX_THICKNESS_PX,
+)
 
 
 # Root folder for this pipeline (EDIT THIS)
@@ -129,6 +139,7 @@ PATCH_SIZE_PX: int = 10
 # - RENDER_FPS_HINT: None to use source fps; else override.
 RENDER_CODEC: str = "mp4v"
 RENDER_FPS_HINT: float | None = None
+RENDER_ENFORCE_SOURCE_RESOLUTION: bool = ENFORCE_SOURCE_VIDEO_RESOLUTION
 # If True and Stage3.1 produced `*_patches_motion_all.csv`, draw rejected
 # detections in blue and kept detections in red.
 STAGE4_DRAW_STAGE3_1_REJECTED: bool = False
@@ -221,7 +232,7 @@ STAGE5_CROP_W: int = int(PATCH_SIZE_PX)
 STAGE5_CROP_H: int = int(PATCH_SIZE_PX)
 STAGE6_GT_BOX_W: int = STAGE5_CROP_W
 STAGE6_GT_BOX_H: int = STAGE5_CROP_H
-OVERLAY_BOX_THICKNESS: int = 1
+OVERLAY_BOX_THICKNESS: int = VIDEO_RENDER_BBOX_THICKNESS_PX
 
 # Stage 5 options
 STAGE5_ONLY_FIREFLY_ROWS: bool = True

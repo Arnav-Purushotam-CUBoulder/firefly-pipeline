@@ -12,9 +12,16 @@ import argparse
 import csv
 from collections import defaultdict
 from pathlib import Path
+import sys
 from typing import Dict, List
 
 import cv2
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from video_rendering_defaults import normalize_video_bbox_thickness, resolve_video_render_size
 
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
@@ -79,6 +86,7 @@ def _open_video(path: Path):
 
 def _make_writer(out_path: Path, width: int, height: int, fps: float):
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    width, height = resolve_video_render_size(width, height)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(out_path), fourcc, float(fps), (int(width), int(height)))
     if not writer.isOpened():
@@ -119,6 +127,7 @@ def render_predictions(
 
     writer = _make_writer(out_video, width, height, fps)
     frame_idx = 0
+    box_thickness = normalize_video_bbox_thickness(None)
 
     try:
         while True:
@@ -135,7 +144,7 @@ def render_predictions(
                 y0 = max(0, min(y0, height - 1))
                 x1 = max(0, min(x1, width - 1))
                 y1 = max(0, min(y1, height - 1))
-                cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 0, 255), 1, cv2.LINE_AA)
+                cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 0, 255), box_thickness, cv2.LINE_AA)
                 conf = det.get("conf")
                 if conf is not None:
                     text = f"{float(conf):.2f}"

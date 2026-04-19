@@ -16,11 +16,18 @@ from __future__ import annotations
 from pathlib import Path
 import csv
 import shutil
+import sys
 
 import cv2
 import numpy as np
 
 import params
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from video_rendering_defaults import normalize_video_bbox_thickness
 
 try:
     from ultralytics import YOLO
@@ -31,9 +38,10 @@ except Exception as e:  # pragma: no cover
     ) from e
 
 
-def _draw_boxes(image: np.ndarray, boxes_xyxy: np.ndarray, color=(0, 0, 255), thickness: int = 1) -> np.ndarray:
+def _draw_boxes(image: np.ndarray, boxes_xyxy: np.ndarray, color=(0, 0, 255), thickness: int | None = None) -> np.ndarray:
     """Return a copy of image with axis-aligned boxes drawn."""
     out = image.copy()
+    thickness = normalize_video_bbox_thickness(thickness)
     for x1, y1, x2, y2 in boxes_xyxy.astype(int):
         cv2.rectangle(out, (int(x1), int(y1)), (int(x2), int(y2)), color, int(thickness), cv2.LINE_AA)
     return out

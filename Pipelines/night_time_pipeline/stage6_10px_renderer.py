@@ -3,6 +3,12 @@ from collections import defaultdict
 from pathlib import Path
 import cv2
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from video_rendering_defaults import normalize_video_bbox_thickness, resolve_video_render_size
+
 BAR_LEN = 50
 def progress(i, total, tag=''):
     frac = i / total if total else 0
@@ -16,7 +22,7 @@ def render_fixed_10px_from_csv(
     csv_path: Path,
     out_path: Path,
     *,
-    thickness=2,
+    thickness=None,
     max_frames=None,
     color=(0,0,255),                # firefly color (red by default for orig)
     draw_background=True,
@@ -66,9 +72,11 @@ def render_fixed_10px_from_csv(
     fps   = cap.get(cv2.CAP_PROP_FPS) or 25
     W     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out_w, out_h = resolve_video_render_size(W, H)
+    thickness = normalize_video_bbox_thickness(thickness)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*'mp4v'), fps, (W,H))
+    out = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*'mp4v'), fps, (out_w, out_h))
 
     FIX_W = 10; FIX_H = 10
 
@@ -102,6 +110,8 @@ def render_fixed_10px_from_csv(
             elif cls == 'background' and draw_background:
                 cv2.rectangle(frame, (x0, y0), (x0 + FIX_W, y0 + FIX_H), background_color, thickness)
 
+        if frame.shape[1] != out_w or frame.shape[0] != out_h:
+            frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
         out.write(frame)
         progress(fr+1, total, 'render-10px'); fr += 1
 
