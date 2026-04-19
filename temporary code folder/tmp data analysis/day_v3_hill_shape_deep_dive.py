@@ -151,7 +151,10 @@ def _hill_metrics(
 
 def _load_final_results(run_root: Path) -> dict[str, str]:
     out: dict[str, str] = {}
-    with (run_root / "final_results.csv").open("r", newline="") as f:
+    final_results_csv = run_root / "inference_outputs" / "final_results.csv"
+    if not final_results_csv.exists():
+        final_results_csv = run_root / "final_results.csv"
+    with final_results_csv.open("r", newline="") as f:
         for row in csv.DictReader(f):
             out[row["video_name"]] = row["species_name"]
     return out

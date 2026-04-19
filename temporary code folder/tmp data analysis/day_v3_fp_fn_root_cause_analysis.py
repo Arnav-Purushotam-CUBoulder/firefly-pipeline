@@ -299,6 +299,16 @@ def _video_case_dirs(run_root: Path) -> list[Path]:
     return sorted([p for p in root.iterdir() if p.is_dir()])
 
 
+def _resolve_pipeline_results_csv(run_root: Path) -> Path:
+    for candidate in (
+        run_root / "inference_outputs" / "final_results.csv",
+        run_root / "final_results.csv",
+    ):
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Could not find pipeline results CSV under {run_root}")
+
+
 def _species_map(final_results_csv: Path) -> dict[str, tuple[str, str]]:
     out: dict[str, tuple[str, str]] = {}
     with final_results_csv.open("r", newline="") as f:
@@ -308,7 +318,7 @@ def _species_map(final_results_csv: Path) -> dict[str, tuple[str, str]]:
 
 
 def analyze_run(run_root: Path, output_dir: Path, dist_px: float = 10.0, selected_near_px: float = 20.0) -> dict:
-    final_results_csv = run_root / "final_results.csv"
+    final_results_csv = _resolve_pipeline_results_csv(run_root)
     video_meta = _species_map(final_results_csv)
 
     output_dir.mkdir(parents=True, exist_ok=True)

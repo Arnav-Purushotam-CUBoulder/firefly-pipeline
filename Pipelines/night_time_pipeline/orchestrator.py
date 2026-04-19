@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""
+Orchestrator: holds ALL global variables and calls each stage.
+
+Pipeline:
+  1) detect_blobs_to_csv():  ORIGINAL video → dynamic boxes → CSV (frame,x,y,w,h)
+  2) recenter_boxes_with_centroid(): original video + CSV → recenter with intensity-weighted centroid → update same CSV
+  3) filter_boxes_by_area(): drop rows with w*h < AREA_THRESHOLD_PX, save a snapshot CSV
+  4) classify_and_filter_csv(): label rows via CNN (adds 'class' column; may drop/keep background)
+  5) prune_overlaps_keep_heaviest_unionfind(): group by centroid distance, keep heaviest RGB-sum per group
+  6) render_from_csv(): draw boxes from CSVs (honors 'class' + draw_background)
+  7) render_fixed_10px_from_csv(): draw fixed 10×10 boxes centered on each detection
+  8) recenter_gaussian_centroid(): refine centers with (Gaussian-optional) intensity centroid, overwrite CSV
+  9) stage9_validate_against_gt(): validate predictions vs ground truth, save FP/TP/FN crops & metrics
+  10) overlay_gt_vs_model(): render GT (GREEN), Model (RED), overlap (YELLOW) on a single video (runs only if Stage 9 ran)
+      and render per-threshold videos (TP=YELLOW, FP=RED, FN=GREEN).   
+"""
+
+from pathlib import Path
+import sys
+import time
+from collections import OrderedDict
+
+# ──────────────────────────────────────────────────────────────
+# Imports for each stage
+# ──────────────────────────────────────────────────────────────
+from stage1_detect import detect_blobs_to_csv
+from stage2_recenter import recenter_boxes_with_centroid
+from stage3_area_filter import filter_boxes_by_area
+from stage4_cnn_filter import classify_and_filter_csv
+from stage5_render import render_from_csv
+from stage6_10px_renderer import render_fixed_10px_from_csv
+from stage7_merge import prune_overlaps_keep_heaviest_unionfind
+from stage8_gaussian_centroid import recenter_gaussian_centroid
+from stage8_5_blob_area_filter import stage8_5_prune_by_blob_area
+from stage9_validate import stage9_validate_against_gt
+from stage10_overlay_gt_vs_model import overlay_gt_vs_model  # includes per-threshold TP/FP/FN videos
+from stage11_fn_analysis import stage11_fn_nearest_tp_analysis
+from stage12_fp_analysis import stage12_fp_nearest_tp_analysis
+from stage8_6_neighbor_hunt import stage8_6_run
+from stage8_7_large_flash_bfs import stage8_7_expand_large_fireflies
+from stage8_9_gt_gaussian_centroid import stage8_9_recenter_gt_gaussian_centroid
+
+from stage8_sync import rebuild_fireflies_logits_from_main
+from stage0_cleanup import cleanup_inference_root
+from stage14_detection_summary import stage14_generate_detection_summary
+from pipeline_params import *  # noqa: F403
+
+if RUN_PRE_RUN_CLEANUP:
+    print("[stage0_cleanup] Running pre-run cleanup…")
+    cleanup_inference_root(
+        ROOT,
+        keep_dirs=CLEANUP_KEEP_DIRS,
+        gt_filename=CLEANUP_GT_FILENAME,
+        verbose=True,
+    )
+
+# Ensure output/working directories exist
+for d in [DIR_CSV, DIR_OUT_BGS, DIR_OUT_ORIG, DIR_OUT_ORIG_10,
+          DIR_STAGE8_CROPS, DIR_STAGE9_OUT, DIR_STAGE10_OUT, DIR_STAGE8_9_OUT, DIR_STAGE14_OUT]:
+    d.mkdir(parents=True, exist_ok=True)
+
+
+
+
+
+
+
+
+
+def _print_stage_timing(stage_times: dict, video_stem: str):
+    # Stages counted toward the *detection pipeline* time (rendering excluded)
+    pipeline_order = [
+        '01_detect','02_recenter','03_area_filter','04_cnn',
+        '07_merge','08_gauss','08_5_blob_area','08_6_neighbor_hunt',
+        '08_7_large_flash_bfs','08_5_after_8_7'  # <- included if present
+    ]
+    # Rendering-only (excluded from pipeline total; printed separately)
+    render_order = ['05_render','06_render10']
+
+    p_times = OrderedDict((k, stage_times[k]) for k in pipeline_order if k in stage_times)
+    r_times = OrderedDict((k, stage_times[k]) for k in render_order   if k in stage_times)
+
+    p_total = sum(p_times.values())
+    r_total = sum(r_times.values())
+    
+
+    # Pipeline breakdown (≤ 8.7 plus optional 8.5-after-8.7)
+    print(f"\n[time] {video_stem} — detection pipeline (≤ 8.7)")
+    if p_total <= 0:
+        print("  (no timed pipeline stages)")
+    else:
+        for k, dt in p_times.items():
+            pct = (100.0 * dt / p_total) if p_total else 0.0
+            print(f"  {k:>20}: {dt:8.2f}s  ({pct:5.1f}%)")
+        print(f"  {'TOTAL (pipeline)':>20}: {p_total:8.2f}s  (100.0%)")
+
+    # Rendering breakdown (excluded from pipeline total)
+    if r_times:
+        print(f"\n[time] {video_stem} — rendering (excluded from pipeline total)")
+        for k, dt in r_times.items():
+            print(f"  {k:>20}: {dt:8.2f}s")
+        print(f"  {'TOTAL (rendering)':>20}: {r_total:8.2f}s\n")
+    else:
+        print()  # blank line for spacing
+
+
+# --- helper: build the right kwargs for the chosen Stage-1 variant
+def _pack_stage1_params_for(variant: str) -> dict:
+    if variant == 'blob':
+        return dict(
+            sbd_min_area_px=SBD_MIN_AREA_PX,
+            sbd_max_area_scale=SBD_MAX_AREA_SCALE,
+            sbd_min_dist=SBD_MIN_DIST,
+            sbd_min_repeat=SBD_MIN_REPEAT,
+            use_clahe=USE_CLAHE, clahe_clip=CLAHE_CLIP, clahe_tile=CLAHE_TILE,
+            use_tophat=USE_TOPHAT, tophat_ksize=TOPHAT_KSIZE,
+            use_dog=USE_DOG, dog_sigma1=DOG_SIGMA1, dog_sigma2=DOG_SIGMA2,
+        )
+    elif variant in ('cc_cpu', 'cc_cuda'):
+        d = dict(
+            min_area_px=CC_MIN_AREA_PX, max_area_scale=CC_MAX_AREA_SCALE,
+            use_clahe=CC_USE_CLAHE, clahe_clip=CC_CLAHE_CLIP, clahe_tile=CC_CLAHE_TILE,
+            use_tophat=CC_USE_TOPHAT, tophat_ksize=CC_TOPHAT_KSIZE,
+            use_dog=CC_USE_DOG, dog_sigma1=CC_DOG_SIGMA1, dog_sigma2=CC_DOG_SIGMA2,
+            threshold_method=CC_THRESHOLD_METHOD, fixed_threshold=CC_FIXED_THRESHOLD,
+            open_ksize=CC_OPEN_KSIZE, connectivity=CC_CONNECTIVITY,
+        )
+        if variant == 'cc_cuda':
+            # only cc_cuda understands these
+            d.update(batch_size=CC_BATCH_SIZE,
+                     preproc_backend=CC_PREPROC_BACKEND,
+                     adaptive_c=CC_ADAPTIVE_C)
+        return d
+    elif variant == 'cucim':
+        return dict(
+            detector=CUCIM_DETECTOR,
+            min_sigma=CUCIM_MIN_SIGMA,
+            max_sigma=CUCIM_MAX_SIGMA,
+            num_sigma=CUCIM_NUM_SIGMA,
+            sigma_ratio=CUCIM_SIGMA_RATIO,
+            threshold=CUCIM_THRESHOLD,
+            overlap=CUCIM_OVERLAP,
+            log_scale=CUCIM_LOG_SCALE,
+            min_area_px=CUCIM_MIN_AREA_PX,
+            max_area_scale=CUCIM_MAX_AREA_SCALE,
+            pad_px=CUCIM_PAD_PX,
+            use_clahe=CUCIM_USE_CLAHE,
+            clahe_clip=CUCIM_CLAHE_CLIP,
+            clahe_tile=CUCIM_CLAHE_TILE,
+            batch_size=CUCIM_BATCH_SIZE,
+        )
+    else:
+        raise ValueError(f"Unknown Stage-1 variant: {variant!r}")
+
+
+
+
+
+def _iter_videos(dir_path: Path):
+    if not dir_path.exists():
+        return []
+    return sorted([p for p in dir_path.iterdir() if p.suffix.lower() in VIDEO_EXTS])
+
+
+def main():
+    # Sanity echo so you always know which root is used
+    print(f"[orchestrator] ROOT: {ROOT}")
+
+    orig_videos = _iter_videos(DIR_ORIG_VIDEOS)
+    if not orig_videos:
+        print(f"[orchestrator] No videos found in: {DIR_ORIG_VIDEOS}")
+        sys.exit(0)
+
+    for orig_path in orig_videos:
+        base = orig_path.stem
+        print(f"\n=== Processing: {base} ===")
+        stage_times = {}
+
+        # Optional BS video with same basename
+        bs_path = None
+        cand = DIR_BGS_VIDEOS / orig_path.name
+        if cand.exists():
+            bs_path = cand
+
+        # CSV path for this video
+        csv_path = DIR_CSV / f'{base}.csv'
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Stage 1 — detect
+        if RUN_STAGE1:
+            if STAGE1_VARIANT == 'blob':
+                _t0 = time.perf_counter()
+                detect_blobs_to_csv(
+                    orig_path=orig_path,
+                    csv_path=csv_path,
+                    max_frames=MAX_FRAMES,
+                    sbd_min_area_px=SBD_MIN_AREA_PX,
+                    sbd_max_area_scale=SBD_MAX_AREA_SCALE,
+                    sbd_min_dist=SBD_MIN_DIST,
+                    sbd_min_repeat=SBD_MIN_REPEAT,
+                    use_clahe=USE_CLAHE,
+                    clahe_clip=CLAHE_CLIP,
+                    clahe_tile=CLAHE_TILE,
+                    use_tophat=USE_TOPHAT,
+                    tophat_ksize=TOPHAT_KSIZE,
+                    use_dog=USE_DOG,
+                    dog_sigma1=DOG_SIGMA1,
+                    dog_sigma2=DOG_SIGMA2,
+                )
+                stage_times['01_detect'] = time.perf_counter() - _t0
+            elif STAGE1_VARIANT in ('cc_cpu', 'cc_cuda', 'cucim'):
+                if STAGE1_VARIANT == 'cc_cpu':
+                    from stage1_detect_cc_cpu import detect_stage1_to_csv as _stage1_impl
+                elif STAGE1_VARIANT == 'cc_cuda':
+                    from stage1_detect_cc_cuda import detect_stage1_to_csv as _stage1_impl
+                else:
+                    from stage1_detect_cucim import detect_stage1_to_csv as _stage1_impl
+
+                _t0 = time.perf_counter()
+                stage1_kwargs = dict(
+                    orig_path=orig_path,
+                    csv_path=csv_path,
+                    max_frames=MAX_FRAMES,
+                    **_pack_stage1_params_for(STAGE1_VARIANT),
+                )
+                _stage1_impl(**stage1_kwargs)
+                stage_times['01_detect'] = time.perf_counter() - _t0
+
+            else:
+                raise ValueError(f"Unknown STAGE1_VARIANT={STAGE1_VARIANT!r} (expected 'blob'|'cc_cpu'|'cc_cuda'|'cucim')")
+        # Stage 2 — recenter via intensity centroid (drop dim crops)
+        if RUN_STAGE2:
+            _t0 = time.perf_counter()
+            recenter_boxes_with_centroid(
+                orig_path=orig_path,
+                csv_path=csv_path,
+                max_frames=MAX_FRAMES,
+                bright_max_threshold=BRIGHT_MAX_THRESHOLD,
+            )
+            stage_times['02_recenter'] = time.perf_counter() - _t0
+
+        # Stage 3 — area filter (in-place) + snapshot
+        if RUN_STAGE3:
+            _t0 = time.perf_counter()
+            snapshot_csv = csv_path.parent / f"{csv_path.stem}_area_snapshot.csv"
+            filter_boxes_by_area(
+                csv_path=csv_path,
+                area_threshold_px=AREA_THRESHOLD_PX,
+                snapshot_csv_path=snapshot_csv,
+            )
+            stage_times['03_area_filter'] = time.perf_counter() - _t0
+
+        # Stage 4 — CNN classify/filter (adds logits/confidence/class)
+        if RUN_STAGE4 and USE_CNN_FILTER:
+            _t0 = time.perf_counter()
+            classify_and_filter_csv(
+                orig_path=orig_path,
+                csv_path=csv_path,
+                max_frames=MAX_FRAMES,
+                use_cnn_filter=USE_CNN_FILTER,
+                model_path=CNN_MODEL_PATH,
+                backbone=CNN_BACKBONE,
+                class_to_keep=CNN_CLASS_TO_KEEP,
+                patch_w=CNN_PATCH_W,
+                patch_h=CNN_PATCH_H,
+                patch_batch_size=NUM_PATCHES_BATCH_SIZE,
+                firefly_conf_thresh=FIREFLY_CONF_THRESH,
+                drop_background_rows=DROP_BACKGROUND_ROWS,
+                imagenet_normalize=IMAGENET_NORMALIZE,
+                print_load_status=PRINT_LOAD_STATUS,
+                fail_if_weights_missing=FAIL_IF_WEIGHTS_MISSING,
+                debug_save_patches_dir=DEBUG_SAVE_PATCHES_DIR,
+            )
+            stage_times['04_cnn'] = time.perf_counter() - _t0
+
+        # Stage 5 — render dynamic boxes on BS and/or original
+        if RUN_STAGE5:
+            _t0 = time.perf_counter()
+            if SAVE_ANN_BG and bs_path is not None:
+                out_bg_path = DIR_OUT_BGS / f"{base}_bs_annotated.mp4"
+                render_from_csv(
+                    video_path=bs_path,
+                    csv_path=csv_path,
+                    out_path=out_bg_path,
+                    color=(0, 0, 255),
+                    thickness=BBOX_THICKNESS,
+                    max_frames=MAX_FRAMES,
+                    draw_background=DRAW_BACKGROUND_BOXES,
+                    background_color=(0, 255, 0),
+                )
+            if SAVE_ANN_ORIG:
+                out_orig_path = DIR_OUT_ORIG / f"{base}_orig_annotated.mp4"
+                render_from_csv(
+                    video_path=orig_path,
+                    csv_path=csv_path,
+                    out_path=out_orig_path,
+                    color=(0, 0, 255),
+                    thickness=BBOX_THICKNESS,
+                    max_frames=MAX_FRAMES,
+                    draw_background=DRAW_BACKGROUND_BOXES,
+                    background_color=(0, 255, 0),
+                )
+            stage_times['05_render'] = time.perf_counter() - _t0
+
+        # Stage 6 — render fixed 10×10 on original
+        if RUN_STAGE6 and SAVE_ANN_10PX:
+            _t0 = time.perf_counter()
+            out_orig_10px_path = DIR_OUT_ORIG_10 / f"{base}_orig_10px.mp4"
+            render_fixed_10px_from_csv(
+                video_path=orig_path,
+                csv_path=csv_path,
+                out_path=out_orig_10px_path,
+                thickness=BBOX_THICKNESS,
+                max_frames=MAX_FRAMES,
+                color=(0, 0, 255),
+                draw_background=DRAW_BACKGROUND_BOXES,
+                background_color=(0, 255, 0),
+            )
+            stage_times['06_render10'] = time.perf_counter() - _t0
+
+        # Stage 7 — prune overlaps (union-find keep-heaviest)
+        if RUN_STAGE7:
+            _t0 = time.perf_counter()
+            prune_overlaps_keep_heaviest_unionfind(
+                orig_video_path=orig_path,
+                csv_path=csv_path,
+                dist_threshold_px=STAGE7_DIST_THRESHOLD_PX,
+                max_frames=MAX_FRAMES,
+                verbose=STAGE7_VERBOSE,
+            )
+            stage_times['07_merge'] = time.perf_counter() - _t0
+            rebuild_fireflies_logits_from_main(csv_path)
+
+
+        # Stage 8 — Gaussian centroid recenter (rewrites CSV; x,y become centers; w,h fixed to patch; adds xy_semantics='center')
+        if RUN_STAGE8:
+            _t0 = time.perf_counter()
+            recenter_gaussian_centroid(
+                orig_video_path=orig_path,
+                csv_path=csv_path,
+                centroid_patch_w=STAGE8_PATCH_W,
+                centroid_patch_h=STAGE8_PATCH_H,
+                gaussian_sigma=STAGE8_GAUSSIAN_SIGMA,
+                max_frames=MAX_FRAMES,
+                verbose=STAGE8_VERBOSE,
+                crop_dir=DIR_STAGE8_CROPS / base,   # optional per-video dump
+            )
+            stage_times['08_gauss'] = time.perf_counter() - _t0
+            rebuild_fireflies_logits_from_main(csv_path)
+        
+        # Stage 8.5 — prune firefly detections by blob area (> brightness floor), keep files in sync
+        if RUN_STAGE8_5:
+            _t0 = time.perf_counter()
+            stage8_5_prune_by_blob_area(
+                orig_video_path=orig_path,
+                csv_path=csv_path,
+                area_threshold_px=AREA_THRESHOLD_PX,  # same scalar you use elsewhere
+                min_pixel_brightness_to_be_considered_in_area_calculation=MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION,
+                max_frames=MAX_FRAMES,
+                verbose=True,
+            )
+            stage_times['08_5_blob_area'] = time.perf_counter() - _t0
+            rebuild_fireflies_logits_from_main(csv_path)
+
+        if RUN_STAGE8_6:
+            _t0 = time.perf_counter()
+            _added = stage8_6_run(
+                orig_video_path=orig_path,
+                main_csv_path=csv_path,
+                num_runs=STAGE8_6_RUNS,
+                stage1_impl=STAGE1_VARIANT,
+                stage1_params=_pack_stage1_params_for(STAGE1_VARIANT),
+            )
+            stage_times['08_6_neighbor_hunt'] = time.perf_counter() - _t0
+            rebuild_fireflies_logits_from_main(csv_path)
+
+         # ── NEW: Stage 8.7 — grow large flashes & replace 10x10 shards
+        if RUN_STAGE8_7:
+            _t0 = time.perf_counter()
+            stage8_7_expand_large_fireflies(
+                orig_video_path=orig_path,
+                main_csv_path=csv_path,
+                neighbor_intensity_threshold=STAGE8_7_INTENSITY_THR,
+                dedupe_dist_px=STAGE8_7_DEDUPE_PX,
+                min_square_area_px=STAGE8_7_MIN_SQUARE_AREA_PX,
+                gaussian_sigma=STAGE8_7_GAUSSIAN_SIGMA,
+                max_frames=MAX_FRAMES,
+                verbose=True,
+            )
+            stage_times['08_7_large_flash_bfs'] = time.perf_counter() - _t0
+            rebuild_fireflies_logits_from_main(csv_path)
+
+        # Re-run 8.5 AFTER 8.7 so replacements/center shifts are re-checked
+        if RUN_STAGE8_5_AFTER_8_7:
+            _t0 = time.perf_counter()
+            stage8_5_prune_by_blob_area(
+                orig_video_path=orig_path,
+                csv_path=csv_path,
+                area_threshold_px=AREA_THRESHOLD_PX,
+                min_pixel_brightness_to_be_considered_in_area_calculation=MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION,
+                max_frames=MAX_FRAMES,
+                verbose=True,
+            )
+            stage_times['08_5_after_8_7'] = time.perf_counter() - _t0
+            rebuild_fireflies_logits_from_main(csv_path)
+        
+
+        _print_stage_timing(stage_times, base)
+
+
+
+
+        # Stage 8.9 — GT recenter (produces x,y,t + debug crops), runs once per video
+        if RUN_STAGE8_9:
+            out89 = DIR_STAGE8_9_OUT / base
+            stage8_9_recenter_gt_gaussian_centroid(
+            orig_video_path=orig_path,
+            gt_csv_path=GT_CSV_PATH,                 # overwritten in place to x,y,t
+            crop_w=STAGE8_9_CROP_W,
+            crop_h=STAGE8_9_CROP_H,
+            gaussian_sigma=STAGE8_9_GAUSSIAN_SIGMA,
+            gt_t_offset=GT_T_OFFSET,
+            max_frames=MAX_FRAMES,
+            out_crop_dir=out89,
+            verbose=True,
+        )
+
+
+
+
+
+
+
+
+
+        # Stage 9 — validate vs ground truth (writes normalized GT to stage9 dir and copies to CSV dir; saves TP/FP/FN crops)
+        ran_stage9 = False
+        if RUN_STAGE9:
+            out9 = DIR_STAGE9_OUT / base
+            out9.mkdir(parents=True, exist_ok=True)
+            stage9_validate_against_gt(
+                orig_video_path=orig_path,
+                pred_csv_path=csv_path,
+                gt_csv_path=GT_CSV_PATH,
+                out_dir=out9,
+                dist_thresholds=DIST_THRESHOLDS_PX,
+                crop_w=STAGE9_CROP_W,
+                crop_h=STAGE9_CROP_H,
+                gt_t_offset=GT_T_OFFSET,
+                max_frames=MAX_FRAMES,
+                only_firefly_rows=STAGE9_ONLY_FIREFLY_ROWS,
+                show_per_frame=STAGE9_SHOW_PER_FRAME,
+                model_path=STAGE9_MODEL_PATH,                # used only for FN confidence
+                backbone=STAGE9_BACKBONE,
+                imagenet_normalize=STAGE9_IMAGENET_NORM,
+                print_load_status=STAGE9_PRINT_LOAD_STATUS,
+                # NEW: forward GT filters from orchestrator constants
+                gt_area_threshold_px=AREA_THRESHOLD_PX,
+                gt_bright_max_threshold=BRIGHT_MAX_THRESHOLD,
+                # NEW: brightness floor for area calculation (largest CC uses '>' this value)
+                min_pixel_brightness_to_be_considered_in_area_calculation=MIN_PIXEL_BRIGHTNESS_TO_BE_CONSIDERED_IN_AREA_CALCULATION,
+                gt_dedupe_dist_threshold_px=STAGE9_GT_DEDUPE_DIST_PX,  # NEW
+            )
+            ran_stage9 = True
+        
+        # Stage 11 — FN analysis (per-threshold nearest-TP distances → CSV + full-frame images)
+        if RUN_STAGE11 and ran_stage9:
+            stage11_fn_nearest_tp_analysis(
+                stage9_video_dir=DIR_STAGE9_OUT / base,
+                orig_video_path=orig_path,          # NEW: needed to grab full frames
+                box_w=STAGE10_GT_BOX_W,             # optional (keeps visuals consistent)
+                box_h=STAGE10_GT_BOX_H,             # optional
+                color=(0, 255, 255),                # optional: yellow boxes for FN & nearest TP
+                thickness=BBOX_THICKNESS,           # optional
+                verbose=True,
+        )
+            
+            
+        # Stage 12 — FP analysis (per-threshold nearest-TP distances → CSV + full-frame images)
+        if RUN_STAGE12 and ran_stage9:
+            stage12_fp_nearest_tp_analysis(
+                stage9_video_dir=DIR_STAGE9_OUT / base,
+                orig_video_path=orig_path,
+                box_w=STAGE10_GT_BOX_W,   # keep consistent visuals
+                box_h=STAGE10_GT_BOX_H,
+                color=(255, 0, 255),      # magenta for FP↔TP pairs (same color for both boxes)
+                thickness=BBOX_THICKNESS,
+                verbose=True,
+        )
+            
+        if ran_stage9 and RUN_STAGE14:
+            summary_dir = DIR_STAGE14_OUT / base
+            stage14_generate_detection_summary(
+                stage9_video_dir=DIR_STAGE9_OUT / base,
+                output_dir=summary_dir,
+                include_nearest_tp=True,
+                verbose=True,
+            )
+
+
+        # Stage 10 — overlay GT (GREEN), model (RED), overlap (YELLOW) on one video
+        #            and render per-threshold TP/FP/FN videos (TP=YELLOW, FP=RED, FN=GREEN)
+        if RUN_STAGE10 and ran_stage9:
+            legend = "LEGEND_GT=GREEN_MODEL=RED_OVERLAP=YELLOW"
+            out_overlay_path = DIR_STAGE10_OUT / f'{base}_gt_vs_model__{legend}.mp4'
+            overlay_gt_vs_model(
+                orig_video_path=orig_path,
+                pred_csv_path=csv_path,
+                out_video_path=out_overlay_path,
+                gt_norm_csv_path=None,                 # auto-find *_norm_offset*.csv (Stage 9 wrote & copied into CSV dir)
+                thickness=BBOX_THICKNESS,
+                gt_box_w=STAGE10_GT_BOX_W,
+                gt_box_h=STAGE10_GT_BOX_H,
+                only_firefly_rows=STAGE9_ONLY_FIREFLY_ROWS,
+                max_frames=MAX_FRAMES,
+                stage9_dir_hint=DIR_STAGE9_OUT,        # helps it find thr_* folders quickly
+                render_threshold_overlays=True,        # also writes per-threshold TP/FP/FN videos
+                thr_box_w=STAGE10_GT_BOX_W,
+                thr_box_h=STAGE10_GT_BOX_H,
+            )
+
+        print(f'done {base}')
+
+if __name__ == "__main__":
+    main()
