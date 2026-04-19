@@ -60,28 +60,49 @@ VIDEO_CATALOG_FILENAME: str = "tmp_scaling_species_training_inference_catalog.js
 # -----------------------------------------------------------------------------
 # Run Component Switches (edit these first)
 # -----------------------------------------------------------------------------
-# 1) Ingestion
-# If False, this script skips ingestion and uses already-ingested species
-# datasets under PATCH_DATA_ROOT directly.
-RUN_INGESTION_FROM_SCRATCH: bool = False
-
-# 2) Model training
-RUN_MODEL_TRAINING: bool = False
+# 1) Model training
+RUN_MODEL_TRAINING: bool = True
 RUN_DAY_MODEL_TRAINING: bool = False
-RUN_NIGHT_MODEL_TRAINING: bool = False
-TRAIN_GLOBAL_MODELS: bool = False
+RUN_NIGHT_MODEL_TRAINING: bool = True
+TRAIN_GLOBAL_MODELS: bool = True
 TRAIN_LEAVEOUT_MODELS: bool = False
 
-# 3) Baseline methods (Lab + Raphael)
+# 2) Baseline methods (Lab + Raphael)
 # Set this True to run only baseline methods if day/night pipeline toggles below
 # are both False.
-RUN_BASELINE_METHODS_INFERENCE: bool = False
-RUN_LAB_BASELINE: bool = False
-RUN_RAPHAEL_BASELINE: bool = False
+RUN_BASELINE_METHODS_INFERENCE: bool = True
+RUN_LAB_BASELINE: bool = True
+RUN_RAPHAEL_BASELINE: bool = True
 
-# 4) Your pipeline inference (split by route)
-RUN_DAY_PIPELINE_INFERENCE: bool = True
-RUN_NIGHT_PIPELINE_INFERENCE: bool = False
+# Baseline species switches are independent from your pipeline inference
+# switches. Turn on only the species you want each baseline method to run on.
+LAB_BASELINE_SPECIES_SWITCHES: Dict[str, bool] = {
+    "bicellonycha-wickershamorum": False,
+    "photinus-acuminatus": False,
+    "photinus-greeni": False,
+    "photuris-bethaniensis": False,
+    "forresti": False,
+    "frontalis": False,
+    "photinus-carolinus": False,
+    "photinus-knulli": True,
+    "tremulans": False,
+}
+
+RAPHAEL_BASELINE_SPECIES_SWITCHES: Dict[str, bool] = {
+    "bicellonycha-wickershamorum": False,
+    "photinus-acuminatus": False,
+    "photinus-greeni": False,
+    "photuris-bethaniensis": False,
+    "forresti": False,
+    "frontalis": False,
+    "photinus-carolinus": False,
+    "photinus-knulli": True,
+    "tremulans": False,
+}
+
+# 3) Your pipeline inference (split by route)
+RUN_DAY_PIPELINE_INFERENCE: bool = False
+RUN_NIGHT_PIPELINE_INFERENCE: bool = True
 RUN_GLOBAL_MODEL_INFERENCE: bool = True
 RUN_LEAVEOUT_MODEL_INFERENCE: bool = False
 
@@ -91,7 +112,7 @@ RUN_LEAVEOUT_MODEL_INFERENCE: bool = False
 DAY_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
     "bicellonycha-wickershamorum": False,
     "photinus-acuminatus": False,
-    "photinus-greeni": True,
+    "photinus-greeni": False,
     "photuris-bethaniensis": False,
 }
 
@@ -99,7 +120,7 @@ NIGHT_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
     "forresti": False,
     "frontalis": False,
     "photinus-carolinus": False,
-    "photinus-knulli": False,
+    "photinus-knulli": True,
     "tremulans": False,
 }
 
@@ -217,9 +238,6 @@ GATEWAY_BRIGHTNESS_THRESHOLD: float = 10.0
 GATEWAY_BRIGHTNESS_FRAMES: int = 5
 GATEWAY_MAX_CONCURRENT: int = 1
 FORCE_GATEWAY_TESTS: bool = False
-
-# Baselines
-BASELINES_ONLY_FOR_NIGHT: bool = False
 
 # Do not change these paths. Baseline artifacts are now stored permanently
 # under this fixed SSD layout instead of under per-run temporary folders.
@@ -1068,6 +1086,14 @@ def _enabled_inference_species_by_route(
     return out
 
 
+def _enabled_species_from_switches(species_switches: Optional[Dict[str, bool]]) -> set[str]:
+    if not species_switches:
+        return set()
+    vals = {_slug(str(k)) for k, v in species_switches.items() if bool(v) and str(k or "").strip()}
+    vals.discard("")
+    return vals
+
+
 def _discover_inference_videos_from_catalog(
     catalog: Dict[str, Any],
     *,
@@ -1104,6 +1130,51 @@ def _discover_inference_videos_from_catalog(
     if not out:
         raise RuntimeError("No inference videos found in training/inference catalog.")
     return out
+
+
+def _discover_inference_videos_from_catalog_by_species_switches(
+    catalog: Dict[str, Any],
+    *,
+    species_switches: Optional[Dict[str, bool]] = None,
+    label: str = "baseline",
+) -> List[RoutedVideo]:
+    allowed_species = _enabled_species_from_switches(species_switches)
+    if not allowed_species:
+        return []
+
+    matched_species: set[str] = set()
+    out: List[RoutedVideo] = []
+    for entry in list(catalog.get("videos") or []):
+        if str(entry.get("category") or "") != "inference":
+            continue
+        video_path = Path(str(entry.get("video_path") or "")).expanduser()
+        if not video_path.exists():
+            continue
+        route = _normalize_route(str(entry.get("route") or ""))
+        species_name = str(entry.get("species_name") or "").strip() or None
+        species_slug = _slug(species_name or "")
+        if species_slug not in allowed_species:
+            continue
+        matched_species.add(species_slug)
+        out.append(RoutedVideo(video_path=video_path, route=route, species_name=species_name))
+
+    missing = sorted(allowed_species - matched_species)
+    if missing:
+        print(f"[tmp-run] WARNING: enabled {label} species not found in catalog inference set: {missing}")
+    return out
+
+
+def _merge_routed_videos(*groups: Sequence[RoutedVideo]) -> List[RoutedVideo]:
+    merged: Dict[tuple[str, str, str], RoutedVideo] = {}
+    for group in groups:
+        for rv in group:
+            key = (
+                str(rv.video_path.expanduser().resolve()),
+                str(rv.route or ""),
+                str(rv.species_name or ""),
+            )
+            merged.setdefault(key, rv)
+    return list(merged.values())
 
 
 def _build_combined_dataset(*, dst_final_dataset_dir: Path, sources: Sequence[SourceSpec], dry_run: bool) -> Dict[str, Any]:
@@ -2262,17 +2333,16 @@ def _run_baselines_for_video(
     run_root: Path,
     video: EvalVideo,
     logs_dir: Path,
+    run_lab: bool,
+    run_raphael: bool,
     dry_run: bool,
 ) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     scripts = _baseline_scripts()
     max_frames_for_video = _video_max_frames_from_gt(video)
 
-    if BASELINES_ONLY_FOR_NIGHT and str(video.route) != "night":
-        return out
-
     # Lab baseline
-    if RUN_LAB_BASELINE:
+    if run_lab:
         out_root = _baseline_species_data_root("lab", video.species_name) / video.video_key
         log_root = _baseline_species_log_root("lab", video.species_name)
         gt_csv = out_root / "ground truth" / "gt.csv"
@@ -2350,7 +2420,7 @@ def _run_baselines_for_video(
         }
 
     # Raphael baseline
-    if RUN_RAPHAEL_BASELINE:
+    if run_raphael:
         out_root = _baseline_species_data_root("raphael", video.species_name) / video.video_key
         log_root = _baseline_species_log_root("raphael", video.species_name)
         gt_csv = out_root / "ground truth" / "gt.csv"
@@ -2899,12 +2969,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             "(expect resnet18 checkpoints). Set TRAIN_RESNET='resnet18'."
         )
 
-    if bool(RUN_INGESTION_FROM_SCRATCH):
-        raise SystemExit(
-            "RUN_INGESTION_FROM_SCRATCH=True is not implemented in this script. "
-            "Set it to False to reuse existing ingested patch datasets."
-        )
-
     raw_videos_root = Path(str(args.raw_videos_root)).expanduser().resolve()
     runs_root = Path(str(args.runs_root)).expanduser().resolve()
     if not runs_root.exists() and not dry_run:
@@ -2952,7 +3016,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(
         f"[tmp-run] baselines: run={run_baselines} lab={run_lab_baseline} "
-        f"raphael={run_raphael_baseline} only_for_night={bool(BASELINES_ONLY_FOR_NIGHT)}"
+        f"raphael={run_raphael_baseline}"
     )
     print(
         f"[tmp-run] pipeline inference: day={bool(RUN_DAY_PIPELINE_INFERENCE)} "
@@ -2971,8 +3035,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(f"[tmp-run] day_inference_species_switches={DAY_INFERENCE_SPECIES_SWITCHES}")
     print(f"[tmp-run] night_inference_species_switches={NIGHT_INFERENCE_SPECIES_SWITCHES}")
+    print(f"[tmp-run] lab_baseline_species_switches={LAB_BASELINE_SPECIES_SWITCHES}")
+    print(f"[tmp-run] raphael_baseline_species_switches={RAPHAEL_BASELINE_SPECIES_SWITCHES}")
     print(f"[tmp-run] day_yolo_training_species_switches={DAY_YOLO_TRAINING_SPECIES_SWITCHES}")
-    print("[tmp-run] ingestion stage: disabled (using existing ingested datasets)")
     print(f"[tmp-run] run_model_training={bool(RUN_MODEL_TRAINING)}")
     if (not run_baselines) and (not run_any_pipeline) and (not bool(RUN_MODEL_TRAINING)) and (not run_day_yolo_training):
         raise SystemExit(
@@ -3142,22 +3207,51 @@ def main(argv: Sequence[str] | None = None) -> int:
             f" inference={int(route_counts.get('inference', 0))}"
         )
 
-    routed_videos = _discover_inference_videos_from_catalog(
-        video_catalog,
-        day_species_switches=DAY_INFERENCE_SPECIES_SWITCHES,
-        night_species_switches=NIGHT_INFERENCE_SPECIES_SWITCHES,
-    )
+    pipeline_routed_videos: List[RoutedVideo] = []
+    if run_any_pipeline:
+        pipeline_routed_videos = _discover_inference_videos_from_catalog(
+            video_catalog,
+            day_species_switches=DAY_INFERENCE_SPECIES_SWITCHES,
+            night_species_switches=NIGHT_INFERENCE_SPECIES_SWITCHES,
+        )
+
+    lab_baseline_routed_videos: List[RoutedVideo] = []
+    raphael_baseline_routed_videos: List[RoutedVideo] = []
+    if run_baselines:
+        if run_lab_baseline:
+            lab_baseline_routed_videos = _discover_inference_videos_from_catalog_by_species_switches(
+                video_catalog,
+                species_switches=LAB_BASELINE_SPECIES_SWITCHES,
+                label="lab baseline",
+            )
+        if run_raphael_baseline:
+            raphael_baseline_routed_videos = _discover_inference_videos_from_catalog_by_species_switches(
+                video_catalog,
+                species_switches=RAPHAEL_BASELINE_SPECIES_SWITCHES,
+                label="raphael baseline",
+            )
+        if (not lab_baseline_routed_videos) and (not raphael_baseline_routed_videos):
+            print("[tmp-run] WARNING: baselines enabled but no baseline species were selected from the inference catalog.")
+
+    baseline_routed_videos = _merge_routed_videos(lab_baseline_routed_videos, raphael_baseline_routed_videos)
+    routed_videos = _merge_routed_videos(pipeline_routed_videos, baseline_routed_videos)
 
     max_videos = int(args.max_videos or 0)
     if max_videos > 0:
         routed_videos = routed_videos[:max_videos]
 
-    print(f"[tmp-run] videos discovered: {len(routed_videos)}")
+    print(f"[tmp-run] pipeline videos selected: {len(pipeline_routed_videos)}")
+    print(f"[tmp-run] lab baseline videos selected: {len(lab_baseline_routed_videos)}")
+    print(f"[tmp-run] raphael baseline videos selected: {len(raphael_baseline_routed_videos)}")
+    print(f"[tmp-run] total baseline videos selected: {len(baseline_routed_videos)}")
+    print(f"[tmp-run] unique videos discovered: {len(routed_videos)}")
     by_route_counts = {"day": 0, "night": 0}
     for v in routed_videos:
         by_route_counts[v.route] = by_route_counts.get(v.route, 0) + 1
-    print(f"[tmp-run] video split: day={by_route_counts.get('day', 0)} night={by_route_counts.get('night', 0)}")
+    print(f"[tmp-run] unique video split: day={by_route_counts.get('day', 0)} night={by_route_counts.get('night', 0)}")
     print(f"[tmp-run] require_gt_for_inference={bool(REQUIRE_GT_FOR_INFERENCE)}")
+    if run_baselines and (not run_any_pipeline) and (not baseline_routed_videos):
+        raise SystemExit("Baselines enabled, but no baseline species were selected from the inference catalog.")
 
     eval_videos: List[EvalVideo] = []
     skipped_videos: List[Dict[str, str]] = []
@@ -3200,6 +3294,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("No videos with GT available for evaluation.")
 
     eval_videos = sorted(eval_videos, key=lambda v: (v.route, v.species_name, v.video_name))
+    baseline_eval_video_keys: set[str] = {
+        _short_key(str(rv.species_name or "unknown_species"), rv.video_path.stem)
+        for rv in baseline_routed_videos
+    }
+    lab_baseline_video_keys: set[str] = {
+        _short_key(str(rv.species_name or "unknown_species"), rv.video_path.stem)
+        for rv in lab_baseline_routed_videos
+    }
+    raphael_baseline_video_keys: set[str] = {
+        _short_key(str(rv.species_name or "unknown_species"), rv.video_path.stem)
+        for rv in raphael_baseline_routed_videos
+    }
+    baseline_eval_videos = [
+        vid
+        for vid in eval_videos
+        if vid.video_key in baseline_eval_video_keys
+    ]
 
     rows_out: List[Dict[str, str]] = []
     if not dry_run:
@@ -3245,35 +3356,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         return lab_metrics, lab_path, raphael_metrics, raphael_path
 
     if run_baselines:
-        print(f"[baselines] enabled={run_baselines} only_for_night={BASELINES_ONLY_FOR_NIGHT}")
-        baseline_eval_videos = [
-            vid for vid in eval_videos if (not BASELINES_ONLY_FOR_NIGHT) or str(vid.route) == "night"
-        ]
-        baseline_species = sorted({vid.species_name for vid in baseline_eval_videos})
-        if run_lab_baseline:
+        print(f"[baselines] enabled={run_baselines}")
+        if not baseline_eval_videos:
+            print("[baselines] WARNING: no baseline-selected videos with GT were found; skipping baseline execution.")
+        lab_baseline_species = sorted({vid.species_name for vid in baseline_eval_videos if vid.video_key in lab_baseline_video_keys})
+        raphael_baseline_species = sorted({vid.species_name for vid in baseline_eval_videos if vid.video_key in raphael_baseline_video_keys})
+        if run_lab_baseline and lab_baseline_species:
             _prepare_baseline_species_storage(
                 method_key="lab",
-                species_names=baseline_species,
+                species_names=lab_baseline_species,
                 dry_run=dry_run,
             )
-        if run_raphael_baseline:
+        if run_raphael_baseline and raphael_baseline_species:
             _prepare_baseline_species_storage(
                 method_key="raphael",
-                species_names=baseline_species,
+                species_names=raphael_baseline_species,
                 dry_run=dry_run,
             )
-        for i, vid in enumerate(eval_videos, start=1):
-            print(f"[baselines] {i}/{len(eval_videos)} {vid.species_name} :: {vid.video_path.name} (route={vid.route})")
+        for i, vid in enumerate(baseline_eval_videos, start=1):
+            print(f"[baselines] {i}/{len(baseline_eval_videos)} {vid.species_name} :: {vid.video_path.name} (route={vid.route})")
+            run_lab_for_video = vid.video_key in lab_baseline_video_keys
+            run_raphael_for_video = vid.video_key in raphael_baseline_video_keys
             if not dry_run:
                 baseline_by_video_key[vid.video_key] = _run_baselines_for_video(
                     run_root=run_root,
                     video=vid,
                     logs_dir=logs_dir,
+                    run_lab=run_lab_for_video,
+                    run_raphael=run_raphael_for_video,
                     dry_run=bool(dry_run),
                 )
             # Persist baseline progress immediately per video so crashes do not
             # lose completed baseline results.
             lab_metrics, lab_path, raphael_metrics, raphael_path = _baseline_fields(vid.video_key)
+            baseline_methods_used = []
+            if run_lab_for_video:
+                baseline_methods_used.append("lab")
+            if run_raphael_for_video:
+                baseline_methods_used.append("raphael")
             _record_row(
                 {
                     "run_id": run_id,
@@ -3281,7 +3401,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "species_name": vid.species_name,
                     "video_name": vid.video_name,
                     "eval_type": "baseline",
-                    "model_used": "lab+raphael",
+                    "model_used": "+".join(baseline_methods_used),
                     "results": "",
                     "inference_output_path": "",
                     "lab_results": lab_metrics,
@@ -3295,7 +3415,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if not dry_run:
             _write_baseline_species_results_and_registry(
-                eval_videos=eval_videos,
+                eval_videos=baseline_eval_videos,
                 baseline_by_video_key=baseline_by_video_key,
                 dry_run=dry_run,
             )
@@ -3501,9 +3621,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "baselines": {
             "enabled": bool(run_baselines),
-            "only_for_night": bool(BASELINES_ONLY_FOR_NIGHT),
             "lab_enabled": bool(run_lab_baseline),
             "raphael_enabled": bool(run_raphael_baseline),
+            "lab_species_switches": dict(LAB_BASELINE_SPECIES_SWITCHES),
+            "raphael_species_switches": dict(RAPHAEL_BASELINE_SPECIES_SWITCHES),
             "data_root": str(BASELINES_DATA_ROOT),
             "lab_data_root": str(LAB_BASELINE_DATA_ROOT),
             "raphael_method_data_root": str(RAPHAEL_METHOD_DATA_ROOT),
