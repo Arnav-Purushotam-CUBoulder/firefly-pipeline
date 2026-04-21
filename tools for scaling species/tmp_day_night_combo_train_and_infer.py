@@ -36,6 +36,24 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
+def _make_species_switches(species_names: Sequence[str], *, enabled: Sequence[str] = ()) -> Dict[str, bool]:
+    ordered_species: List[str] = []
+    seen: set[str] = set()
+    for species_name in species_names:
+        name = str(species_name or "").strip()
+        if not name or name in seen:
+            continue
+        ordered_species.append(name)
+        seen.add(name)
+
+    enabled_set = {str(species_name).strip() for species_name in enabled if str(species_name or "").strip()}
+    unknown = sorted(enabled_set - set(ordered_species))
+    if unknown:
+        raise ValueError(f"Unknown species in switch config: {unknown}")
+
+    return {species_name: (species_name in enabled_set) for species_name in ordered_species}
+
+
 # =============================================================================
 # GLOBALS (edit these if needed)
 # =============================================================================
@@ -46,6 +64,15 @@ REPO_ROOT: Path = Path("/home/guest/Desktop/arnav's files/firefly pipeline")
 INTEGRATED_OUTER_ROOT: Path = Path("/mnt/Samsung_SSD_2TB/integrated prototype data")
 INTEGRATED_INNER_ROOT: Path = INTEGRATED_OUTER_ROOT / "integrated prototype data"
 PATCH_DATA_ROOT: Path = INTEGRATED_INNER_ROOT / "patch training datasets and pipeline validation data"
+MODEL_ZOO_ROOT: Path = INTEGRATED_INNER_ROOT / "model zoo"
+GLOBAL_MODEL_ZOO_ROOT: Path = MODEL_ZOO_ROOT / "global models"
+DAY_GLOBAL_MODEL_ZOO_DIR: Path = GLOBAL_MODEL_ZOO_ROOT / "daytime global"
+NIGHT_GLOBAL_MODEL_ZOO_DIR: Path = GLOBAL_MODEL_ZOO_ROOT / "night time global"
+GLOBAL_MODEL_ZOO_BEST_FILENAME: str = "best.pt"
+GLOBAL_MODEL_ZOO_MANIFEST_FILENAME: str = "training_manifest.json"
+LEAVEOUT_MODEL_ZOO_ROOT: Path = MODEL_ZOO_ROOT / "leave out models"
+LEAVEOUT_MODEL_ZOO_BEST_FILENAME: str = "best.pt"
+LEAVEOUT_MODEL_ZOO_MANIFEST_FILENAME: str = "training_manifest.json"
 
 # Raw videos root to infer on (can be overridden via CLI).
 RAW_VIDEOS_ROOT: Path = Path("/mnt/Samsung_SSD_2TB/all species raw videos and annotations (from annotator)")
@@ -61,85 +88,76 @@ VIDEO_CATALOG_FILENAME: str = "tmp_scaling_species_training_inference_catalog.js
 # Run Component Switches (edit these first)
 # -----------------------------------------------------------------------------
 # 1) Model training
-RUN_MODEL_TRAINING: bool = True
+RUN_MODEL_TRAINING: bool = False
 RUN_DAY_MODEL_TRAINING: bool = False
-RUN_NIGHT_MODEL_TRAINING: bool = True
-TRAIN_GLOBAL_MODELS: bool = True
+RUN_NIGHT_MODEL_TRAINING: bool = False
+TRAIN_GLOBAL_MODELS: bool = False
 TRAIN_LEAVEOUT_MODELS: bool = False
+
+# Canonical routing metadata. Route-scoped switch dicts below are derived from
+# this map so day/night membership is defined in one place.
+ROUTE_BY_SPECIES: Dict[str, str] = {
+    "bicellonycha-wickershamorum": "day",
+    "photinus-acuminatus": "day",
+    "photinus-greeni": "day",
+    "photuris-bethaniensis": "day",
+    "forresti": "night",
+    "frontalis": "night",
+    "photinus-carolinus": "night",
+    "photinus-knulli": "night",
+    "tremulans": "night",
+}
+DAY_ROUTE_SPECIES: Tuple[str, ...] = tuple(
+    species_name for species_name, route_name in ROUTE_BY_SPECIES.items() if route_name == "day"
+)
+NIGHT_ROUTE_SPECIES: Tuple[str, ...] = tuple(
+    species_name for species_name, route_name in ROUTE_BY_SPECIES.items() if route_name == "night"
+)
+ALL_ROUTED_SPECIES: Tuple[str, ...] = DAY_ROUTE_SPECIES + NIGHT_ROUTE_SPECIES
+
+# Optional exact override by video stem (without extension).
+ROUTE_BY_VIDEO_STEM: Dict[str, str] = {}
+
+ROUTE_NAME_HINT_DAY_TOKENS: Sequence[str] = ("day", "daytime", "day_time")
+ROUTE_NAME_HINT_NIGHT_TOKENS: Sequence[str] = ("night", "nighttime", "night_time")
+ROUTE_DEFAULT: str = "night"
+REQUIRE_EXPLICIT_ROUTE: bool = True
 
 # 2) Baseline methods (Lab + Raphael)
 # Set this True to run only baseline methods if day/night pipeline toggles below
 # are both False.
-RUN_BASELINE_METHODS_INFERENCE: bool = True
-RUN_LAB_BASELINE: bool = True
-RUN_RAPHAEL_BASELINE: bool = True
+RUN_BASELINE_METHODS_INFERENCE: bool = False
+RUN_LAB_BASELINE: bool = False
+RUN_RAPHAEL_BASELINE: bool = False
 
 # Baseline species switches are independent from your pipeline inference
 # switches. Turn on only the species you want each baseline method to run on.
-LAB_BASELINE_SPECIES_SWITCHES: Dict[str, bool] = {
-    "bicellonycha-wickershamorum": False,
-    "photinus-acuminatus": False,
-    "photinus-greeni": False,
-    "photuris-bethaniensis": False,
-    "forresti": False,
-    "frontalis": False,
-    "photinus-carolinus": False,
-    "photinus-knulli": True,
-    "tremulans": False,
-}
+LAB_BASELINE_SPECIES_SWITCHES: Dict[str, bool] = _make_species_switches(ALL_ROUTED_SPECIES)
 
-RAPHAEL_BASELINE_SPECIES_SWITCHES: Dict[str, bool] = {
-    "bicellonycha-wickershamorum": False,
-    "photinus-acuminatus": False,
-    "photinus-greeni": False,
-    "photuris-bethaniensis": False,
-    "forresti": False,
-    "frontalis": False,
-    "photinus-carolinus": False,
-    "photinus-knulli": True,
-    "tremulans": False,
-}
+RAPHAEL_BASELINE_SPECIES_SWITCHES: Dict[str, bool] = _make_species_switches(ALL_ROUTED_SPECIES)
 
 # 3) Your pipeline inference (split by route)
 RUN_DAY_PIPELINE_INFERENCE: bool = False
 RUN_NIGHT_PIPELINE_INFERENCE: bool = True
 RUN_GLOBAL_MODEL_INFERENCE: bool = True
-RUN_LEAVEOUT_MODEL_INFERENCE: bool = False
+RUN_LEAVEOUT_MODEL_INFERENCE: bool = True
 
-# Per-route species inference switches.
-# Only species with True are evaluated from the cataloged inference-only videos.
-# These switches are route-specific to make the day/night split explicit.
-DAY_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
-    "bicellonycha-wickershamorum": False,
-    "photinus-acuminatus": False,
-    "photinus-greeni": False,
-    "photuris-bethaniensis": False,
-}
+# Per-scope route-specific inference switches. These are derived from the
+# canonical route metadata above, so the per-route species membership is not
+# duplicated here. Global inference and leaveout inference can still target
+# different species in one run.
+GLOBAL_DAY_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = _make_species_switches(DAY_ROUTE_SPECIES)
 
-NIGHT_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
-    "forresti": False,
-    "frontalis": False,
-    "photinus-carolinus": False,
-    "photinus-knulli": True,
-    "tremulans": False,
-}
-
-# Pretrained model selection when RUN_MODEL_TRAINING=False.
-# If True, the script auto-discovers the newest compatible trained artifact
-# for that model family and uses it. If False, it uses the manual path below.
-AUTO_DISCOVER_LATEST_DAY_MODEL_ROOT: bool = True
-AUTO_DISCOVER_LATEST_NIGHT_MODEL_ROOT: bool = True
-
-# Manual fallback paths used when the corresponding auto-discovery switch is
-# False. The day/night paths should point to the route-specific directory that
-# contains global_all_species.pt plus any leaveout_*.pt files for that route.
-DAY_PRETRAINED_MODEL_ROOT: Path = Path(
-    "/mnt/Samsung_SSD_2TB/temp to delete/firefly_patch_training_local_run/"
-    "tmp_day_night_combo_train_and_infer__20260328__004250/models/day"
+GLOBAL_NIGHT_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = _make_species_switches(
+    NIGHT_ROUTE_SPECIES,
+    enabled=("forresti", "frontalis", "photinus-carolinus", "tremulans"),
 )
-NIGHT_PRETRAINED_MODEL_ROOT: Path = Path(
-    "/mnt/Samsung_SSD_2TB/temp to delete/firefly_patch_training_local_run/"
-    "tmp_day_night_combo_train_and_infer__20260305__163237/models/night"
+
+LEAVEOUT_DAY_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = _make_species_switches(DAY_ROUTE_SPECIES)
+
+LEAVEOUT_NIGHT_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = _make_species_switches(
+    NIGHT_ROUTE_SPECIES,
+    enabled=("forresti", "frontalis", "photinus-carolinus", "photinus-knulli", "tremulans"),
 )
 
 # -----------------------------------------------------------------------------
@@ -149,13 +167,10 @@ RUN_DAY_YOLO_MODEL_TRAINING: bool = False
 TRAIN_DAY_YOLO_GLOBAL_MODEL: bool = False
 TRAIN_DAY_YOLO_LEAVEOUT_MODELS: bool = False
 
-DAY_YOLO_TRAINING_SPECIES_SWITCHES: Dict[str, bool] = {
-    "bicellonycha-wickershamorum": True,
-    "photinus-acuminatus": True,
-    "photinus-greeni": True,
-    "photuris-bethaniensis": True,
-    "pyrallis-gopro": True,
-}
+DAY_YOLO_TRAINING_SPECIES_SWITCHES: Dict[str, bool] = _make_species_switches(
+    (*DAY_ROUTE_SPECIES, "pyrallis-gopro"),
+    enabled=(*DAY_ROUTE_SPECIES, "pyrallis-gopro"),
+)
 
 # Do not change these paths. The YOLO dataset/model helpers depend on this
 # exact folder layout and changing them will break the save/load logic.
@@ -171,7 +186,10 @@ DAY_YOLO_LEAVEOUT_MODELS_ROOT: Path = Path(
 DAY_YOLO_LEGACY_MODELS_ROOT: Path = Path(
     "/mnt/Samsung_SSD_2TB/integrated prototype data/v3 daytime YOLO model data/models/legacy models"
 )
-
+# Day-pipeline inference always resolves the global day YOLO checkpoint through
+# this selector, even if a day YOLO model was trained earlier in the same run.
+# True picks the newest dated folder under DAY_YOLO_GLOBAL_MODELS_ROOT, while
+# False uses the exact path in DAY_YOLO_MODEL_WEIGHTS.
 AUTO_DISCOVER_LATEST_DAY_YOLO_MODEL: bool = True
 DAY_YOLO_MODEL_WEIGHTS: Path = DAY_YOLO_GLOBAL_MODELS_ROOT / "20260414" / "best_firefly_yolo.pt"
 DAY_YOLO_MODEL_WEIGHTS_INIT: str = "yolov8s.pt"
@@ -184,38 +202,17 @@ DAY_YOLO_PATIENCE: int = 20
 DAY_YOLO_LR0: float | None = 0.01
 DAY_YOLO_WEIGHT_DECAY: float | None = 0.0005
 DAY_YOLO_MPS_CPU_FALLBACK: bool = True
-DAY_YOLO_REUSE_EXISTING_MODELS_IF_PRESENT: bool = True
 
 # Evaluation safeguard: require per-video GT and cap processing to the last
 # annotated frame in that GT.
 REQUIRE_GT_FOR_INFERENCE: bool = True
 
-# Route assignment by species token.
-ROUTE_BY_SPECIES: Dict[str, str] = {
-    "bicellonycha-wickershamorum": "day",
-    "forresti": "night",
-    "frontalis": "night",
-    "photinus-acuminatus": "day",
-    "photinus-carolinus": "night",
-    "photinus-greeni": "day",
-    "photinus-knulli": "night",
-    "photuris-bethaniensis": "day",
-    "tremulans": "night",
-}
-
-# Optional exact override by video stem (without extension).
-ROUTE_BY_VIDEO_STEM: Dict[str, str] = {}
-
-ROUTE_NAME_HINT_DAY_TOKENS: Sequence[str] = ("day", "daytime", "day_time")
-ROUTE_NAME_HINT_NIGHT_TOKENS: Sequence[str] = ("night", "nighttime", "night_time")
-ROUTE_DEFAULT: str = "night"
-REQUIRE_EXPLICIT_ROUTE: bool = True
-
 # Build settings for merged datasets.
 REQUIRE_HARDLINKS: bool = True
 
-# If True, skip retraining if a model file already exists.
-REUSE_EXISTING_MODELS_IF_PRESENT: bool = True
+# Keep False. Reusing existing checkpoints can silently skip retraining after
+# dataset/species/hyperparameter changes.
+REUSE_EXISTING_MODELS_IF_PRESENT: bool = False
 
 # Training hyperparameters.
 TRAIN_EPOCHS: int = 50
@@ -1095,6 +1092,16 @@ def _enabled_species_from_switches(species_switches: Optional[Dict[str, bool]]) 
     return vals
 
 
+def _merge_species_switches(*switch_groups: Optional[Dict[str, bool]]) -> Dict[str, bool]:
+    merged: Dict[str, bool] = {}
+    for switches in switch_groups:
+        if not switches:
+            continue
+        for key, value in switches.items():
+            merged[str(key)] = bool(merged.get(str(key), False) or bool(value))
+    return merged
+
+
 def _discover_inference_videos_from_catalog(
     catalog: Dict[str, Any],
     *,
@@ -1210,6 +1217,342 @@ def _build_combined_dataset(*, dst_final_dataset_dir: Path, sources: Sequence[So
     }
 
 
+def _summarize_materialized_combined_dataset(
+    dataset_final_dir: Path,
+    *,
+    sources: Optional[Sequence[SourceSpec]] = None,
+) -> Dict[str, Any]:
+    planned_counts: Dict[str, Dict[str, int]] = {split: {cls: 0 for cls in CLASSES} for split in SPLITS}
+    copied_counts: Dict[str, int] = {}
+    source_records: List[Dict[str, str]] = []
+    slug_to_source_key: Dict[str, str] = {}
+
+    for src in list(sources or []):
+        source_key = f"{src.species_name}@{src.route}"
+        copied_counts[source_key] = 0
+        source_records.append({"species": src.species_name, "route": src.route, "path": str(src.path)})
+        slug_to_source_key[_slug(src.species_name)] = source_key
+
+    unknown_source_prefix_counts: Dict[str, int] = {}
+    for split in SPLITS:
+        for cls in CLASSES:
+            src_dir = dataset_final_dir / split / cls
+            for img in _iter_image_files(src_dir):
+                planned_counts[split][cls] += 1
+                prefix = str(img.name).split("__", 1)[0].strip().lower()
+                if not prefix:
+                    continue
+                source_key = slug_to_source_key.get(prefix)
+                if source_key is not None:
+                    copied_counts[source_key] = int(copied_counts.get(source_key, 0)) + 1
+                else:
+                    unknown_source_prefix_counts[prefix] = int(unknown_source_prefix_counts.get(prefix, 0)) + 1
+
+    summary: Dict[str, Any] = {
+        "sources": source_records,
+        "copied_per_source": copied_counts,
+        "counts": planned_counts,
+    }
+    if unknown_source_prefix_counts:
+        summary["unknown_source_prefix_counts"] = unknown_source_prefix_counts
+    return summary
+
+
+def _trained_on_species_from_dataset_summary(dataset_summary: Dict[str, Any]) -> List[str]:
+    return sorted(
+        {
+            str(src.get("species") or "").strip()
+            for src in list(dataset_summary.get("sources") or [])
+            if str(src.get("species") or "").strip()
+        }
+    )
+
+
+def _global_model_zoo_dir(route: str) -> Path:
+    route_name = _normalize_route(route)
+    return DAY_GLOBAL_MODEL_ZOO_DIR if route_name == "day" else NIGHT_GLOBAL_MODEL_ZOO_DIR
+
+
+def _build_global_model_zoo_manifest(
+    *,
+    route: str,
+    model_path: Path,
+    metrics_path: Path,
+    zoo_dir: Path,
+    dataset_summary: Dict[str, Any],
+    training_metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    trained_on_species = _trained_on_species_from_dataset_summary(dataset_summary)
+
+    run_root = ""
+    try:
+        run_root = str(model_path.resolve().parents[2])
+    except Exception:
+        run_root = ""
+
+    best_model_export = zoo_dir / GLOBAL_MODEL_ZOO_BEST_FILENAME
+    manifest_path = zoo_dir / GLOBAL_MODEL_ZOO_MANIFEST_FILENAME
+    return {
+        "manifest_version": "global_model_zoo_manifest_v1",
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "model_family": "route_split_patch_classifier",
+        "model_scope": "global",
+        "route": str(route),
+        "model_key": "global_all_species",
+        "trained_on_species": trained_on_species,
+        "source_artifacts": {
+            "run_root": run_root,
+            "checkpoint": str(model_path),
+            "training_metrics_json": str(metrics_path),
+        },
+        "stored_artifacts": {
+            "model_dir": str(zoo_dir),
+            "best_checkpoint": str(best_model_export),
+            "training_manifest": str(manifest_path),
+        },
+        "training": {
+            "timestamp": str(training_metrics.get("timestamp") or ""),
+            "data_dir": str(training_metrics.get("data_dir") or ""),
+            "dataset_summary": dataset_summary,
+            "config": {
+                "resnet_model": str(training_metrics.get("resnet_model") or ""),
+                "epochs": (int(training_metrics.get("epochs")) if training_metrics.get("epochs") is not None else None),
+                "batch_size": (
+                    int(training_metrics.get("batch_size")) if training_metrics.get("batch_size") is not None else None
+                ),
+                "lr": (float(training_metrics.get("lr")) if training_metrics.get("lr") is not None else None),
+                "num_workers": (
+                    int(training_metrics.get("num_workers")) if training_metrics.get("num_workers") is not None else None
+                ),
+                "seed": (int(training_metrics.get("seed")) if training_metrics.get("seed") is not None else None),
+            },
+            "results": {
+                "best_epoch": (
+                    int(training_metrics.get("best_epoch")) if training_metrics.get("best_epoch") is not None else None
+                ),
+                "best_val_acc": (
+                    float(training_metrics.get("best_val_acc"))
+                    if training_metrics.get("best_val_acc") is not None
+                    else None
+                ),
+                "test_loss": (
+                    float(training_metrics.get("test_loss")) if training_metrics.get("test_loss") is not None else None
+                ),
+                "test_acc": (
+                    float(training_metrics.get("test_acc")) if training_metrics.get("test_acc") is not None else None
+                ),
+            },
+            "sanitizer": dict(training_metrics.get("sanitizer") or {}),
+        },
+    }
+
+
+def _export_global_model_to_model_zoo(
+    *,
+    route: str,
+    model_path: Path,
+    metrics_path: Path,
+    dataset_summary: Dict[str, Any],
+    training_metrics: Dict[str, Any],
+    dry_run: bool,
+) -> Dict[str, Any]:
+    zoo_dir = _global_model_zoo_dir(route)
+    best_model_export = zoo_dir / GLOBAL_MODEL_ZOO_BEST_FILENAME
+    manifest = _build_global_model_zoo_manifest(
+        route=route,
+        model_path=model_path,
+        metrics_path=metrics_path,
+        zoo_dir=zoo_dir,
+        dataset_summary=dataset_summary,
+        training_metrics=training_metrics,
+    )
+    if not dry_run:
+        if not model_path.exists():
+            raise FileNotFoundError(f"Cannot export global model; checkpoint missing: {model_path}")
+        zoo_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(model_path, best_model_export)
+        (zoo_dir / GLOBAL_MODEL_ZOO_MANIFEST_FILENAME).write_text(
+            json.dumps(manifest, indent=2),
+            encoding="utf-8",
+        )
+
+    print(f"[tmp-run][model-zoo] global route={route} -> {best_model_export}")
+    return manifest
+
+
+def _leaveout_model_zoo_species_dir(leaveout_species: str) -> Path:
+    return LEAVEOUT_MODEL_ZOO_ROOT / _slug(leaveout_species)
+
+
+def _build_leaveout_model_zoo_manifest(
+    *,
+    route: str,
+    model_key: str,
+    leaveout_species: str,
+    model_path: Path,
+    metrics_path: Path,
+    zoo_species_dir: Path,
+    dataset_summary: Dict[str, Any],
+    training_metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    trained_on_species = _trained_on_species_from_dataset_summary(dataset_summary)
+
+    run_root = ""
+    try:
+        run_root = str(model_path.resolve().parents[2])
+    except Exception:
+        run_root = ""
+
+    best_model_export = zoo_species_dir / LEAVEOUT_MODEL_ZOO_BEST_FILENAME
+    manifest_path = zoo_species_dir / LEAVEOUT_MODEL_ZOO_MANIFEST_FILENAME
+    return {
+        "manifest_version": "leaveout_model_zoo_manifest_v1",
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "model_family": "route_split_patch_classifier",
+        "model_scope": "leaveout",
+        "route": str(route),
+        "model_key": str(model_key),
+        "left_out_species": str(leaveout_species),
+        "trained_on_species": trained_on_species,
+        "source_artifacts": {
+            "run_root": run_root,
+            "checkpoint": str(model_path),
+            "training_metrics_json": str(metrics_path),
+        },
+        "stored_artifacts": {
+            "species_dir": str(zoo_species_dir),
+            "best_checkpoint": str(best_model_export),
+            "training_manifest": str(manifest_path),
+        },
+        "training": {
+            "timestamp": str(training_metrics.get("timestamp") or ""),
+            "data_dir": str(training_metrics.get("data_dir") or ""),
+            "dataset_summary": dataset_summary,
+            "config": {
+                "resnet_model": str(training_metrics.get("resnet_model") or ""),
+                "epochs": (int(training_metrics.get("epochs")) if training_metrics.get("epochs") is not None else None),
+                "batch_size": (
+                    int(training_metrics.get("batch_size")) if training_metrics.get("batch_size") is not None else None
+                ),
+                "lr": (float(training_metrics.get("lr")) if training_metrics.get("lr") is not None else None),
+                "num_workers": (
+                    int(training_metrics.get("num_workers")) if training_metrics.get("num_workers") is not None else None
+                ),
+                "seed": (int(training_metrics.get("seed")) if training_metrics.get("seed") is not None else None),
+            },
+            "results": {
+                "best_epoch": (
+                    int(training_metrics.get("best_epoch")) if training_metrics.get("best_epoch") is not None else None
+                ),
+                "best_val_acc": (
+                    float(training_metrics.get("best_val_acc"))
+                    if training_metrics.get("best_val_acc") is not None
+                    else None
+                ),
+                "test_loss": (
+                    float(training_metrics.get("test_loss")) if training_metrics.get("test_loss") is not None else None
+                ),
+                "test_acc": (
+                    float(training_metrics.get("test_acc")) if training_metrics.get("test_acc") is not None else None
+                ),
+            },
+            "sanitizer": dict(training_metrics.get("sanitizer") or {}),
+        },
+    }
+
+
+def _export_leaveout_model_to_model_zoo(
+    *,
+    route: str,
+    model_key: str,
+    leaveout_species: Optional[str],
+    model_path: Path,
+    metrics_path: Path,
+    dataset_summary: Dict[str, Any],
+    training_metrics: Dict[str, Any],
+    dry_run: bool,
+) -> Optional[Dict[str, Any]]:
+    if not str(leaveout_species or "").strip():
+        return None
+
+    zoo_species_dir = _leaveout_model_zoo_species_dir(str(leaveout_species))
+    best_model_export = zoo_species_dir / LEAVEOUT_MODEL_ZOO_BEST_FILENAME
+    manifest = _build_leaveout_model_zoo_manifest(
+        route=route,
+        model_key=model_key,
+        leaveout_species=str(leaveout_species),
+        model_path=model_path,
+        metrics_path=metrics_path,
+        zoo_species_dir=zoo_species_dir,
+        dataset_summary=dataset_summary,
+        training_metrics=training_metrics,
+    )
+    if not dry_run:
+        if not model_path.exists():
+            raise FileNotFoundError(f"Cannot export leaveout model; checkpoint missing: {model_path}")
+        zoo_species_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(model_path, best_model_export)
+        (zoo_species_dir / LEAVEOUT_MODEL_ZOO_MANIFEST_FILENAME).write_text(
+            json.dumps(manifest, indent=2),
+            encoding="utf-8",
+        )
+
+    print(f"[tmp-run][model-zoo] leaveout={leaveout_species} -> {best_model_export}")
+    return manifest
+
+
+def _load_patch_models_for_route_from_model_zoo(
+    *,
+    route: str,
+    sources: Sequence[SourceSpec],
+    dry_run: bool,
+    include_global: bool = True,
+    include_leaveout: bool = True,
+) -> Dict[str, ModelSpec]:
+    models: Dict[str, ModelSpec] = {}
+    if not sources:
+        return models
+
+    missing: List[Path] = []
+    if include_global:
+        ckpt = _global_model_zoo_dir(route) / GLOBAL_MODEL_ZOO_BEST_FILENAME
+        if ckpt.exists() or dry_run:
+            models["global_all_species"] = ModelSpec(
+                route=route,
+                model_key="global_all_species",
+                ckpt_path=ckpt,
+                leaveout_species=None,
+            )
+        else:
+            missing.append(ckpt)
+
+    if include_leaveout:
+        all_species = sorted({s.species_name for s in sources})
+        for species in all_species:
+            if not any(s.species_name != species for s in sources):
+                continue
+            ckpt = _leaveout_model_zoo_species_dir(species) / LEAVEOUT_MODEL_ZOO_BEST_FILENAME
+            if ckpt.exists() or dry_run:
+                model_key = f"leaveout_{species}"
+                models[model_key] = ModelSpec(
+                    route=route,
+                    model_key=model_key,
+                    ckpt_path=ckpt,
+                    leaveout_species=species,
+                )
+            else:
+                missing.append(ckpt)
+
+    if missing:
+        missing_txt = "\n".join(f"  - {p}" for p in missing)
+        raise SystemExit(
+            "Required patch-classifier model-zoo files are missing:\n"
+            f"{missing_txt}\n"
+            "Populate the model zoo with the needed best.pt files and manifests before inference."
+        )
+    return models
+
+
 def _assert_trainable(dataset_final_dir: Path) -> None:
     checks = [
         dataset_final_dir / "train" / "firefly",
@@ -1292,8 +1635,10 @@ def _discover_day_yolo_sources(
 
 def _write_day_yolo_data_yaml(dataset_root: Path, *, dry_run: bool) -> Path:
     data_yaml = dataset_root / "data.yaml"
+    dataset_root_abs = dataset_root.resolve()
     payload = (
-        "path: .\n"
+        # Ultralytics rewrites non-absolute dataset roots under its global DATASETS_DIR.
+        f"path: {json.dumps(str(dataset_root_abs))}\n"
         "train: train/images\n"
         "val: train/images\n"
         "nc: 1\n"
@@ -1621,20 +1966,6 @@ def _train_day_yolo_models(
         output_ckpt = output_dir / "best_firefly_yolo.pt"
         output_manifest = output_dir / "training_manifest.json"
 
-        if bool(DAY_YOLO_REUSE_EXISTING_MODELS_IF_PRESENT) and output_ckpt.exists() and output_manifest.exists():
-            manifest = _read_json_if_exists(output_manifest)
-            training_manifests[model_key] = manifest
-            dataset_summaries[model_key] = dict(manifest.get("dataset_summary") or {})
-            models[model_key] = YoloModelSpec(
-                model_key=model_key,
-                ckpt_path=output_ckpt,
-                output_dir=output_dir,
-                leaveout_species=leaveout_species,
-                species_included=tuple(str(x) for x in manifest.get("species_included") or []),
-            )
-            print(f"[tmp-run][yolo-train] reuse existing model: {output_ckpt}")
-            continue
-
         temp_dataset_root = run_root / "_tmp_yolo_training_datasets" / model_key
         temp_project_root = run_root / "_tmp_yolo_training_runs" / model_key
         if temp_dataset_root.exists():
@@ -1673,16 +2004,12 @@ def _latest_dated_subdir(root: Path) -> Optional[Path]:
 
 
 def _auto_discover_latest_day_yolo_model(*, dry_run: bool) -> Optional[Path]:
-    if not DAY_YOLO_GLOBAL_MODELS_ROOT.exists():
+    latest_dir = _latest_dated_subdir(DAY_YOLO_GLOBAL_MODELS_ROOT)
+    if latest_dir is None:
         return None
-    for model_dir in sorted(
-        [p for p in DAY_YOLO_GLOBAL_MODELS_ROOT.iterdir() if p.is_dir() and re.fullmatch(r"\d{8}", p.name)],
-        key=lambda p: p.name,
-        reverse=True,
-    ):
-        candidate = model_dir / "best_firefly_yolo.pt"
-        if dry_run or candidate.exists():
-            return candidate
+    candidate = latest_dir / "best_firefly_yolo.pt"
+    if dry_run or candidate.exists():
+        return candidate
     return None
 
 
@@ -1694,32 +2021,22 @@ def _auto_discover_latest_day_yolo_leaveout_models(
     needed = sorted({_day_yolo_species_slug(s) for s in required_species if str(s or "").strip()})
     if not needed:
         return {}
-    if not DAY_YOLO_LEAVEOUT_MODELS_ROOT.exists():
+    latest_dir = _latest_dated_subdir(DAY_YOLO_LEAVEOUT_MODELS_ROOT)
+    if latest_dir is None:
         return {}
-
-    dated_dirs = sorted(
-        [p for p in DAY_YOLO_LEAVEOUT_MODELS_ROOT.iterdir() if p.is_dir() and re.fullmatch(r"\d{8}", p.name)],
-        key=lambda p: p.name,
-        reverse=True,
-    )
-    for run_dir in dated_dirs:
-        out: Dict[str, YoloModelSpec] = {}
-        missing: List[str] = []
-        for species in needed:
-            ckpt = run_dir / species / "best_firefly_yolo.pt"
-            if not ckpt.exists():
-                missing.append(species)
-                continue
-            out[species] = YoloModelSpec(
-                model_key=f"leaveout_{species}",
-                ckpt_path=ckpt,
-                output_dir=ckpt.parent,
-                leaveout_species=species,
-                species_included=tuple(),
-            )
-        if not missing:
-            return out
-    return {}
+    out: Dict[str, YoloModelSpec] = {}
+    for species in needed:
+        ckpt = latest_dir / species / "best_firefly_yolo.pt"
+        if not dry_run and not ckpt.exists():
+            continue
+        out[species] = YoloModelSpec(
+            model_key=f"leaveout_{species}",
+            ckpt_path=ckpt,
+            output_dir=ckpt.parent,
+            leaveout_species=species,
+            species_included=tuple(),
+        )
+    return out
 
 
 def sanitize_dataset_images(
@@ -2618,17 +2935,34 @@ def _train_models_for_route(
         model_path = model_root / route / f"{model_key}.pt"
         metrics_path = model_root / route / f"{model_key}_training_metrics.json"
 
-        if bool(REUSE_EXISTING_MODELS_IF_PRESENT) and model_path.exists() and (not dry_run):
-            print(f"[tmp-run][train] reuse existing model: {model_path}")
-            metrics = _read_json_if_exists(metrics_path)
-        else:
-            if not dry_run:
-                _assert_trainable(dst_final)
-            metrics = _train_model(
+        if not dry_run:
+            _assert_trainable(dst_final)
+        metrics = _train_model(
+            route=route,
+            dataset_final_dir=dst_final,
+            model_path=model_path,
+            metrics_path=metrics_path,
+            dry_run=dry_run,
+        )
+
+        if leaveout_species is None:
+            _export_global_model_to_model_zoo(
                 route=route,
-                dataset_final_dir=dst_final,
                 model_path=model_path,
                 metrics_path=metrics_path,
+                dataset_summary=summary,
+                training_metrics=metrics,
+                dry_run=dry_run,
+            )
+        else:
+            _export_leaveout_model_to_model_zoo(
+                route=route,
+                model_key=model_key,
+                leaveout_species=leaveout_species,
+                model_path=model_path,
+                metrics_path=metrics_path,
+                dataset_summary=summary,
+                training_metrics=metrics,
                 dry_run=dry_run,
             )
 
@@ -2643,165 +2977,11 @@ def _train_models_for_route(
     return models, dataset_summaries, training_metrics
 
 
-def _expected_model_keys_for_sources(
-    sources: Sequence[SourceSpec],
-    *,
-    include_global: bool = True,
-    include_leaveout: bool = True,
-) -> List[str]:
-    all_species = sorted({s.species_name for s in sources})
-    keys: List[str] = []
-    if include_global:
-        keys.append("global_all_species")
-    if include_leaveout:
-        for species in all_species:
-            # Match _train_models_for_route: leaveout model exists only if at least
-            # one other species remains in the route-specific training pool.
-            if any(s.species_name != species for s in sources):
-                keys.append(f"leaveout_{species}")
-    return keys
-
-
-def _route_model_dir_has_required_models(
-    *,
-    route_model_dir: Path,
-    sources: Sequence[SourceSpec],
-    dry_run: bool,
-    include_global: bool = True,
-    include_leaveout: bool = True,
-) -> bool:
-    for mk in _expected_model_keys_for_sources(
-        sources,
-        include_global=include_global,
-        include_leaveout=include_leaveout,
-    ):
-        ckpt = route_model_dir / f"{mk}.pt"
-        if not ckpt.exists():
-            return False
-    return True
-
-
-def _auto_discover_latest_route_model_dir(
-    *,
-    route: str,
-    runs_root: Path,
-    current_run_root: Path,
-    sources: Sequence[SourceSpec],
-    dry_run: bool,
-    include_global: bool = True,
-    include_leaveout: bool = True,
-) -> Optional[Path]:
-    candidates: List[Path] = []
-    for run_dir in sorted(
-        [p for p in runs_root.glob(f"{RUN_NAME_PREFIX}__*") if p.is_dir()],
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    ):
-        if run_dir.resolve() == current_run_root.resolve():
-            continue
-        route_model_dir = run_dir / "models" / route
-        if not route_model_dir.exists():
-            continue
-        candidates.append(route_model_dir)
-
-    for route_model_dir in candidates:
-        if _route_model_dir_has_required_models(
-            route_model_dir=route_model_dir,
-            sources=sources,
-            dry_run=dry_run,
-            include_global=include_global,
-            include_leaveout=include_leaveout,
-        ):
-            return route_model_dir
-    return None
-
-
-def _load_models_for_route(
-    *,
-    route: str,
-    sources: Sequence[SourceSpec],
-    route_model_dir: Path,
-    dry_run: bool,
-    include_global: bool = True,
-    include_leaveout: bool = True,
-) -> Dict[str, ModelSpec]:
-    models: Dict[str, ModelSpec] = {}
-    if not sources:
-        return models
-
-    missing: List[Path] = []
-    for model_key in _expected_model_keys_for_sources(
-        sources,
-        include_global=include_global,
-        include_leaveout=include_leaveout,
-    ):
-        ckpt = route_model_dir / f"{model_key}.pt"
-        if not ckpt.exists():
-            missing.append(ckpt)
-            continue
-        leaveout_species = model_key[len("leaveout_") :] if model_key.startswith("leaveout_") else None
-        models[model_key] = ModelSpec(
-            route=route,
-            model_key=model_key,
-            ckpt_path=ckpt,
-            leaveout_species=leaveout_species,
-        )
-
-    if missing:
-        missing_txt = "\n".join(f"  - {p}" for p in missing)
-        raise SystemExit(
-            "RUN_MODEL_TRAINING=False but required model files are missing:\n"
-            f"{missing_txt}\n"
-            f"Either enable RUN_MODEL_TRAINING=True or point the manual {route} model root "
-            "to a complete route-specific model directory."
-        )
-
-    return models
-
-
 def _resolve_manual_path(path_value: Path, *, label: str, dry_run: bool) -> Path:
     resolved = Path(str(path_value)).expanduser().resolve()
     if not resolved.exists():
         raise SystemExit(f"{label} does not exist: {resolved}")
     return resolved
-
-
-def _resolve_route_model_dir(
-    *,
-    route: str,
-    auto_discover: bool,
-    manual_root: Path,
-    runs_root: Path,
-    current_run_root: Path,
-    sources: Sequence[SourceSpec],
-    dry_run: bool,
-    include_global: bool,
-    include_leaveout: bool,
-) -> tuple[Path, str]:
-    if auto_discover:
-        resolved = _auto_discover_latest_route_model_dir(
-            route=route,
-            runs_root=runs_root,
-            current_run_root=current_run_root,
-            sources=sources,
-            dry_run=dry_run,
-            include_global=include_global,
-            include_leaveout=include_leaveout,
-        )
-        if resolved is None:
-            raise SystemExit(
-                f"RUN_MODEL_TRAINING=False and auto-discovery could not find a compatible latest "
-                f"{route} model directory under {runs_root}.\n"
-                f"Turn AUTO_DISCOVER_LATEST_{route.upper()}_MODEL_ROOT off and set the manual "
-                f"{route} model root, or enable RUN_MODEL_TRAINING=True."
-            )
-        return resolved, "auto"
-
-    return _resolve_manual_path(
-        manual_root,
-        label=f"manual {route} model root",
-        dry_run=dry_run,
-    ), "manual"
 
 
 def _resolve_day_yolo_model_path(*, auto_discover: bool, manual_path: Path, dry_run: bool) -> tuple[Path, str]:
@@ -3055,6 +3235,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "disabling pipeline inference."
         )
     run_any_pipeline = bool(enabled_pipeline_routes) and run_any_pipeline_models
+    global_day_species_switches = dict(GLOBAL_DAY_INFERENCE_SPECIES_SWITCHES)
+    global_night_species_switches = dict(GLOBAL_NIGHT_INFERENCE_SPECIES_SWITCHES)
+    leaveout_day_species_switches = dict(LEAVEOUT_DAY_INFERENCE_SPECIES_SWITCHES)
+    leaveout_night_species_switches = dict(LEAVEOUT_NIGHT_INFERENCE_SPECIES_SWITCHES)
+    pipeline_day_species_switches = _merge_species_switches(
+        (global_day_species_switches if run_global_model_inference else {}),
+        (leaveout_day_species_switches if run_leaveout_model_inference else {}),
+    )
+    pipeline_night_species_switches = _merge_species_switches(
+        (global_night_species_switches if run_global_model_inference else {}),
+        (leaveout_night_species_switches if run_leaveout_model_inference else {}),
+    )
 
     print(
         f"[tmp-run] baselines: run={run_baselines} lab={run_lab_baseline} "
@@ -3075,12 +3267,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"global={bool(TRAIN_DAY_YOLO_GLOBAL_MODEL)} "
         f"leaveout={bool(TRAIN_DAY_YOLO_LEAVEOUT_MODELS)}"
     )
-    print(f"[tmp-run] day_inference_species_switches={DAY_INFERENCE_SPECIES_SWITCHES}")
-    print(f"[tmp-run] night_inference_species_switches={NIGHT_INFERENCE_SPECIES_SWITCHES}")
+    print(f"[tmp-run] global_day_inference_species_switches={global_day_species_switches}")
+    print(f"[tmp-run] global_night_inference_species_switches={global_night_species_switches}")
+    print(f"[tmp-run] leaveout_day_inference_species_switches={leaveout_day_species_switches}")
+    print(f"[tmp-run] leaveout_night_inference_species_switches={leaveout_night_species_switches}")
+    print(f"[tmp-run] merged_day_inference_species_switches={pipeline_day_species_switches}")
+    print(f"[tmp-run] merged_night_inference_species_switches={pipeline_night_species_switches}")
     print(f"[tmp-run] lab_baseline_species_switches={LAB_BASELINE_SPECIES_SWITCHES}")
     print(f"[tmp-run] raphael_baseline_species_switches={RAPHAEL_BASELINE_SPECIES_SWITCHES}")
     print(f"[tmp-run] day_yolo_training_species_switches={DAY_YOLO_TRAINING_SPECIES_SWITCHES}")
     print(f"[tmp-run] run_model_training={bool(RUN_MODEL_TRAINING)}")
+    if bool(RUN_MODEL_TRAINING) and bool(REUSE_EXISTING_MODELS_IF_PRESENT):
+        raise SystemExit(
+            "REUSE_EXISTING_MODELS_IF_PRESENT must remain False. "
+            "Patch-model training always retrains to avoid stale model reuse."
+        )
     if (not run_baselines) and (not run_any_pipeline) and (not bool(RUN_MODEL_TRAINING)) and (not run_day_yolo_training):
         raise SystemExit(
             "Nothing to run: RUN_MODEL_TRAINING=False, RUN_DAY_YOLO_MODEL_TRAINING=False, RUN_BASELINE_METHODS_INFERENCE=False, "
@@ -3155,41 +3356,45 @@ def main(argv: Sequence[str] | None = None) -> int:
             srcs = sources_by_route.get(route) or []
             if not srcs:
                 continue
-            if route == "day":
-                route_model_dir, source_kind = _resolve_route_model_dir(
-                    route=route,
-                    auto_discover=bool(AUTO_DISCOVER_LATEST_DAY_MODEL_ROOT),
-                    manual_root=DAY_PRETRAINED_MODEL_ROOT,
-                    runs_root=runs_root,
-                    current_run_root=run_root,
-                    sources=srcs,
-                    dry_run=dry_run,
-                    include_global=run_global_model_inference,
-                    include_leaveout=run_leaveout_model_inference,
+            route_models: Dict[str, ModelSpec] = {}
+            resolved_parts: List[str] = []
+            resolved_source_parts: List[str] = []
+
+            if run_global_model_inference:
+                route_models.update(
+                    _load_patch_models_for_route_from_model_zoo(
+                        route=route,
+                        sources=srcs,
+                        dry_run=dry_run,
+                        include_global=True,
+                        include_leaveout=False,
+                    )
                 )
-            else:
-                route_model_dir, source_kind = _resolve_route_model_dir(
-                    route=route,
-                    auto_discover=bool(AUTO_DISCOVER_LATEST_NIGHT_MODEL_ROOT),
-                    manual_root=NIGHT_PRETRAINED_MODEL_ROOT,
-                    runs_root=runs_root,
-                    current_run_root=run_root,
-                    sources=srcs,
-                    dry_run=dry_run,
-                    include_global=run_global_model_inference,
-                    include_leaveout=run_leaveout_model_inference,
+                global_model_dir = _global_model_zoo_dir(route)
+                global_source_kind = "model_zoo"
+                print(f"[tmp-run] {route} global model root ({global_source_kind}): {global_model_dir}")
+                resolved_parts.append(f"global={global_model_dir}")
+                resolved_source_parts.append(f"global={global_source_kind}")
+
+            if run_leaveout_model_inference:
+                route_models.update(
+                    _load_patch_models_for_route_from_model_zoo(
+                        route=route,
+                        sources=srcs,
+                        dry_run=dry_run,
+                        include_global=False,
+                        include_leaveout=True,
+                    )
                 )
-            resolved_pretrained_model_dirs[route] = str(route_model_dir)
-            resolved_pretrained_model_sources[route] = source_kind
-            print(f"[tmp-run] {route} model root ({source_kind}): {route_model_dir}")
-            models_by_route[route] = _load_models_for_route(
-                route=route,
-                sources=srcs,
-                route_model_dir=route_model_dir,
-                dry_run=dry_run,
-                include_global=run_global_model_inference,
-                include_leaveout=run_leaveout_model_inference,
-            )
+                leaveout_model_dir = LEAVEOUT_MODEL_ZOO_ROOT
+                leaveout_source_kind = "model_zoo"
+                print(f"[tmp-run] {route} leaveout model root ({leaveout_source_kind}): {leaveout_model_dir}")
+                resolved_parts.append(f"leaveout={leaveout_model_dir}")
+                resolved_source_parts.append(f"leaveout={leaveout_source_kind}")
+
+            models_by_route[route] = route_models
+            resolved_pretrained_model_dirs[route] = " | ".join(resolved_parts)
+            resolved_pretrained_model_sources[route] = " | ".join(resolved_source_parts)
     else:
         print("[tmp-run] model prep skipped (training disabled and both day/night pipeline inference toggles are off).")
 
@@ -3206,9 +3411,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 include_leaveout=bool(TRAIN_DAY_YOLO_LEAVEOUT_MODELS),
                 dry_run=dry_run,
             )
-            if "global_all_species" in day_yolo_models:
-                resolved_day_yolo_model = day_yolo_models["global_all_species"].ckpt_path
-                resolved_day_yolo_source = "trained_this_run"
             resolved_day_yolo_leaveout_models = {
                 m.leaveout_species or "": m
                 for m in day_yolo_models.values()
@@ -3217,7 +3419,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if resolved_day_yolo_leaveout_models:
                 resolved_day_yolo_leaveout_source = "trained_this_run"
 
-    if bool(RUN_DAY_PIPELINE_INFERENCE) and resolved_day_yolo_model is None:
+    if bool(RUN_DAY_PIPELINE_INFERENCE):
         resolved_day_yolo_model, resolved_day_yolo_source = _resolve_day_yolo_model_path(
             auto_discover=bool(AUTO_DISCOVER_LATEST_DAY_YOLO_MODEL),
             manual_path=DAY_YOLO_MODEL_WEIGHTS,
@@ -3249,13 +3451,37 @@ def main(argv: Sequence[str] | None = None) -> int:
             f" inference={int(route_counts.get('inference', 0))}"
         )
 
+    global_pipeline_routed_videos: List[RoutedVideo] = []
+    leaveout_pipeline_routed_videos: List[RoutedVideo] = []
     pipeline_routed_videos: List[RoutedVideo] = []
     if run_any_pipeline:
-        pipeline_routed_videos = _discover_inference_videos_from_catalog(
-            video_catalog,
-            day_species_switches=DAY_INFERENCE_SPECIES_SWITCHES,
-            night_species_switches=NIGHT_INFERENCE_SPECIES_SWITCHES,
+        global_allowed = _enabled_inference_species_by_route(
+            day_species_switches=global_day_species_switches,
+            night_species_switches=global_night_species_switches,
         )
+        if run_global_model_inference and any(global_allowed.values()):
+            global_pipeline_routed_videos = _discover_inference_videos_from_catalog(
+                video_catalog,
+                day_species_switches=global_day_species_switches,
+                night_species_switches=global_night_species_switches,
+            )
+        elif run_global_model_inference:
+            print("[tmp-run] WARNING: global inference enabled but no global inference species were selected.")
+
+        leaveout_allowed = _enabled_inference_species_by_route(
+            day_species_switches=leaveout_day_species_switches,
+            night_species_switches=leaveout_night_species_switches,
+        )
+        if run_leaveout_model_inference and any(leaveout_allowed.values()):
+            leaveout_pipeline_routed_videos = _discover_inference_videos_from_catalog(
+                video_catalog,
+                day_species_switches=leaveout_day_species_switches,
+                night_species_switches=leaveout_night_species_switches,
+            )
+        elif run_leaveout_model_inference:
+            print("[tmp-run] WARNING: leaveout inference enabled but no leaveout inference species were selected.")
+
+        pipeline_routed_videos = _merge_routed_videos(global_pipeline_routed_videos, leaveout_pipeline_routed_videos)
 
     lab_baseline_routed_videos: List[RoutedVideo] = []
     raphael_baseline_routed_videos: List[RoutedVideo] = []
@@ -3282,6 +3508,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if max_videos > 0:
         routed_videos = routed_videos[:max_videos]
 
+    print(f"[tmp-run] global pipeline videos selected: {len(global_pipeline_routed_videos)}")
+    print(f"[tmp-run] leaveout pipeline videos selected: {len(leaveout_pipeline_routed_videos)}")
     print(f"[tmp-run] pipeline videos selected: {len(pipeline_routed_videos)}")
     print(f"[tmp-run] lab baseline videos selected: {len(lab_baseline_routed_videos)}")
     print(f"[tmp-run] raphael baseline videos selected: {len(raphael_baseline_routed_videos)}")
@@ -3404,6 +3632,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     for v in eval_videos:
         videos_by_route.setdefault(v.route, []).append(v)
 
+    global_pipeline_video_keys: set[str] = {
+        _short_key(str(rv.species_name or "unknown_species"), rv.video_path.stem)
+        for rv in global_pipeline_routed_videos
+    }
+    leaveout_pipeline_video_keys: set[str] = {
+        _short_key(str(rv.species_name or "unknown_species"), rv.video_path.stem)
+        for rv in leaveout_pipeline_routed_videos
+    }
     pipeline_eval_video_keys: set[str] = {
         _short_key(str(rv.species_name or "unknown_species"), rv.video_path.stem)
         for rv in pipeline_routed_videos
@@ -3426,21 +3662,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     processed_gt_by_video_key: Dict[str, Dict[str, str]] = {}
 
     if bool(RUN_DAY_PIPELINE_INFERENCE) and bool(run_leaveout_model_inference) and not resolved_day_yolo_leaveout_models:
-        required_leaveout_species = sorted({v.species_name for v in videos_by_route.get("day") or []})
+        required_leaveout_species = sorted(
+            {
+                v.species_name
+                for v in (videos_by_route.get("day") or [])
+                if v.video_key in leaveout_pipeline_video_keys
+            }
+        )
         resolved_day_yolo_leaveout_models = _auto_discover_latest_day_yolo_leaveout_models(
             required_species=required_leaveout_species,
             dry_run=dry_run,
         )
+        missing_day_yolo_leaveout_species = sorted(
+            set(str(s) for s in required_leaveout_species if str(s or "").strip())
+            - set(str(s) for s in resolved_day_yolo_leaveout_models.keys())
+        )
+        if missing_day_yolo_leaveout_species:
+            raise SystemExit(
+                "Leaveout day YOLO models are required for leaveout day inference, but the following "
+                "species are missing from the dedicated day YOLO model directory: "
+                f"{missing_day_yolo_leaveout_species}"
+            )
         if resolved_day_yolo_leaveout_models:
             resolved_day_yolo_leaveout_source = "auto"
             print(
                 f"[tmp-run] day yolo leaveout models ({resolved_day_yolo_leaveout_source}): "
                 f"{sorted(resolved_day_yolo_leaveout_models.keys())}"
-            )
-        elif required_leaveout_species:
-            print(
-                "[tmp-run] WARNING: leaveout day YOLO models were not found; "
-                "day leaveout inference will fall back to the global YOLO model."
             )
 
     # Global model on all videos in each route.
@@ -3449,7 +3696,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if route_name not in enabled_pipeline_routes:
                 print(f"[eval][global] route={route_name} disabled by run toggle; skipping route.")
                 continue
-            route_videos = videos_by_route.get(route_name) or []
+            route_videos = [
+                v
+                for v in (videos_by_route.get(route_name) or [])
+                if v.video_key in global_pipeline_video_keys
+            ]
             if not route_videos:
                 continue
 
@@ -3537,7 +3788,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if route_name not in enabled_pipeline_routes:
                 print(f"[eval][leaveout] route={route_name} disabled by run toggle; skipping route.")
                 continue
-            route_videos = videos_by_route.get(route_name) or []
+            route_videos = [
+                v
+                for v in (videos_by_route.get(route_name) or [])
+                if v.video_key in leaveout_pipeline_video_keys
+            ]
             if not route_videos:
                 continue
 
@@ -3559,11 +3814,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(f"[eval][{lm.model_key}][{route_name}] {i}/{len(sel)} {vid.video_path.name}")
                     leaveout_day_yolo_path: Optional[Path] = None
                     if route_name == "day":
-                        leaveout_day_yolo_path = (
-                            resolved_day_yolo_leaveout_models.get(left_species).ckpt_path
-                            if left_species in resolved_day_yolo_leaveout_models
-                            else resolved_day_yolo_model
-                        )
+                        leaveout_day_model = resolved_day_yolo_leaveout_models.get(left_species)
+                        if leaveout_day_model is None:
+                            raise RuntimeError(
+                                "Required leaveout day YOLO model was not resolved for "
+                                f"species={left_species}"
+                            )
+                        leaveout_day_yolo_path = leaveout_day_model.ckpt_path
 
                     if dry_run:
                         metrics = {"error": "dry_run"}
@@ -3738,8 +3995,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "night_enabled": bool(RUN_NIGHT_PIPELINE_INFERENCE),
             "global_enabled": bool(run_global_model_inference),
             "leaveout_enabled": bool(run_leaveout_model_inference),
-            "day_species_switches": dict(DAY_INFERENCE_SPECIES_SWITCHES),
-            "night_species_switches": dict(NIGHT_INFERENCE_SPECIES_SWITCHES),
+            "global_day_species_switches": dict(global_day_species_switches),
+            "global_night_species_switches": dict(global_night_species_switches),
+            "leaveout_day_species_switches": dict(leaveout_day_species_switches),
+            "leaveout_night_species_switches": dict(leaveout_night_species_switches),
+            "merged_day_species_switches": dict(pipeline_day_species_switches),
+            "merged_night_species_switches": dict(pipeline_night_species_switches),
         },
         "model_training": {
             "run_model_training": bool(RUN_MODEL_TRAINING),
@@ -3763,11 +4024,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "training_manifests": day_yolo_training_manifests,
         },
         "model_selection": {
-            "auto_discover_latest_day_model_root": bool(AUTO_DISCOVER_LATEST_DAY_MODEL_ROOT),
-            "auto_discover_latest_night_model_root": bool(AUTO_DISCOVER_LATEST_NIGHT_MODEL_ROOT),
             "auto_discover_latest_day_yolo_model": bool(AUTO_DISCOVER_LATEST_DAY_YOLO_MODEL),
-            "manual_day_model_root": str(DAY_PRETRAINED_MODEL_ROOT),
-            "manual_night_model_root": str(NIGHT_PRETRAINED_MODEL_ROOT),
             "manual_day_yolo_model_weights": str(DAY_YOLO_MODEL_WEIGHTS),
             "resolved_day_model_root": str(resolved_pretrained_model_dirs.get("day") or ""),
             "resolved_night_model_root": str(resolved_pretrained_model_dirs.get("night") or ""),

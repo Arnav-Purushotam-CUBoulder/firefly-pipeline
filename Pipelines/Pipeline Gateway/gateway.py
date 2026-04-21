@@ -36,11 +36,8 @@ FORCE_START_FROM_FRAME_0: bool = True  # overrides start/offset params -> 0 when
 # Priority:
 #   1) --route-override (CLI)
 #   2) day/night tokens in the video path
-#   3) ROUTE_DEFAULT unless REQUIRE_EXPLICIT_ROUTE=True
 ROUTE_NAME_HINT_DAY_TOKENS: tuple[str, ...] = ("day", "daytime", "day_time")
 ROUTE_NAME_HINT_NIGHT_TOKENS: tuple[str, ...] = ("night", "nighttime", "night_time")
-ROUTE_DEFAULT: str = "night"
-REQUIRE_EXPLICIT_ROUTE: bool = False
 
 # Folder ingestion behavior
 RECURSIVE: bool = False
@@ -106,9 +103,6 @@ def _iter_videos(input_path: Path, *, recursive: bool) -> list[Path]:
     return sorted(vids)
 
 
-_ROUTE_WARNED_DEFAULT_DIRS: set[str] = set()
-
-
 def _route_hint_from_video_path(video_path: Path) -> str | None:
     token_src = str(video_path).lower()
     has_day = any(tok in token_src for tok in ROUTE_NAME_HINT_DAY_TOKENS)
@@ -126,16 +120,10 @@ def _infer_route_for_video(video_path: Path) -> str:
     hint = _route_hint_from_video_path(video_path)
     if hint is not None:
         return hint
-    if REQUIRE_EXPLICIT_ROUTE:
-        raise RuntimeError(
-            f"No route tokens found in video path: {video_path}. "
-            "Pass --route-override or rename path to include day/night token."
-        )
-    key = str(video_path.parent)
-    if key not in _ROUTE_WARNED_DEFAULT_DIRS:
-        print(f"[gateway] WARNING: route unresolved for {video_path}; defaulting to '{ROUTE_DEFAULT}'.")
-        _ROUTE_WARNED_DEFAULT_DIRS.add(key)
-    return str(ROUTE_DEFAULT).strip().lower()
+    raise RuntimeError(
+        f"No route tokens found in video path: {video_path}. "
+        "Pass --route-override or rename path to include day/night token."
+    )
 
 
 def _parse_frame_like(value: object) -> int | None:
