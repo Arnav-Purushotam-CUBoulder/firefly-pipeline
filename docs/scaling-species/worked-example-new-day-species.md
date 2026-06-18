@@ -193,7 +193,7 @@ Set those to `True` only when you intentionally want to run those baselines.
 
 For an existing species, the raw catalog already knows which videos are training and which are inference.
 
-For a brand-new species, the catalog may initially mark every raw video as `inference`, because no patch dataset exists yet for that species. You need to bootstrap the split once.
+For a brand-new species, the catalog generator may initially mark every raw video as `inference`, because no patch dataset exists yet for that species. You need to bootstrap the split once.
 
 Catalog path:
 
@@ -201,7 +201,40 @@ Catalog path:
 /mnt/Samsung_SSD_2TB/all species raw videos and annotations (from annotator)/tmp_scaling_species_training_inference_catalog.json
 ```
 
-Preferred bootstrap method:
+There are two workable bootstrap methods.
+
+### Bootstrap Method A: Temporarily Bypass the Catalog
+
+This is the simplest current-code path.
+
+Temporarily edit:
+
+```text
+tools for scaling species/patch_classification_models_dataset_ingestor.py
+```
+
+Set:
+
+```python
+USE_ROOT_VIDEO_CATALOG_IF_PRESENT = False
+TRAIN_PAIR_FRACTION = 0.8
+```
+
+Then the ingestor uses a deterministic sorted 80/20 split for that raw folder. It ingests the training side only and leaves the rest held out.
+
+After the first successful ingestion, restore:
+
+```python
+USE_ROOT_VIDEO_CATALOG_IF_PRESENT = True
+```
+
+Then the integrated patch dataset contains training stems for the new species. The next real combo-runner execution can rebuild the catalog with those stems marked as `training`.
+
+Important: `tmp_day_night_combo_train_and_infer.py --dry-run` builds the catalog in memory but does not write it to disk. A non-dry-run combo execution writes the catalog, but it may also run whichever training/inference/baseline toggles are enabled. Check toggles before using a real run just to refresh the catalog.
+
+### Bootstrap Method B: Manually Add Catalog Entries
+
+Use this when you need exact control over which clips are training and which clips are held out before first ingestion.
 
 1. Decide which videos are training and which are held-out inference.
 2. Add entries for the new species to the catalog's `videos` list.
@@ -239,26 +272,7 @@ training:  PE_001, PE_002, PE_003, PE_004
 inference: PE_005
 ```
 
-After the first successful patch ingestion, the combo runner can regenerate the catalog using the integrated dataset's patch-location stems. At that point the catalog should stay consistent automatically.
-
-Fallback bootstrap method:
-
-Temporarily edit:
-
-```text
-tools for scaling species/patch_classification_models_dataset_ingestor.py
-```
-
-Set:
-
-```python
-USE_ROOT_VIDEO_CATALOG_IF_PRESENT = False
-TRAIN_PAIR_FRACTION = 0.8
-```
-
-Then the ingestor uses a deterministic sorted 80/20 split for that raw folder. Restore `USE_ROOT_VIDEO_CATALOG_IF_PRESENT = True` after the first ingestion.
-
-Use the preferred catalog method when you need exact control over which clips are held out.
+If you manually edit the catalog, keep `summary` and `by_species` consistent or regenerate the catalog with a real combo run after the first ingestion. The ingestor primarily uses the `videos` entries for the explicit split.
 
 ## Step 4: Dry-Run Patch Dataset Ingestion
 
@@ -323,15 +337,19 @@ and verify the new dataset version exists under:
 /mnt/Samsung_SSD_2TB/integrated prototype data/integrated prototype data/patch training datasets and pipeline validation data/Integrated_prototype_datasets
 ```
 
-## Step 6: Regenerate/Check the Catalog
+## Step 6: Regenerate or Check the Catalog
 
-Run a combo-runner dry run:
+Run a combo-runner dry run to check the plan:
 
 ```bash
 python3 "tools for scaling species/tmp_day_night_combo_train_and_infer.py" --dry-run
 ```
 
-Inspect the catalog:
+Remember: dry run does not write the catalog.
+
+If you used Bootstrap Method A, the on-disk catalog will not necessarily update until a real combo-runner execution writes it. Before running a real combo run, check the toggles at the top of `tmp_day_night_combo_train_and_infer.py` so you do not accidentally train, infer, or run baselines you did not intend.
+
+Inspect the current on-disk catalog:
 
 ```bash
 python3 - <<'PY'
@@ -355,7 +373,7 @@ training day PE_004.mp4
 inference day PE_005.mp4
 ```
 
-If all entries are still inference, the training clips did not make it into the integrated dataset or the catalog did not write/regenerate as expected.
+If all entries are still inference after a real catalog-writing run, the training clips did not make it into the integrated dataset or the catalog did not regenerate from the expected training stems.
 
 ## Step 7: Add Day YOLO Data
 
@@ -647,4 +665,3 @@ Fix:
 
 - Verify whether annotator `x,y` is top-left or center.
 - Convert annotations or adjust validation preprocessing before trusting metrics.
-
