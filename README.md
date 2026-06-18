@@ -18,10 +18,13 @@ Most scripts currently assume the Samsung SSD is mounted at `/mnt/Samsung_SSD_2T
 - Repository map: [docs/repository-map.md](docs/repository-map.md)
 - Environment and dependencies: [docs/environment.md](docs/environment.md)
 - External SSD data layout: [docs/data-roots.md](docs/data-roots.md)
-- Day pipeline: [docs/day-pipeline.md](docs/day-pipeline.md)
-- Night pipeline: [docs/night-pipeline.md](docs/night-pipeline.md)
+- Day pipeline overview: [docs/day-pipeline.md](docs/day-pipeline.md)
+- Day pipeline deep docs: [docs/day-pipeline/README.md](docs/day-pipeline/README.md)
+- Night pipeline overview: [docs/night-pipeline.md](docs/night-pipeline.md)
+- Night pipeline deep docs: [docs/night-pipeline/README.md](docs/night-pipeline/README.md)
 - Gateway runner: [docs/gateway.md](docs/gateway.md)
-- Species scaling workflow: [docs/scaling-species.md](docs/scaling-species.md)
+- Species scaling overview: [docs/scaling-species.md](docs/scaling-species.md)
+- Species scaling deep docs: [docs/scaling-species/README.md](docs/scaling-species/README.md)
 - Validation and output schemas: [docs/validation-and-outputs.md](docs/validation-and-outputs.md)
 - Operations runbook: [docs/operations-runbook.md](docs/operations-runbook.md)
 
@@ -90,4 +93,3 @@ Temporary run outputs:
 ```text
 /mnt/Samsung_SSD_2TB/temp to delete
 ```
-

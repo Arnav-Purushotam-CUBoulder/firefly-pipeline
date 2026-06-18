@@ -212,11 +212,13 @@ The name means outputs are disposable, but still inspect before deleting if an e
 
 ## Common CSV Schemas
 
-Annotator CSV:
+Annotator-style CSV:
 
 ```text
 x,y,w,h,frame
 ```
+
+Coordinate warning: verify whether `x,y` are top-left or center for the annotation source before validation or Stage 8.9 GT recentering.
 
 Normalized GT CSV:
 
@@ -243,4 +245,3 @@ frame,x,y,w,h,...,xy_semantics
 ```
 
 For night after Stage 8, `x,y` are center coordinates and `xy_semantics` should be `center`.
-

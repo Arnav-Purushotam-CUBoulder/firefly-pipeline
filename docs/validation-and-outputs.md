@@ -16,9 +16,9 @@ Normalized points:
 x,y,t
 ```
 
-The manual annotation GUI writes annotator-style boxes where `x,y` are top-left coordinates and `frame` is zero-based.
+The manual annotation GUI writes annotator-style boxes where `frame` is zero-based. Verify whether a given CSV's `x,y` values are top-left or center before validation; downstream code often treats `x,y` as the point/crop center.
 
-Validators normalize GT to point detections before matching. They can filter dim/small GT and dedupe nearby same-frame GT.
+Validators normalize GT to point detections before matching. They can filter dim/small GT and dedupe nearby same-frame GT. Do not assume the validator adds `w/2,h/2`; check the route-specific code and overlays for the annotation source being used.
 
 ## Frame Offsets
 
@@ -155,10 +155,9 @@ These stages are useful for model/parameter tuning. They are not the minimum req
 
 Do not mix these without conversion:
 
-- Annotator top-left boxes: `x,y,w,h,frame`.
+- Annotator-style boxes: `x,y,w,h,frame`.
 - Day Stage 3 top-left patch detections.
 - Day Stage 3.2 center-style `x,y,t`.
 - Night final Stage 8 center-style detections.
 
 When in doubt, open the relevant stage code or render an overlay before comparing CSVs numerically.
-

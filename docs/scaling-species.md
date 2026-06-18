@@ -6,6 +6,23 @@ Path:
 tools for scaling species
 ```
 
+For detailed takeover docs, start with:
+
+```text
+docs/scaling-species/README.md
+```
+
+Detailed pages:
+
+- [scaling-species/raw-data-and-catalog.md](scaling-species/raw-data-and-catalog.md)
+- [scaling-species/patch-dataset-ingestion.md](scaling-species/patch-dataset-ingestion.md)
+- [scaling-species/combo-runner.md](scaling-species/combo-runner.md)
+- [scaling-species/model-zoo-and-training.md](scaling-species/model-zoo-and-training.md)
+- [scaling-species/day-yolo-workflow.md](scaling-species/day-yolo-workflow.md)
+- [scaling-species/baselines-and-evaluation.md](scaling-species/baselines-and-evaluation.md)
+- [scaling-species/add-species-runbook.md](scaling-species/add-species-runbook.md)
+- [scaling-species/worked-example-new-day-species.md](scaling-species/worked-example-new-day-species.md)
+
 This folder contains the tooling that turns raw annotated videos into scalable datasets, trains or selects models, runs inference through the gateway, evaluates against GT, and compares against legacy baselines.
 
 ## Scaling Mental Model
@@ -244,4 +261,3 @@ Night:
 - `photinus-carolinus`
 - `photinus-knulli`
 - `tremulans`
-

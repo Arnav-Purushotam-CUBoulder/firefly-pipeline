@@ -227,7 +227,7 @@ Check `GT_T_OFFSET`, the GT CSV schema, and whether the GT frame index is raw-fr
 
 Check coordinate semantics:
 
-- Annotator CSVs use top-left boxes.
+- Annotator-style CSVs use `x,y,w,h,frame`, but verify whether `x,y` is top-left or center for the specific source.
 - Day Stage 3 uses top-left patch boxes.
 - Day Stage 3.2 uses centroid `x,y,t`.
 - Night after Stage 8 uses center coordinates.
@@ -235,4 +235,3 @@ Check coordinate semantics:
 ### Outputs disappeared
 
 Check whether a direct pipeline run started with `RUN_PRE_RUN_CLEANUP = True` and the same `ROOT`.
-

@@ -18,6 +18,20 @@ Main runner:
 Pipelines/night_time_pipeline/orchestrator.py
 ```
 
+For detailed takeover docs, start with:
+
+```text
+docs/night-pipeline/README.md
+```
+
+Detailed pages:
+
+- [night-pipeline/stage-flow.md](night-pipeline/stage-flow.md)
+- [night-pipeline/configuration.md](night-pipeline/configuration.md)
+- [night-pipeline/data-contracts.md](night-pipeline/data-contracts.md)
+- [night-pipeline/repair-and-validation.md](night-pipeline/repair-and-validation.md)
+- [night-pipeline/operations-and-debugging.md](night-pipeline/operations-and-debugging.md)
+
 ## Purpose
 
 The night pipeline handles dark-background videos where firefly flashes appear as bright blobs. It detects blobs, recenters and filters them, classifies patches with a CNN, merges duplicates, refines centroids, performs repair passes, renders videos, and validates against GT.
@@ -141,4 +155,3 @@ The firefly logits CSV contains frame-wise centroid predictions and logits for d
 - Stage 0 has special behavior for `ground truth/gt.csv`; inspect GT files before running direct night orchestration.
 - Stage 8.9 overwrites GT into normalized `x,y,t` form if the input GT is annotator-style.
 - The default Stage 1 requires GPU-side dependencies. Missing CuPy/cuCIM/CUDA support is an environment issue, not necessarily a pipeline logic issue.
-

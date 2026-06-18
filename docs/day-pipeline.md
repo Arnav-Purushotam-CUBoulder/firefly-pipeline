@@ -18,6 +18,20 @@ Main runner:
 Pipelines/day time pipeline v3 (yolo + patch classifier ensemble)/orchestrator.py
 ```
 
+For detailed takeover docs, start with:
+
+```text
+docs/day-pipeline/README.md
+```
+
+Detailed pages:
+
+- [day-pipeline/stage-flow.md](day-pipeline/stage-flow.md)
+- [day-pipeline/configuration.md](day-pipeline/configuration.md)
+- [day-pipeline/data-contracts.md](day-pipeline/data-contracts.md)
+- [day-pipeline/validation-and-analysis.md](day-pipeline/validation-and-analysis.md)
+- [day-pipeline/operations-and-debugging.md](day-pipeline/operations-and-debugging.md)
+
 ## Purpose
 
 The day pipeline handles videos where the background is bright enough that simple bright-blob detection is not enough. It compresses time into long-exposure images, detects candidate regions with YOLO, expands those regions back to individual frames, filters frame patches with a binary patch classifier, then optionally performs trajectory/intensity selection and centroid refinement.
@@ -139,4 +153,3 @@ Use Stage 3.2 `x,y,t` for downstream 3D reconstruction, not raw Stage 3 top-left
 - Stage 5 validation can accept annotator-style GT or normalized `x,y,t`, but `GT_T_OFFSET` must be correct.
 - Stage 7, 8, and 9 analyses are disabled by default in `params.py`.
 - Ultralytics may have trouble with apostrophes in model paths. The Stage 2 code copies weights to an apostrophe-safe cache path when needed.
-
