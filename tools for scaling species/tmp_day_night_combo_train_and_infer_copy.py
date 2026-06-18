@@ -125,54 +125,17 @@ ROUTE_DEFAULT: str = "night"
 REQUIRE_EXPLICIT_ROUTE: bool = True
 
 # 2) Baseline methods (Lab + Raphael)
-RUN_LAB_BASELINE: bool = True
-RUN_RAPHAEL_BASELINE: bool = True
+RUN_LAB_BASELINE: bool = False
+RUN_RAPHAEL_BASELINE: bool = False
 
 # Baseline species switches are independent from your pipeline inference
 # switches. Edit these two dictionaries directly to choose which species each
 # baseline method should run on. Day/night GT handling stays internal.
 LAB_BASELINE_SPECIES_SWITCHES: Dict[str, bool] = {
     "bicellonycha-wickershamorum": False,
-    "photinus-acuminatus": True,
-    "photinus-greeni": False,
-    "photuris-bethaniensis": False,
-    "forresti": False,
-    "frontalis": True,
-    "photinus-carolinus": False,
-    "photinus-knulli": False,
-    "tremulans": False,
-}
-
-RAPHAEL_BASELINE_SPECIES_SWITCHES: Dict[str, bool] = {
-    "bicellonycha-wickershamorum": False,
-    "photinus-acuminatus": True,
-    "photinus-greeni": False,
-    "photuris-bethaniensis": False,
-    "forresti": False,
-    "frontalis": True,
-    "photinus-carolinus": False,
-    "photinus-knulli": False,
-    "tremulans": False,
-}
-
-# 3) Your pipeline inference (split by route)
-RUN_DAY_PIPELINE_INFERENCE: bool = False
-RUN_NIGHT_PIPELINE_INFERENCE: bool = False
-RUN_GLOBAL_MODEL_INFERENCE: bool = False
-RUN_LEAVEOUT_MODEL_INFERENCE: bool = False
-
-# Per-scope route-specific inference switches. These are derived from the
-# canonical route metadata above, so the per-route species membership is not
-# duplicated here. Global inference and leaveout inference can still target
-# different species in one run.
-GLOBAL_DAY_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
-    "bicellonycha-wickershamorum": True,
-    "photinus-acuminatus": True,
+    "photinus-acuminatus": False,
     "photinus-greeni": True,
     "photuris-bethaniensis": True,
-}
-
-GLOBAL_NIGHT_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
     "forresti": True,
     "frontalis": True,
     "photinus-carolinus": True,
@@ -180,9 +143,44 @@ GLOBAL_NIGHT_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
     "tremulans": True,
 }
 
-# Keep day leaveout inference off for now. Baselines only need one pipeline run
-# per selected video, and the current SSD model layout does not include
-# leaveout day-YOLO checkpoints.
+RAPHAEL_BASELINE_SPECIES_SWITCHES: Dict[str, bool] = {
+    "bicellonycha-wickershamorum": False,
+    "photinus-acuminatus": False,
+    "photinus-greeni": True,
+    "photuris-bethaniensis": True,
+    "forresti": True,
+    "frontalis": True,
+    "photinus-carolinus": True,
+    "photinus-knulli": False,
+    "tremulans": True,
+}
+
+# 3) Your pipeline inference (split by route)
+RUN_DAY_PIPELINE_INFERENCE: bool = False
+RUN_NIGHT_PIPELINE_INFERENCE: bool = True
+RUN_GLOBAL_MODEL_INFERENCE: bool = True
+RUN_LEAVEOUT_MODEL_INFERENCE: bool = True
+
+# Per-scope route-specific inference switches. These are derived from the
+# canonical route metadata above, so the per-route species membership is not
+# duplicated here. Global inference and leaveout inference can still target
+# different species in one run.
+GLOBAL_DAY_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
+    "bicellonycha-wickershamorum": False,
+    "photinus-acuminatus": False,
+    "photinus-greeni": False,
+    "photuris-bethaniensis": False,
+}
+
+GLOBAL_NIGHT_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
+    "forresti": False,
+    "frontalis": True,
+    "photinus-carolinus": False,
+    "photinus-knulli": False,
+    "tremulans": False,
+}
+
+# Day leaveout inference is enabled only for the selected rerun species below.
 LEAVEOUT_DAY_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
     "bicellonycha-wickershamorum": False,
     "photinus-acuminatus": False,
@@ -191,11 +189,11 @@ LEAVEOUT_DAY_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
 }
 
 LEAVEOUT_NIGHT_INFERENCE_SPECIES_SWITCHES: Dict[str, bool] = {
-    "forresti": True,
+    "forresti": False,
     "frontalis": True,
-    "photinus-carolinus": True,
+    "photinus-carolinus": False,
     "photinus-knulli": False,
-    "tremulans": True,
+    "tremulans": False,
 }
 
 # -----------------------------------------------------------------------------
